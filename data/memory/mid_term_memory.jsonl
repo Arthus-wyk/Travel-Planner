@@ -1,0 +1,18 @@
+{"content": "用户请求帮忙挑选酒店", "type": "decision", "plan_id": "australia_trip_202310"}
+{"content": "First day arrival in Sydney at 9:00 AM.", "type": "constraint", "plan_id": "australia_trip_202310"}
+{"content": "Last day flight departs at 8:00 PM.", "type": "constraint", "plan_id": "australia_trip_202310"}
+{"content": "Include daily itinerary start points and key highlights for each day.", "type": "decision", "plan_id": "australia_trip_202310"}
+{"content": "入住悉尼精品酒店", "type": "decision", "plan_id": "australia_trip_202310"}
+{"content": "全程入住悉尼精品酒店（地址：114 Darlinghurst Rd, Darlinghurst NSW 2010, Australia）", "type": "decision", "plan_id": "australia_trip_202310"}
+{"content": "用户询问从天安门广场到故宫的步行时间约28分钟", "type": "fact", "plan_id": null}
+{"content": "驾车从天安门广场到故宫约3.6公里，行驶时间约16分钟，实际时间可能因交通拥堵、红绿灯或道路施工而有所变化。", "type": "fact", "plan_id": null}
+{"content": "Add hotels to the daily itinerary for the Australia travel plan (plan_id: austravel_trip_202310).", "type": "decision", "plan_id": "australia_trip_202310"}
+{"content": "用户要求从机场到酒店使用出租车，并将预计到达时间调整为09:45", "type": "constraint", "plan_id": "australia_trip_202310"}
+{"content": "第一天行程已更新：09:30‑09:45 打车前往悉尼精品酒店，09:45 入住酒店", "type": "fact", "plan_id": "australia_trip_202310"}
+{"content": "User wants to modify all itineraries", "type": "fact", "plan_id": "australia_trip_202310"}
+{"content": "每天设定开始时间和预计结束时间", "type": "constraint", "plan_id": "australia_trip_202310"}
+{"content": "第2天09:00从酒店乘坐出租车前往大堡礁出发点，预计耗时30分钟", "type": "fact", "plan_id": "australia_trip_202310"}
+{"content": "第一天有两个悉尼歌剧院的项目，而且没有回酒店的流程", "type": "constraint", "plan_id": "australia_trip_202310"}
+{"content": "避免在同一天安排两个悉尼歌剧院的活动", "type": "constraint", "plan_id": "australia_trip_202310"}
+{"content": "在行程中加入返回酒店的流程", "type": "constraint", "plan_id": "australia_trip_202310"}
+{"content": "Include Sydney Opera House in itinerary", "type": "decision", "plan_id": "australia_trip_202310"}

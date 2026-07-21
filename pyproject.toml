@@ -1,0 +1,16 @@
+[project]
+name = "custom-travel-planner-mcp"
+version = "0.1.0"
+description = "MCP tools for a custom travel planning agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.27,<2",
+    "ollama>=0.6.2",
+    "pymysql>=1.1.1,<2",
+]
+
+[project.scripts]
+travel-agent = "service.agent.client:main"
+travel-mcp = "mcp_server:main"
+travel-api = "service.api.server:main"
