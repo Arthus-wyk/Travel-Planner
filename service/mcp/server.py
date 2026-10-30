@@ -15,22 +15,24 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from service.integrations.travel_google_maps import (
+from service.integrations.travel_amap import (
     build_places_payload,
     build_route_payload,
     compute_route,
-    google_maps_error,
+    amap_error,
     place_summary,
     search_places,
+    geocode,
+    static_map,
 )
-from service.agent.itinerary_audit import audit_plan
-from service.agent.preference_profile import (
+from service.travel.itinerary_audit import audit_plan
+from service.storage.memory_store import (
     PROFILE_SECTIONS,
     read_preference_profile,
     update_preference_profile,
 )
-from service.agent.recommendation_ranker import rank_candidates
-from service.agent.tool_verifier import verify_tool_result
+from service.travel.recommendation_ranker import rank_candidates
+from service.travel.tool_verification import verify_tool_result
 from service.storage.travel_db import (
     database_error,
     delete_plan,
@@ -44,6 +46,7 @@ from service.validation import (
     VALID_ITINERARY_FIELDS,
     VALID_PRIORITIES,
     VALID_PROFILE_FIELDS,
+    TravelProfileUpdates,
     VALID_RECOMMENDATION_FIELDS,
     next_id,
     validate_date_range,
@@ -82,7 +85,7 @@ def update_travel_preference_profile(
 
 
 def audit_travel_plan(plan_id: str) -> dict[str, Any]:
-    """Check a travel plan for consistency, budget, pacing, date, and booking risks."""
+    """Check schedule and budget risks; cost overlap may make the total a range."""
     plan, error = get_plan(plan_id)
     if error is not None:
         return error
@@ -97,7 +100,7 @@ def rank_recommendations(
 ) -> dict[str, Any]:
     """Rank candidate places with scores, reasons, and trade-offs.
 
-    candidates can be raw Google Places summaries or saved recommendation-like
+    candidates can be raw 高德 POI summaries or saved recommendation-like
     objects. preferences can be read from read_travel_preference_profile.
     """
     if not isinstance(candidates, list):
@@ -127,7 +130,7 @@ def verify_last_tool_result(
     return {"success": True, "verification": verify_tool_result(tool_name, arguments, result_text)}
 
 
-def google_maps_search_places(
+def amap_search_places(
     query: str,
     max_results: int = 5,
     language_code: str = "zh-CN",
@@ -136,11 +139,9 @@ def google_maps_search_places(
     location_bias_longitude: float | None = None,
     location_bias_radius_meters: float = 5000,
 ) -> dict[str, Any]:
-    """Search Google Places by text query.
-
-    Use this to find hotels, restaurants, attractions, stations, or addresses.
-    Provide a natural language query such as "family hotels near Tokyo Station".
-    Optionally add a circular location bias with latitude, longitude, and radius.
+    """Search Amap POIs in China by keywords. region_code accepts a Chinese city
+    name, citycode or adcode. Optional coordinates use GCJ-02 and perform radius
+    search (up to 50000 meters). language_code is retained for call compatibility.
     """
     payload, validation_error = build_places_payload(
         query,
@@ -156,33 +157,34 @@ def google_maps_search_places(
 
     try:
         places = search_places(payload or {})
+        summaries = [place_summary(place) for place in places]
     except Exception as exc:
-        return google_maps_error(exc)
+        return amap_error(exc)
 
     return {
         "success": True,
         "query": query,
-        "places": [place_summary(place) for place in places],
+        "places": summaries,
         "raw_places": places,
     }
 
 
-def google_maps_search_hotels(
+def amap_search_hotels(
     destination: str,
     query: str = "",
     max_results: int = 5,
     language_code: str = "zh-CN",
     region_code: str | None = None,
 ) -> dict[str, Any]:
-    """Search hotel candidates with Google Places.
+    """Search hotel candidates with 高德 POI.
 
     The destination should be a city, area, landmark, or address. Use query for
     constraints such as budget, family friendly, near subway, or ocean view.
     """
-    hotel_query = f"hotels in {destination}"
+    hotel_query = f"{destination} 酒店"
     if query:
-        hotel_query = f"{query} hotels in {destination}"
-    return google_maps_search_places(
+        hotel_query = f"{destination} {query} 酒店"
+    return amap_search_places(
         query=hotel_query,
         max_results=max_results,
         language_code=language_code,
@@ -190,7 +192,7 @@ def google_maps_search_hotels(
     )
 
 
-def google_maps_compute_route(
+def amap_compute_route(
     origin: str,
     destination: str,
     travel_mode: str = "DRIVE",
@@ -200,9 +202,11 @@ def google_maps_compute_route(
     avoid_highways: bool = False,
     avoid_ferries: bool = False,
 ) -> dict[str, Any]:
-    """Compute distance and travel time between two addresses with Google Routes.
+    """Compute distance and travel time between two addresses with 高德地图.
 
-    travel_mode can be DRIVE, WALK, BICYCLE, TWO_WHEELER, or TRANSIT.
+    travel_mode: DRIVE, WALK, BICYCLE, TWO_WHEELER (electric bicycle), TRANSIT.
+    Addresses or GCJ-02 longitude,latitude are accepted. Distances are meters.
+    avoid_ferries is unsupported; road avoidance options apply only to DRIVE.
     """
     payload, validation_error, normalized_travel_mode, _ = build_route_payload(
         origin,
@@ -220,9 +224,15 @@ def google_maps_compute_route(
     try:
         routes = compute_route(payload or {})
     except Exception as exc:
-        return google_maps_error(exc)
+        return amap_error(exc)
 
-    route = routes[0] if routes else {}
+    if not routes:
+        return {
+            "success": False,
+            "message": f"No route found from {origin} to {destination}.",
+        }
+
+    route = routes[0]
     return {
         "success": True,
         "origin": origin,
@@ -235,6 +245,29 @@ def google_maps_compute_route(
         "legs": route.get("legs", []),
         "raw_routes": routes,
     }
+
+
+def amap_geocode(address: str, city: str = "") -> dict[str, Any]:
+    """Convert a Chinese address to GCJ-02 coordinates; city disambiguates names."""
+    try:
+        matches = geocode(address, city)
+        return {"success": bool(matches), "geocodes": matches, "coordinate_system": "GCJ-02",
+                "message": "OK" if matches else "No matching address found"}
+    except Exception as exc:
+        return amap_error(exc)
+
+
+def amap_static_map(center: str, zoom: int = 13, width: int = 600, height: int = 400,
+                    markers: list[str] | None = None) -> dict[str, Any]:
+    """Fetch an Amap static image as image_data_url, without exposing the API key.
+
+    center and up to 10 markers accept addresses or GCJ-02 longitude,latitude.
+    zoom is 1-17; width and height are 1-1024 pixels.
+    """
+    try:
+        return static_map(center, zoom, width, height, markers)
+    except Exception as exc:
+        return amap_error(exc)
 
 
 def create_travel_plan(
@@ -344,13 +377,30 @@ def create_travel_plan(
 
 def update_travel_profile(
     plan_id: str,
-    updates: dict[str, Any],
+    updates: TravelProfileUpdates,
 ) -> dict[str, Any]:
     """Update traveler preferences or high-level trip requirements.
 
-    Supported fields are destination, start_date, end_date, departure_city,
-    travelers, budget, currency, travel_style, interests, constraints, pace,
-    and notes. Only include fields that should change.
+    Translate the user's natural-language request into the updates object;
+    never use the user's wording as a field name. Only these keys are allowed:
+    destination (string), start_date and end_date (YYYY-MM-DD strings),
+    departure_city (string), travelers (positive integer), budget (non-negative
+    number), currency (string), travel_style (string), interests (list of strings),
+    constraints (list of strings), pace (string), notes (string).
+
+    Map preferred activities to interests, restrictions such as diet, mobility,
+    or accommodation requirements to constraints, trip tempo to pace, and other
+    trip-specific requests to notes. Preserve the user's meaning; do not invent
+    unsupported keys such as dietary_preferences, hotel_preferences, or transport.
+    For example, use {"constraints": ["不要辣"]} for a diet restriction and
+    {"pace": "relaxed"} for an easy pace.
+
+
+    Include every listed key; use null for fields that should not change.
+    Non-null values replace existing fields,
+    including lists and notes: read get_travel_plan first when adding preferences
+    so existing entries are preserved unless the user asks to remove them.
+    Ask for clarification when the intended value cannot be inferred safely.
     """
     plan, error = get_plan(plan_id)
     if error is not None:
@@ -360,6 +410,7 @@ def update_travel_profile(
         return {
             "success": False,
             "message": "No updates provided.",
+            "error_type": "validation_error",
         }
 
     invalid_fields = set(updates) - VALID_PROFILE_FIELDS
@@ -367,7 +418,12 @@ def update_travel_profile(
         return {
             "success": False,
             "message": f"Invalid profile fields: {', '.join(sorted(invalid_fields))}.",
+            "error_type": "validation_error",
         }
+
+    updates = {field: value for field, value in updates.items() if value is not None}
+    if not updates:
+        return {"success": False, "message": "No non-null updates provided.", "error_type": "validation_error"}
 
     start_date = updates.get("start_date", plan["start_date"])
     end_date = updates.get("end_date", plan["end_date"])
@@ -376,6 +432,7 @@ def update_travel_profile(
         return {
             "success": False,
             "message": date_error,
+            "error_type": "validation_error",
         }
 
     if "travelers" in updates:
@@ -384,6 +441,7 @@ def update_travel_profile(
             return {
                 "success": False,
                 "message": "travelers must be a positive integer.",
+                "error_type": "validation_error",
             }
 
     if "budget" in updates:
@@ -395,6 +453,7 @@ def update_travel_profile(
             return {
                 "success": False,
                 "message": budget_error,
+                "error_type": "validation_error",
             }
 
     for field_name in ("interests", "constraints"):
@@ -404,10 +463,22 @@ def update_travel_profile(
                 return {
                     "success": False,
                     "message": message,
+                    "error_type": "validation_error",
                 }
 
     for field, value in updates.items():
         plan[field] = value
+
+    if (plan.get("planning") or {}).get("stage") and set(updates) & {
+        "destination", "departure_city", "start_date", "end_date", "travelers"
+    }:
+        planning = plan["planning"]
+        planning["stage"] = "requirements"
+        planning["transport_candidates"] = []
+        planning["hotel_candidates"] = []
+        planning["selected_transport"] = {}
+        planning["selected_hotel"] = None
+        planning["needs_replan"] = True
 
     plan["updated_at"] = now()
 
@@ -937,7 +1008,7 @@ def reconcile_travel_plan(
                 refreshed_routes.append(record)
                 affected_route_item_ids.update((origin["item_id"], destination["item_id"]))
             except Exception as exc:
-                route_errors.append(google_maps_error(exc))
+                route_errors.append(amap_error(exc))
 
     audit = audit_plan(plan)
     suggestions = list(audit.get("suggestions", []))
@@ -965,7 +1036,7 @@ def reconcile_travel_plan(
     except Exception as exc:
         return database_error(exc)
     return {
-        "success": True,
+        "success": not route_errors,
         "plan_id": plan_id,
         "affected_days": sorted(days),
         "affected_item_ids": sorted(affected_route_item_ids or item_ids),
@@ -1204,7 +1275,7 @@ def get_travel_plan(plan_id: str) -> dict[str, Any]:
 
 
 def summarize_travel_plan(plan_id: str) -> dict[str, Any]:
-    """Return a compact planning summary with budget totals and coverage by day."""
+    """Summarize coverage and budget ranges; itinerary and budget costs may overlap."""
     plan, error = get_plan(plan_id)
     if error is not None:
         return error
@@ -1214,6 +1285,8 @@ def summarize_travel_plan(plan_id: str) -> dict[str, Any]:
         item["estimated_cost"] for item in plan["recommendations"]
     )
     budget_total = sum(item["amount"] for item in plan["budget_items"])
+    tracked_min = max(itinerary_cost, budget_total)
+    tracked_max = itinerary_cost + budget_total
     days = sorted({item["day"] for item in plan["itinerary"]})
 
     return {
@@ -1234,6 +1307,8 @@ def summarize_travel_plan(plan_id: str) -> dict[str, Any]:
             "estimated_itinerary_cost": itinerary_cost,
             "estimated_recommendation_cost": recommendation_cost,
             "budget_item_total": budget_total,
+            "tracked_cost_range": {"min": tracked_min, "max": tracked_max},
+            "remaining_budget_range": {"min": plan["budget"] - tracked_max, "max": plan["budget"] - tracked_min},
             "remaining_budget_after_budget_items": plan["budget"] - budget_total,
         },
     }

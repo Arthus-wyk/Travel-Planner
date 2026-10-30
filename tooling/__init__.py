@@ -2,6 +2,6 @@
 
 from tooling.context import ToolContext
 from tooling.registry import ToolRegistry
-from tooling.spec import Tool, ToolSpec
+from tooling.spec import ToolSpec
 
-__all__ = ["Tool", "ToolContext", "ToolRegistry", "ToolSpec"]
+__all__ = ["ToolContext", "ToolRegistry", "ToolSpec"]

@@ -5,12 +5,19 @@ description = "MCP tools for a custom travel planning agent"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "httpx>=0.27,<1",
+    "fastapi>=0.115,<1",
+    "jsonschema>=4,<5",
+    "langgraph>=1,<2",
     "mcp[cli]>=1.27,<2",
     "ollama>=0.6.2",
+    "onnxruntime<1.24",
     "pymysql>=1.1.1,<2",
+    "rapidocr-onnxruntime>=1.4.4",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.scripts]
-travel-agent = "service.agent.client:main"
+travel-agent = "service.cli:main"
 travel-mcp = "mcp_server:main"
 travel-api = "service.api.server:main"

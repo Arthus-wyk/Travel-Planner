@@ -47,6 +47,13 @@ def make_plan():
 
 
 class ItineraryReconciliationTests(unittest.TestCase):
+    def test_route_search_without_results_reports_failure(self):
+        with patch.object(server, "compute_route", return_value=[]):
+            result = server.amap_compute_route("故宫，北京", "颐和园，北京")
+
+        self.assertFalse(result["success"])
+        self.assertIn("No route", result["message"])
+
     def test_delete_removes_item_and_invalidates_related_routes(self):
         plan = make_plan()
         with patch.object(server, "get_plan", return_value=(plan, None)), patch.object(
@@ -103,6 +110,16 @@ class ItineraryReconciliationTests(unittest.TestCase):
         self.assertEqual(plan["routes"][0]["distance_meters"], 21000)
         self.assertIn("audit", result)
         save_plan.assert_called_once()
+
+    def test_reconcile_without_routes_reports_failure(self):
+        plan = make_plan()
+        with patch.object(server, "get_plan", return_value=(plan, None)), patch.object(
+            server, "save_plan"
+        ), patch.object(server, "compute_route", return_value=[]):
+            result = server.reconcile_travel_plan("trip-1", affected_days=[1])
+
+        self.assertFalse(result["success"])
+        self.assertEqual(len(result["route_errors"]), 1)
 
 
 if __name__ == "__main__":

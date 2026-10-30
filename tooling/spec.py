@@ -20,6 +20,3 @@ class ToolSpec:
     risk: str = "low"
     required_permission: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-
-
-Tool = ToolSpec

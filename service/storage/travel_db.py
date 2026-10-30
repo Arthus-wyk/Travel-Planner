@@ -4,6 +4,7 @@ import json
 import re
 from datetime import date, datetime
 from decimal import Decimal
+from functools import lru_cache
 from typing import Any
 
 from service.config import (
@@ -44,6 +45,20 @@ def check_database_on_startup() -> None:
         ) from exc
 
 
+@lru_cache(maxsize=1)
+def _ensure_map_cache() -> None:
+    with connect() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """CREATE TABLE IF NOT EXISTS map_api_cache (
+                    cache_key CHAR(64) PRIMARY KEY,
+                    payload LONGTEXT NOT NULL,
+                    expires_at DATETIME NOT NULL,
+                    INDEX idx_map_cache_expiry (expires_at)
+                ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"""
+            )
+
+
 def ensure_schema() -> None:
     charset = _validated_charset()
     database_name = _quote_identifier(DB_NAME)
@@ -55,6 +70,7 @@ def ensure_schema() -> None:
                 f"CHARACTER SET {charset} COLLATE {charset}_unicode_ci"
             )
 
+    _ensure_map_cache()
     with connect() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -79,7 +95,8 @@ def ensure_schema() -> None:
                     itinerary LONGTEXT NOT NULL,
                     routes LONGTEXT NULL,
                     recommendations LONGTEXT NOT NULL,
-                    budget_items LONGTEXT NOT NULL
+                    budget_items LONGTEXT NOT NULL,
+                    planning LONGTEXT NULL
                 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
                 """
             )
@@ -128,8 +145,34 @@ def ensure_schema() -> None:
             except Exception as exc:
                 if "duplicate" not in str(exc).lower() and "1060" not in str(exc):
                     raise
+            try:
+                cursor.execute("ALTER TABLE travel_plans ADD COLUMN planning LONGTEXT NULL")
+            except Exception as exc:
+                if "duplicate" not in str(exc).lower() and "1060" not in str(exc):
+                    raise
             cursor.execute(
                 "UPDATE travel_plans SET title = CONCAT(destination, ' 行程') WHERE title IS NULL OR title = ''"
+            )
+
+
+def read_map_cache(cache_key: str, allow_expired: bool = False) -> Any | None:
+    _ensure_map_cache()
+    with connect() as conn:
+        with conn.cursor() as cursor:
+            expiry = "" if allow_expired else " AND expires_at>UTC_TIMESTAMP()"
+            cursor.execute("SELECT payload FROM map_api_cache WHERE cache_key=%s" + expiry, (cache_key,))
+            row = cursor.fetchone()
+    return json.loads(row["payload"]) if row else None
+
+
+def write_map_cache(cache_key: str, payload: Any, ttl_seconds: int) -> None:
+    with connect() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO map_api_cache (cache_key,payload,expires_at)
+                   VALUES (%s,%s,TIMESTAMPADD(SECOND,%s,UTC_TIMESTAMP()))
+                   ON DUPLICATE KEY UPDATE payload=VALUES(payload),expires_at=VALUES(expires_at)""",
+                (cache_key, json.dumps(payload, ensure_ascii=False), ttl_seconds),
             )
 
 
@@ -159,7 +202,8 @@ def save_plan(plan: dict[str, Any]) -> None:
                     itinerary,
                     routes,
                     recommendations,
-                    budget_items
+                    budget_items,
+                    planning
                 )
                 VALUES (
                     %(plan_id)s,
@@ -181,7 +225,8 @@ def save_plan(plan: dict[str, Any]) -> None:
                     %(itinerary)s,
                     %(routes)s,
                     %(recommendations)s,
-                    %(budget_items)s
+                    %(budget_items)s,
+                    %(planning)s
                 )
                 ON DUPLICATE KEY UPDATE
                     title = VALUES(title),
@@ -201,7 +246,8 @@ def save_plan(plan: dict[str, Any]) -> None:
                     itinerary = VALUES(itinerary),
                     routes = VALUES(routes),
                     recommendations = VALUES(recommendations),
-                    budget_items = VALUES(budget_items)
+                    budget_items = VALUES(budget_items),
+                    planning = VALUES(planning)
                 """,
                 {
                     "plan_id": plan["plan_id"],
@@ -224,6 +270,7 @@ def save_plan(plan: dict[str, Any]) -> None:
                     "routes": _json_dumps(plan.get("routes", [])),
                     "recommendations": _json_dumps(plan["recommendations"]),
                     "budget_items": _json_dumps(plan["budget_items"]),
+                    "planning": _json_dumps(plan.get("planning", {})),
                 },
             )
 
@@ -368,6 +415,7 @@ def row_to_plan(row: dict[str, Any]) -> dict[str, Any]:
         "routes": _json_loads(row.get("routes"), []),
         "recommendations": _json_loads(row["recommendations"], []),
         "budget_items": _json_loads(row["budget_items"], []),
+        "planning": _json_loads(row.get("planning"), {}),
     }
 
 

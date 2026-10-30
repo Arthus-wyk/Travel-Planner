@@ -1,6 +1,6 @@
 import unittest
 
-from service.agent.itinerary_audit import audit_plan
+from service.travel.itinerary_audit import audit_plan
 from service.validation import time_minutes, validate_time_of_day
 
 

@@ -38,4 +38,14 @@ class ToolRegistry:
         return tuple(spec for spec in self._specs.values() if spec.domains & requested)
 
     def ollama_schemas(self) -> list[dict]:
-        return [{"type": "function", "function": {"name": spec.name, "description": spec.description, "parameters": spec.input_schema}} for spec in self._specs.values()]
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.input_schema,
+                },
+            }
+            for spec in self._specs.values()
+        ]

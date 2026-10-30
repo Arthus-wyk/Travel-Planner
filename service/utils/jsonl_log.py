@@ -4,6 +4,11 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from threading import Lock
+
+from service.utils.runtime_log import current_run, redact
+
+_write_lock = Lock()
 
 
 def utc_now_iso() -> str:
@@ -58,6 +63,10 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as file:
-        json.dump(to_jsonable(record), file, ensure_ascii=False)
-        file.write("\n")
+    record = dict(record)
+    run = current_run.get()
+    if run is not None:
+        record["runId"] = run.run_id
+    line = json.dumps(redact(to_jsonable(record)), ensure_ascii=False) + "\n"
+    with _write_lock, path.open("a", encoding="utf-8") as file:
+        file.write(line)

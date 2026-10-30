@@ -42,32 +42,5 @@ DB_CHARSET = os.getenv("TRAVEL_DB_CHARSET", "utf8mb4")
 DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("TRAVEL_DB_CONNECT_TIMEOUT_SECONDS", "5"))
 VALID_DB_CHARSETS = {"utf8", "utf8mb4"}
 
-GOOGLE_MAPS_API_KEY = get_env_or_dotenv("GOOGLE_MAPS_API_KEY", "")
-GOOGLE_MAPS_TIMEOUT_SECONDS = int(os.getenv("GOOGLE_MAPS_TIMEOUT_SECONDS", "10"))
-GOOGLE_PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
-GOOGLE_ROUTES_COMPUTE_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
-GOOGLE_PLACES_FIELD_MASK = ",".join(
-    [
-        "places.id",
-        "places.displayName",
-        "places.formattedAddress",
-        "places.location",
-        "places.rating",
-        "places.userRatingCount",
-        "places.priceLevel",
-        "places.businessStatus",
-        "places.types",
-        "places.googleMapsUri",
-    ]
-)
-GOOGLE_ROUTES_FIELD_MASK = ",".join(
-    [
-        "routes.duration",
-        "routes.staticDuration",
-        "routes.distanceMeters",
-        "routes.localizedValues",
-        "routes.legs.distanceMeters",
-        "routes.legs.duration",
-        "routes.legs.localizedValues",
-    ]
-)
+AMAP_API_KEY = get_env_or_dotenv("AMAP_API_KEY", "")
+AMAP_TIMEOUT_SECONDS = int(get_env_or_dotenv("AMAP_TIMEOUT_SECONDS", "10"))

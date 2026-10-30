@@ -4,11 +4,3 @@ class ToolError(Exception):
 
 class ToolNotFoundError(ToolError):
     pass
-
-
-class ToolValidationError(ToolError):
-    pass
-
-
-class ToolPolicyError(ToolError):
-    pass

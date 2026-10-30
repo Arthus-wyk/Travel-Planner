@@ -1,0 +1,1003 @@
+{
+  "add_budget_item": {
+    "properties": {
+      "amount": {
+        "title": "Amount",
+        "type": "number"
+      },
+      "category": {
+        "title": "Category",
+        "type": "string"
+      },
+      "description": {
+        "title": "Description",
+        "type": "string"
+      },
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id",
+      "category",
+      "amount",
+      "description"
+    ],
+    "title": "add_budget_itemArguments",
+    "type": "object"
+  },
+  "add_itinerary_item": {
+    "properties": {
+      "booking_required": {
+        "default": false,
+        "title": "Booking Required",
+        "type": "boolean"
+      },
+      "category": {
+        "title": "Category",
+        "type": "string"
+      },
+      "day": {
+        "title": "Day",
+        "type": "integer"
+      },
+      "duration_minutes": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Duration Minutes"
+      },
+      "estimated_cost": {
+        "default": 0,
+        "title": "Estimated Cost",
+        "type": "number"
+      },
+      "location": {
+        "title": "Location",
+        "type": "string"
+      },
+      "notes": {
+        "default": "",
+        "title": "Notes",
+        "type": "string"
+      },
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      },
+      "time_of_day": {
+        "title": "Time Of Day",
+        "type": "string"
+      },
+      "title": {
+        "title": "Title",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id",
+      "day",
+      "time_of_day",
+      "title",
+      "location",
+      "category"
+    ],
+    "title": "add_itinerary_itemArguments",
+    "type": "object"
+  },
+  "add_recommendation": {
+    "properties": {
+      "category": {
+        "title": "Category",
+        "type": "string"
+      },
+      "estimated_cost": {
+        "default": 0,
+        "title": "Estimated Cost",
+        "type": "number"
+      },
+      "location": {
+        "title": "Location",
+        "type": "string"
+      },
+      "name": {
+        "title": "Name",
+        "type": "string"
+      },
+      "notes": {
+        "default": "",
+        "title": "Notes",
+        "type": "string"
+      },
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      },
+      "priority": {
+        "default": "medium",
+        "title": "Priority",
+        "type": "string"
+      },
+      "tags": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Tags"
+      },
+      "why": {
+        "title": "Why",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id",
+      "name",
+      "category",
+      "location",
+      "why"
+    ],
+    "title": "add_recommendationArguments",
+    "type": "object"
+  },
+  "audit_travel_plan": {
+    "properties": {
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id"
+    ],
+    "title": "audit_travel_planArguments",
+    "type": "object"
+  },
+  "create_travel_plan": {
+    "properties": {
+      "budget": {
+        "title": "Budget",
+        "type": "number"
+      },
+      "constraints": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Constraints"
+      },
+      "currency": {
+        "default": "CNY",
+        "title": "Currency",
+        "type": "string"
+      },
+      "departure_city": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Departure City"
+      },
+      "destination": {
+        "title": "Destination",
+        "type": "string"
+      },
+      "end_date": {
+        "title": "End Date",
+        "type": "string"
+      },
+      "interests": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Interests"
+      },
+      "notes": {
+        "default": "",
+        "title": "Notes",
+        "type": "string"
+      },
+      "pace": {
+        "default": "moderate",
+        "title": "Pace",
+        "type": "string"
+      },
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      },
+      "start_date": {
+        "title": "Start Date",
+        "type": "string"
+      },
+      "title": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Title"
+      },
+      "travel_style": {
+        "default": "balanced",
+        "title": "Travel Style",
+        "type": "string"
+      },
+      "travelers": {
+        "title": "Travelers",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "plan_id",
+      "destination",
+      "start_date",
+      "end_date",
+      "travelers",
+      "budget"
+    ],
+    "title": "create_travel_planArguments",
+    "type": "object"
+  },
+  "delete_itinerary_item": {
+    "properties": {
+      "item_id": {
+        "title": "Item Id",
+        "type": "string"
+      },
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id",
+      "item_id"
+    ],
+    "title": "delete_itinerary_itemArguments",
+    "type": "object"
+  },
+  "delete_travel_plan": {
+    "properties": {
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id"
+    ],
+    "title": "delete_travel_planArguments",
+    "type": "object"
+  },
+  "get_travel_plan": {
+    "properties": {
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id"
+    ],
+    "title": "get_travel_planArguments",
+    "type": "object"
+  },
+  "list_itinerary": {
+    "properties": {
+      "day": {
+        "anyOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Day"
+      },
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id"
+    ],
+    "title": "list_itineraryArguments",
+    "type": "object"
+  },
+  "list_travel_plans": {
+    "properties": {},
+    "title": "list_travel_plansArguments",
+    "type": "object"
+  },
+  "move_itinerary_item": {
+    "properties": {
+      "item_id": {
+        "title": "Item Id",
+        "type": "string"
+      },
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      },
+      "target_day": {
+        "title": "Target Day",
+        "type": "integer"
+      },
+      "target_time_of_day": {
+        "title": "Target Time Of Day",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id",
+      "item_id",
+      "target_day",
+      "target_time_of_day"
+    ],
+    "title": "move_itinerary_itemArguments",
+    "type": "object"
+  },
+  "rank_recommendations": {
+    "properties": {
+      "candidates": {
+        "items": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "title": "Candidates",
+        "type": "array"
+      },
+      "category": {
+        "default": "",
+        "title": "Category",
+        "type": "string"
+      },
+      "max_results": {
+        "default": 5,
+        "title": "Max Results",
+        "type": "integer"
+      },
+      "preferences": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Preferences"
+      }
+    },
+    "required": [
+      "candidates"
+    ],
+    "title": "rank_recommendationsArguments",
+    "type": "object"
+  },
+  "read_travel_preference_profile": {
+    "properties": {},
+    "title": "read_travel_preference_profileArguments",
+    "type": "object"
+  },
+  "reconcile_travel_plan": {
+    "properties": {
+      "affected_days": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Affected Days"
+      },
+      "affected_item_ids": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Affected Item Ids"
+      },
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      },
+      "travel_mode": {
+        "default": "DRIVE",
+        "title": "Travel Mode",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id"
+    ],
+    "title": "reconcile_travel_planArguments",
+    "type": "object"
+  },
+  "summarize_travel_plan": {
+    "properties": {
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id"
+    ],
+    "title": "summarize_travel_planArguments",
+    "type": "object"
+  },
+  "update_itinerary_item": {
+    "properties": {
+      "item_id": {
+        "title": "Item Id",
+        "type": "string"
+      },
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      },
+      "updates": {
+        "additionalProperties": true,
+        "title": "Updates",
+        "type": "object"
+      }
+    },
+    "required": [
+      "plan_id",
+      "item_id",
+      "updates"
+    ],
+    "title": "update_itinerary_itemArguments",
+    "type": "object"
+  },
+  "update_itinerary_routes": {
+    "properties": {
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      },
+      "routes": {
+        "items": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "title": "Routes",
+        "type": "array"
+      }
+    },
+    "required": [
+      "plan_id",
+      "routes"
+    ],
+    "title": "update_itinerary_routesArguments",
+    "type": "object"
+  },
+  "update_recommendation": {
+    "properties": {
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      },
+      "recommendation_id": {
+        "title": "Recommendation Id",
+        "type": "string"
+      },
+      "updates": {
+        "additionalProperties": true,
+        "title": "Updates",
+        "type": "object"
+      }
+    },
+    "required": [
+      "plan_id",
+      "recommendation_id",
+      "updates"
+    ],
+    "title": "update_recommendationArguments",
+    "type": "object"
+  },
+  "update_travel_preference_profile": {
+    "properties": {
+      "note": {
+        "default": "",
+        "title": "Note",
+        "type": "string"
+      },
+      "updates": {
+        "additionalProperties": true,
+        "title": "Updates",
+        "type": "object"
+      }
+    },
+    "required": [
+      "updates"
+    ],
+    "title": "update_travel_preference_profileArguments",
+    "type": "object"
+  },
+  "update_travel_profile": {
+    "$defs": {
+      "TravelProfileUpdates": {
+        "additionalProperties": false,
+        "properties": {
+          "destination": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Destination"
+          },
+          "start_date": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Date"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date"
+          },
+          "departure_city": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Departure City"
+          },
+          "travelers": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Travelers"
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "travel_style": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Travel Style"
+          },
+          "interests": {
+            "anyOf": [
+              {
+                "description": "Preferred activities and themes.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interests"
+          },
+          "constraints": {
+            "anyOf": [
+              {
+                "description": "Dietary, mobility, accommodation, or other trip restrictions.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Constraints"
+          },
+          "pace": {
+            "anyOf": [
+              {
+                "description": "Requested trip tempo, for example relaxed.",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pace"
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "description": "Other trip-specific requests that do not fit another field.",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notes"
+          }
+        },
+        "required": [
+          "destination",
+          "start_date",
+          "end_date",
+          "departure_city",
+          "travelers",
+          "budget",
+          "currency",
+          "travel_style",
+          "interests",
+          "constraints",
+          "pace",
+          "notes"
+        ],
+        "title": "TravelProfileUpdates",
+        "type": "object"
+      }
+    },
+    "properties": {
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      },
+      "updates": {
+        "$ref": "#/$defs/TravelProfileUpdates"
+      }
+    },
+    "required": [
+      "plan_id",
+      "updates"
+    ],
+    "title": "update_travel_profileArguments",
+    "type": "object"
+  },
+  "verify_last_tool_result": {
+    "properties": {
+      "arguments": {
+        "additionalProperties": true,
+        "title": "Arguments",
+        "type": "object"
+      },
+      "result_text": {
+        "title": "Result Text",
+        "type": "string"
+      },
+      "tool_name": {
+        "title": "Tool Name",
+        "type": "string"
+      }
+    },
+    "required": [
+      "tool_name",
+      "arguments",
+      "result_text"
+    ],
+    "title": "verify_last_tool_resultArguments",
+    "type": "object"
+  },
+  "amap_search_places": {
+    "properties": {
+      "query": {
+        "title": "Query",
+        "type": "string"
+      },
+      "max_results": {
+        "default": 5,
+        "title": "Max Results",
+        "type": "integer"
+      },
+      "language_code": {
+        "default": "zh-CN",
+        "title": "Language Code",
+        "type": "string"
+      },
+      "region_code": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Region Code"
+      },
+      "location_bias_latitude": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Location Bias Latitude"
+      },
+      "location_bias_longitude": {
+        "anyOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Location Bias Longitude"
+      },
+      "location_bias_radius_meters": {
+        "default": 5000,
+        "title": "Location Bias Radius Meters",
+        "type": "number"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "title": "amap_search_placesArguments",
+    "type": "object"
+  },
+  "amap_search_hotels": {
+    "properties": {
+      "destination": {
+        "title": "Destination",
+        "type": "string"
+      },
+      "query": {
+        "default": "",
+        "title": "Query",
+        "type": "string"
+      },
+      "max_results": {
+        "default": 5,
+        "title": "Max Results",
+        "type": "integer"
+      },
+      "language_code": {
+        "default": "zh-CN",
+        "title": "Language Code",
+        "type": "string"
+      },
+      "region_code": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Region Code"
+      }
+    },
+    "required": [
+      "destination"
+    ],
+    "title": "amap_search_hotelsArguments",
+    "type": "object"
+  },
+  "amap_compute_route": {
+    "properties": {
+      "origin": {
+        "title": "Origin",
+        "type": "string"
+      },
+      "destination": {
+        "title": "Destination",
+        "type": "string"
+      },
+      "travel_mode": {
+        "default": "DRIVE",
+        "title": "Travel Mode",
+        "type": "string"
+      },
+      "language_code": {
+        "default": "zh-CN",
+        "title": "Language Code",
+        "type": "string"
+      },
+      "units": {
+        "default": "METRIC",
+        "title": "Units",
+        "type": "string"
+      },
+      "avoid_tolls": {
+        "default": false,
+        "title": "Avoid Tolls",
+        "type": "boolean"
+      },
+      "avoid_highways": {
+        "default": false,
+        "title": "Avoid Highways",
+        "type": "boolean"
+      },
+      "avoid_ferries": {
+        "default": false,
+        "title": "Avoid Ferries",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "origin",
+      "destination"
+    ],
+    "title": "amap_compute_routeArguments",
+    "type": "object"
+  },
+  "amap_geocode": {
+    "properties": {
+      "address": {
+        "title": "Address",
+        "type": "string"
+      },
+      "city": {
+        "default": "",
+        "title": "City",
+        "type": "string"
+      }
+    },
+    "required": [
+      "address"
+    ],
+    "title": "amap_geocodeArguments",
+    "type": "object"
+  },
+  "amap_static_map": {
+    "properties": {
+      "center": {
+        "title": "Center",
+        "type": "string"
+      },
+      "zoom": {
+        "default": 13,
+        "title": "Zoom",
+        "type": "integer"
+      },
+      "width": {
+        "default": 600,
+        "title": "Width",
+        "type": "integer"
+      },
+      "height": {
+        "default": 400,
+        "title": "Height",
+        "type": "integer"
+      },
+      "markers": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Markers"
+      }
+    },
+    "required": [
+      "center"
+    ],
+    "title": "amap_static_mapArguments",
+    "type": "object"
+  }
+}

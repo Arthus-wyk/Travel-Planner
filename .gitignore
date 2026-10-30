@@ -17,3 +17,4 @@ wheels/
 frontend/node_modules/
 frontend/dist/
 frontend/.idea/
+data

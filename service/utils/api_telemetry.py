@@ -5,6 +5,7 @@ from typing import Any
 
 from service.utils.jsonl_log import append_jsonl, utc_now_iso
 from service.utils.log_paths import API_EVENTS_FILE
+from service.utils.runtime_log import record_event
 
 
 class ApiTelemetryLogger:
@@ -104,6 +105,7 @@ class ApiTelemetryLogger:
         )
 
     def _record(self, event_name: str, payload: dict[str, Any]) -> None:
+        record_event(event_name, payload)
         append_jsonl(
             API_EVENTS_FILE,
             {

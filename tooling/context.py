@@ -10,5 +10,4 @@ class ToolContext:
 
     actor_id: str | None = None
     permissions: frozenset[str] = frozenset()
-    confirmed: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)

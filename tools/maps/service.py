@@ -1,5 +1,6 @@
-"""Google Maps search and route business operations."""
+"""Amap search, geocoding, static maps and route operations."""
+from service.mcp.server import (
+    amap_compute_route, amap_search_hotels, amap_search_places, amap_geocode, amap_static_map,
+)
 
-from service.mcp.server import google_maps_compute_route, google_maps_search_hotels, google_maps_search_places
-
-__all__ = ["google_maps_compute_route", "google_maps_search_hotels", "google_maps_search_places"]
+__all__ = ["amap_compute_route", "amap_search_hotels", "amap_search_places", "amap_geocode", "amap_static_map"]

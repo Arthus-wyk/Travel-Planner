@@ -1,7 +1,7 @@
 from tools.maps import service
 
-TOOL_NAMES = ("google_maps_search_places", "google_maps_search_hotels", "google_maps_compute_route")
-TOOL_DOMAINS = {"google_maps_search_places": {"place", "restaurant", "recommendation"}, "google_maps_search_hotels": {"hotel"}, "google_maps_compute_route": {"route"}}
+TOOL_NAMES = ("amap_search_places", "amap_search_hotels", "amap_compute_route", "amap_geocode", "amap_static_map")
+TOOL_DOMAINS = {"amap_search_places": {"place", "restaurant", "recommendation"}, "amap_search_hotels": {"hotel"}, "amap_compute_route": {"route"}, "amap_geocode": {"place", "hotel", "route"}, "amap_static_map": {"place", "route"}}
 
 
 def register(mcp) -> None:

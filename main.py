@@ -1,4 +1,4 @@
-from service.agent.client import main
+from service.cli import main
 
 
 if __name__ == "__main__":

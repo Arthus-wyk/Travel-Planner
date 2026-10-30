@@ -1,24 +1,29 @@
 from __future__ import annotations
-
+from uuid import uuid4
 from datetime import datetime
 import re
-from typing import Any
+from typing import Annotated, Any
+from typing_extensions import TypedDict
+from pydantic import ConfigDict, Field, with_config
 
 
-VALID_PROFILE_FIELDS = {
-    "destination",
-    "start_date",
-    "end_date",
-    "departure_city",
-    "travelers",
-    "budget",
-    "currency",
-    "travel_style",
-    "interests",
-    "constraints",
-    "pace",
-    "notes",
-}
+@with_config(ConfigDict(extra="forbid", strict=True))
+class TravelProfileUpdates(TypedDict):
+    destination: str | None
+    start_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")] | None
+    end_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")] | None
+    departure_city: str | None
+    travelers: Annotated[int, Field(ge=1)] | None
+    budget: Annotated[float, Field(ge=0)] | None
+    currency: str | None
+    travel_style: str | None
+    interests: Annotated[list[str], Field(description="Preferred activities and themes.")] | None
+    constraints: Annotated[list[str], Field(description="Dietary, mobility, accommodation, or other trip restrictions.")] | None
+    pace: Annotated[str, Field(description="Requested trip tempo, for example relaxed.")] | None
+    notes: Annotated[str, Field(description="Other trip-specific requests that do not fit another field.")] | None
+
+
+VALID_PROFILE_FIELDS = set(TravelProfileUpdates.__annotations__)
 
 VALID_ITINERARY_FIELDS = {
     "day",
@@ -93,8 +98,8 @@ def validate_non_negative_number(
     return True, None
 
 
-def next_id(items: list[dict[str, Any]], prefix: str) -> str:
-    return f"{prefix}_{len(items) + 1}"
+def next_id(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex}"
 
 
 def _parse_date(value: str, field_name: str) -> tuple[bool, str | None]:
