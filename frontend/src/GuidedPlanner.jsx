@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import "./guided-planner.css";
 import PlacePicker from "./PlacePicker";
+import GuideGeneration from "./GuideGeneration";
 import { refreshAfterCommit } from "./api";
 import { activitySnapshot as buildSnapshot, activityIssues, transportIssues, validMoney, placeTarget, focusIssue, hasCoordinates } from "./planningValidation";
 import { BusyStatus, IssueList, LoadError, useUnsavedChanges } from "./planningUi";
@@ -80,7 +81,7 @@ export function PlanningPage({ api, refreshPlans }) {
   const [newLocation, setNewLocation] = useState("");
   const [newCategory, setNewCategory] = useState("attraction");
   const [busy, setBusy] = useState(false);
-  const [generating, setGenerating] = useState(false);
+  const [jobRunning, setJobRunning] = useState(false);
   const [error, setError] = useState("");
   const requestBusy = useRef(false);
   const [dirty, setDirty] = useState(false);
@@ -120,7 +121,6 @@ export function PlanningPage({ api, refreshPlans }) {
     requestBusy.current = true; setBusy(true); setError("");
     const labels = { guide: "正在识别攻略图片", activities: "正在识别地点与要求", draft: "正在生成并检查路线", candidates: "正在查询交通候选", resolve_place: "正在确认地点", choose_activities: "正在保存地点选择", choose_candidates: "正在保存交通并查询住宿", add_activity: "正在添加地点" };
     setTask(labels[name] || "正在保存");
-    if (name === "draft") setGenerating(true);
     try {
       if (plan.planning?.stage === 'activities') payload = { ...activitySnapshot(), text: guideText, ...payload };
       if (file) {
@@ -135,20 +135,15 @@ export function PlanningPage({ api, refreshPlans }) {
       void refreshAfterCommit(refreshPlans, setNotice);
       return result;
     } catch (cause) { if (mounted.current) { setError(cause.message); setUncertain(Boolean(cause.uncertain)); } return null; }
-    finally { requestBusy.current = false; if (mounted.current) { setBusy(false); setGenerating(false); setTask(""); } }
-  }
-  async function upload(event) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    if (!file.type.startsWith("image/") || file.size > 10 * 1024 * 1024) { setError("请选择不超过 10 MB 的图片。"); return; }
-    await action("guide", {}, file);
-    event.target.value = "";
+    finally { requestBusy.current = false; if (mounted.current) { setBusy(false); setTask(""); } }
   }
   const edits = { choices, categories, details, selected_hotel: selectedHotel, text: guideText };
   const activitySnapshot = () => buildSnapshot(plan, edits);
-  async function generate() {
-    if (activityIssues(plan, edits).some(x => x.blocking)) return;
-    if (await action("draft", { text: guideText, ...activitySnapshot() })) { allowNavigation(); navigate(`/plans/${encode(planId)}/review`); }
+  async function generateFromSavedPlaces() {
+    if (activityIssues(plan, edits).some(issue => issue.blocking)) return;
+    if (await action("draft", { ...activitySnapshot(), text: plan.planning?.guide_text || "" })) {
+      allowNavigation(); navigate(`/plans/${encode(planId)}/review`);
+    }
   }
   function changeKind(direction, kind) {
     const nextKinds = kind === "drive" ? { outbound: "drive", return: "drive" } : kinds[direction] === "drive" ? { outbound: kind, return: kind } : { ...kinds, [direction]: kind };
@@ -198,15 +193,14 @@ export function PlanningPage({ api, refreshPlans }) {
       <div className="guided-actions"><button className="primary-button" disabled={transportProblems.length > 0} onClick={() => action("choose_candidates", { ...selection, ...(driving ? { drive_departures: driveDepartures, vehicles: Number(vehicles) } : {}) })}>确认交通，继续</button><button onClick={() => action("candidates")}>重新查询交通候选</button></div>
       </fieldset>
     </section>}
-    {stage === "activities" && <section className="guided-card activity-workspace"><div className="activity-intro"><div><h2>把想去的地方，整理成旅程</h2><p className="guided-note">导入攻略或手动添加地点，选好住宿与必去地点后生成路线。</p></div><span className="activity-total">{activities.length} 个地点</span></div>
+    {["activities", "review", "confirmed"].includes(stage) && <GuideGeneration api={api} planId={planId} text={guideText} onText={value => { setGuideText(value); setDirty(true); }} snapshot={activitySnapshot()} disabled={busy || uncertain || blockers.length > 0} manualAvailable={activities.some(item => item.category !== "hotel" && choices[item.id] !== "exclude")} onManual={generateFromSavedPlaces} onRunning={setJobRunning} onComplete={() => { allowNavigation(); navigate(`/plans/${encode(planId)}/review`); }} />}
+    {stage === "activities" && <section className="guided-card activity-workspace"><div className="activity-intro"><div><h2>把想去的地方，整理成旅程</h2><p className="guided-note">提交攻略即可生成每日草稿，也可以展开高级编辑调整。</p></div><span className="activity-total">{activities.length} 个地点</span></div>
       <div className="guided-save-status" role="status">{busy ? '保存中…' : dirty ? '有未保存的修改' : '已保存'}{newPlace.trim() && ' · 有尚未添加的地点'}{guideText !== (state.guide_text || '') && ' · 攻略文字已修改，下次识别或生成时会重新解析'}</div>
-      <fieldset className="guided-fieldset" disabled={busy || uncertain} onChange={event => { if (event.target.type !== 'file' && event.target.type !== 'checkbox' && !event.target.closest('.place-picker,.guided-add')) setDirty(true); }}>
-      <div className="guided-actions guided-primary-actions"><span>{blockers.length ? `还需处理 ${blockers.length} 项才能生成` : "可以生成路线"}</span><button className="primary-button" disabled={blockers.length > 0} onClick={generate}>{generating ? "正在根据攻略规划行程…" : "生成并检查路线"}</button><button disabled={!validDetails} onClick={() => action("choose_activities", { ...activitySnapshot(), text: guideText })}>保存地点选择</button><button disabled={!validDetails} onClick={() => action("candidates")}>保存并重新比较交通</button></div>
+      <details><summary>调整地点与住宿</summary>
+      <fieldset className="guided-fieldset" disabled={busy || uncertain || jobRunning} onChange={event => { if (event.target.type !== 'file' && event.target.type !== 'checkbox' && !event.target.closest('.place-picker,.guided-add')) setDirty(true); }}>
+      <div className="guided-actions guided-primary-actions"><span>{blockers.length ? `请先处理 ${blockers.length} 项地点问题` : "调整后可在上方生成每日行程"}</span><button disabled={!validDetails} onClick={() => action("choose_activities", { ...activitySnapshot(), text: guideText })}>保存地点调整</button></div>
 
       <IssueList issues={problems} />
-      <details className="guided-guide-section activity-import" open={!activities.length || undefined}><summary><strong>导入旅行攻略</strong><span>上传图片或粘贴文字，提取想去的地方</span></summary><label className="guided-upload">上传攻略图片<input type="file" accept="image/*" onChange={upload} /></label>
-      <label className="guided-text">识别文字（可修改）<textarea id="guide-input" rows="5" value={guideText} onChange={(e) => setGuideText(e.target.value)} placeholder="粘贴攻略文字，包括日期、先后顺序、用餐和住宿要求。" /></label>
-      <div className="guided-actions"><button disabled={!validDetails} onClick={() => action("activities", { text: guideText, ...activitySnapshot() })}>识别地点与要求</button></div></details>
       <div className="guided-actions"><label><input type="checkbox" checked={showExcluded} onChange={e => { setShowExcluded(e.target.checked); e.stopPropagation(); }} />显示已排除地点</label></div>
       {Object.entries(categoryLabels).sort(([a], [b]) => a === "hotel" ? -1 : b === "hotel" ? 1 : 0).map(([category, label]) => <details className="guided-category activity-category" id={`category-${category}`} key={category} open={category === "hotel" || undefined}><summary>{category === "hotel" ? "选择住宿" : label} <small>共 {activities.filter(x => (categories[x.id] || x.category) === category).length} 个 · 必去 {activities.filter(x => (categories[x.id] || x.category) === category && choices[x.id] === "must").length} 个 · 待定位 {activities.filter(x => (categories[x.id] || x.category) === category && choices[x.id] !== "exclude" && !hasCoordinates(x.place)).length} 个</small></summary>{category === "hotel" && <p className="guided-note">本次行程选择一家住宿；酒店估价为模拟价格，已购金额优先计入预算。{!needsHotel && "一日游无需选择住宿。"}</p>}
         <div className="guided-options">{activities.filter((item) => (categories[item.id] || item.category || "attraction") === category && (showExcluded || choices[item.id] !== "exclude")).map((item) => {
@@ -221,10 +215,10 @@ export function PlanningPage({ api, refreshPlans }) {
       
       
 
-      </fieldset>{generating && <p role="status" className="guided-note">正在根据攻略规划行程，请稍候…</p>}
+      </fieldset></details>
     </section>}
     {stage === "review" && <section className="guided-card"><h2>地点选择已完成</h2><p>路线地图、每日行程和预算检查在独立审核页中查看。</p><div className="guided-actions"><Link className="primary-button" to={`/plans/${encode(planId)}/review`}>打开路线与预算审核</Link><button disabled={busy} onClick={() => action("edit_places")}>修改地点选择</button></div></section>}
-    {stage === "confirmed" && <section className="guided-card"><h2>已确认行程</h2><p>行程单可查看、打印，并登记交通、酒店与门票购买价格。</p><Link className="primary-button" to={`/plans/${encode(planId)}/sheet`}>查看行程单</Link><div className="guided-actions"><button onClick={generate} disabled={busy || uncertain}>{generating ? "正在根据攻略规划行程…" : "重新规划路线"}</button><button onClick={() => action("candidates")} disabled={busy}>重新比较交通</button></div></section>}
+    {stage === "confirmed" && <section className="guided-card"><h2>已确认行程</h2><p>行程单可查看、打印，并登记交通、酒店与门票购买价格。</p><Link className="primary-button" to={`/plans/${encode(planId)}/sheet`}>查看行程单</Link></section>}
   </div>;
 }
 

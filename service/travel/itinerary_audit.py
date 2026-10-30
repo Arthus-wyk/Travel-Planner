@@ -114,6 +114,12 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
         home_location = planning.get("home_location") or plan.get("departure_city")
         selected_hotel = next((x for x in planning.get("hotel_candidates") or [] if x.get("id") == planning.get("selected_hotel")), None)
         hotel_location = (selected_hotel or {}).get("location")
+        if trip_days and trip_days > 1 and not selected_hotel:
+            issues.append(issue("missing_hotel", "high", "尚未确定住宿，请选择具体酒店后重新生成。", None))
+        unresolved_places = [x["id"] for x in planning.get("activities", [])
+                             if x.get("choice") != "exclude" and x.get("category") != "hotel" and not x.get("place")]
+        if planning.get("guide_auto") and unresolved_places:
+            issues.append(issue("unresolved_places", "high", "部分地点位置待确定，请选择候选或移除后重新生成。", unresolved_places))
         for day in range(1, (trip_days or 0) + 1):
             ordered = sorted(by_day.get(day, []), key=lambda x: time_minutes(x.get("time_of_day")) if time_minutes(x.get("time_of_day")) is not None else 1440)
             expected_start = "home_anchor" if day == 1 else "hotel_anchor"
@@ -150,7 +156,8 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
         if unresolved:
             issues.append(issue("unresolved_activity", "high", "主题推荐尚不是具体地点，请选择具体地点或排除这些推荐后重新规划。", unresolved))
         if any(x.get("source") == "provisional_estimate" for x in plan.get("routes") or []):
-            issues.append(issue("route_estimate", "medium", "地点间交通时间为临时估算，出行前请核对实时路线。", None))
+            severity = "high" if planning.get("guide_auto") else "medium"
+            issues.append(issue("route_estimate", severity, "地点间交通时间为临时估算，出行前请核对实时路线。", None))
         guided_budget = budget_summary(plan)
         for item in guided_budget["items"]:
             if item.get("selection_changed"):

@@ -66,3 +66,20 @@
 .activity-manual{margin-top:18px;border-top:1px solid #dce7e8;padding-top:16px}
 .activity-manual>summary{cursor:pointer;color:#166b78;font-weight:700}
 @media(max-width:700px){.activity-intro{flex-direction:column;gap:10px}.activity-intro h2{font-size:1.25rem}.activity-category>summary{flex-wrap:wrap;padding:14px}.activity-category>summary small{flex-basis:80%}.activity-category>.guided-options{padding:8px}.activity-workspace .guided-primary-actions{gap:8px}}
+
+.generation-progress { margin-top: 20px; padding: 22px; border: 1px solid #a7c7bc; border-radius: 16px; background: #f0f7f4; color: #244c42; }
+.generation-progress strong { display: flex; align-items: center; gap: 10px; }
+.generation-progress ol { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 10px; padding: 0; list-style: none; }
+.generation-progress li { padding: 10px; border-radius: 8px; color: #68766f; background: #ffffff80; }
+.generation-progress li.current { background: #245c4b; color: white; font-weight: 600; }
+.generation-progress li.done { color: #245c4b; }
+.generation-progress small { display: block; margin-top: 10px; overflow-wrap: anywhere; }
+.activity-import{border-color:#9bbbad;background:linear-gradient(135deg,#f7fbf8,#fff 65%)}
+.activity-import textarea{min-height:130px;resize:vertical}
+.activity-import>.primary-button{margin-top:10px;min-width:190px}
+.generation-error{margin-top:18px;padding:16px 18px;border-left:4px solid #b45309;background:#fff7ed;color:#78350f;border-radius:8px}
+.generation-error p{margin:8px 0;line-height:1.5}
+.generation-error button{margin-top:4px}
+.generation-spinner { width: 16px; height: 16px; border: 2px solid #a7c7bc; border-top-color: #245c4b; border-radius: 50%; animation: generation-spin 1s linear infinite; }
+@keyframes generation-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .generation-spinner { animation: none; } }

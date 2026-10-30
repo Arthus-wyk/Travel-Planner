@@ -16,8 +16,8 @@ class OutputContractTests(unittest.TestCase):
         self.addCleanup(self.client.stop); self.addCleanup(self.model.stop)
 
     def propose(self, placements, plan=None):
-        self.chat.return_value = SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[{"function": {
-            "name": "submit_itinerary_schedule", "arguments": json.dumps({"placements": placements}, ensure_ascii=False)}}]))
+        self.chat.return_value = SimpleNamespace(message=SimpleNamespace(
+            content=json.dumps({"placements": placements}, ensure_ascii=False), tool_calls=[]))
         return generate_itinerary_proposal(plan or sample_plan())
 
     def test_server_binds_positions_and_duration_without_exposing_ids(self):
@@ -26,7 +26,8 @@ class OutputContractTests(unittest.TestCase):
         self.assertEqual(result["stops"], [{"activity_id": "temple", "day": 2, "time_of_day": "09:00", "duration_minutes": 120, "reason": "攻略第二天上午"}])
         self.assertEqual(result["unscheduled"], [{"activity_id": "food", "reason": "午餐时间不足"}])
         request = self.chat.call_args.kwargs
-        self.assertEqual(request["tools"][0]["function"]["name"], "submit_itinerary_schedule")
+        self.assertEqual(request["tools"], [])
+        self.assertFalse(request["format"]["additionalProperties"])
         self.assertNotIn("activity_id", json.dumps(request["tools"], ensure_ascii=False))
         self.assertNotIn("temple", request["messages"][1]["content"])
         self.assertIn("第二天先去灵隐寺", request["messages"][1]["content"])

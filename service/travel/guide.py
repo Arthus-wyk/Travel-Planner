@@ -4,12 +4,50 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 
 SKILL_PATH = Path(__file__).resolve().parents[2] / ".agents" / "skills" / "guide-recognition" / "SKILL.md"
+
+
+def _object(properties):
+    return {"type": "object", "additionalProperties": False,
+            "properties": properties, "required": list(properties)}
+
+
+_TEXT = {"type": "string"}
+_DAY = {"type": "integer", "minimum": 1, "maximum": 365}
+_DURATION = {"type": "integer", "minimum": 30, "maximum": 600}
+_PLACE_PROPERTIES = {
+    "name": {"type": "string", "minLength": 1, "maxLength": 80},
+    "category": {"type": "string", "enum": ["attraction", "food", "hotel", "other"]},
+    "address": {"type": "string", "maxLength": 300},
+    "day": {"anyOf": [_DAY, {"type": "null"}]},
+    "time_window": _TEXT,
+    "duration_minutes": {"anyOf": [_DURATION, {"type": "null"}]},
+    "ticket_required": {"type": ["boolean", "null"]},
+    "note": {"type": "string", "maxLength": 500},
+}
+_CONSTRAINT = _object({
+    "type": {"type": "string", "enum": ["order", "hotel_change"]},
+    "places": {"type": "array", "items": _TEXT},
+    "source": {"type": "string", "maxLength": 500},
+})
+GUIDE_SCHEMA = _object({
+    "places": {"type": "array", "items": _object(_PLACE_PROPERTIES)},
+    "constraints": {"type": "array", "maxItems": 200, "items": _CONSTRAINT},
+})
+
+
+class GuideOutputError(ValueError):
+    pass
+
+
+class GuideNeedsInput(ValueError):
+    pass
 
 
 def recognize_guide(image_bytes: bytes) -> str:
@@ -29,31 +67,28 @@ def recognize_guide(image_bytes: bytes) -> str:
 
 def _skill_prompt() -> str:
     content = SKILL_PATH.read_text(encoding="utf-8")
-    return content.split("---", 2)[-1].strip() + """
-
-保留以上只提取原文信息的原则，扩展 JSON 契约：
-places 每项增加 category（attraction 游玩 / food 吃饭 / hotel 酒店 / other 其他）、
-address（原文地址线索，没有则空字符串）、day（原文明确指定第几天，没有则 null）、
-time_window（原文时间段，HH:MM-HH:MM，没有则空字符串）。不要生成经纬度。
-例如“上午”可表达为09:00-12:00，“晚上”为18:00-23:00；精确时间使用相同起止值。
-顶层增加 constraints 数组：每项 type 为 day/time_window/order/duration/hotel_change，
-places 为原文地点名称列表，source 为原文依据，hard 为是否明确必须遵守；
-day 类型含 day 整数，time_window 含 time_window，duration 含 duration_minutes；
-order 按先后列出 places。仅提取原文明确要求，不要补充约束。
-"""
+    return content.split("---", 2)[-1].strip()
 
 
-def _extract_with_model(text: str) -> str:
+def _extract_with_model(text: str, feedback: str = "") -> str:
     from service.utils.model_client import create_model_client, get_model
 
     async def request() -> str:
         response = await asyncio.wait_for(create_model_client().chat(
             model=get_model(),
             messages=[{"role": "system", "content": _skill_prompt()},
-                      {"role": "user", "content": f"攻略原文：\n{text}"}],
-            tools=[], stream=False, format="json",
-        ), timeout=90)
-        return response.message.content or ""
+                      {"role": "user", "content": f"攻略原文：\n{text}" + (f"\n上次输出校验失败：{feedback}\n请修正后重新输出完整 JSON。" if feedback else "")}],
+            tools=[], stream=False, format=GUIDE_SCHEMA,
+        ), timeout=180)
+        from jsonschema import ValidationError, validate
+        if response.message.tool_calls:
+            raise GuideOutputError("不得调用工具")
+        content = response.message.content or ""
+        try:
+            validate(json.loads(content), GUIDE_SCHEMA)
+        except (json.JSONDecodeError, ValidationError) as exc:
+            raise GuideOutputError(f"JSON 或 Schema 无效：{exc}") from exc
+        return content
 
     return asyncio.run(request())
 
@@ -63,16 +98,33 @@ def analyze_guide(text: str) -> dict[str, Any]:
         raise ValueError("Guide text is too long")
     if not text.strip():
         return {"text": text, "places": []}
-    try:
-        data = json.loads(_extract_with_model(text))
-    except Exception as exc:
-        raise ValueError("Guide extraction model failed; please retry or check model configuration") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("places"), list):
+    feedback = ""
+    for attempt in range(1, 4):
+        try:
+            raw = _extract_with_model(text, feedback)
+        except GuideOutputError as exc:
+            feedback = str(exc)[:1000]
+            logging.getLogger("travel.generation").warning("guide_extraction_invalid attempt=%s reason=%s", attempt, feedback)
+            continue
+        except TimeoutError as exc:
+            raise ValueError("攻略提取模型响应超时（180 秒），请检查模型服务状态后重试") from exc
+        except Exception as exc:
+            raise ValueError("Guide extraction model failed; please retry or check model configuration") from exc
+        try:
+            return _parse_guide_data(json.loads(raw), text)
+        except ValueError as exc:
+            feedback = str(exc)[:1000]
+            logging.getLogger("travel.generation").warning("guide_extraction_invalid attempt=%s reason=%s", attempt, feedback)
+    raise GuideNeedsInput(f"攻略地点提取连续 3 次校验失败：{feedback}。请手动添加或修正地点后继续规划。")
+
+
+def _parse_guide_data(data: Any, text: str) -> dict[str, Any]:
+    if not isinstance(data, dict) or set(data) - {"places", "constraints"} or not isinstance(data.get("places"), list):
         raise ValueError("Guide extraction model returned invalid places")
     places = []
     seen = set()
     for item in data["places"]:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or set(item) - set(_PLACE_PROPERTIES):
             raise ValueError("Guide extraction model returned invalid places")
         name, note = item.get("name"), item.get("note", "")
         if not isinstance(name, str) or not isinstance(note, str):
@@ -87,9 +139,6 @@ def analyze_guide(text: str) -> dict[str, Any]:
         ticket = item.get("ticket_required")
         if not isinstance(ticket, bool):
             ticket = None
-        tips = item.get("visit_tips")
-        if not isinstance(tips, str):
-            tips = ""
         category = item.get("category", "attraction")
         if category not in {"attraction", "food", "hotel", "other"}:
             raise ValueError("Guide extraction model returned invalid category")
@@ -98,28 +147,33 @@ def analyze_guide(text: str) -> dict[str, Any]:
             raise ValueError("Guide extraction model returned invalid day")
         address = item.get("address") or ""
         window = item.get("time_window") or ""
-        if not isinstance(address, str) or len(address) > 300 or not _valid_window(window):
-            raise ValueError("Guide extraction model returned invalid location or time window")
+        if not isinstance(address, str) or len(address) > 300:
+            raise ValueError(f"地点 {name} 的地址无效，必须为不超过 300 字的文字")
+        if not _valid_window(window):
+            raise ValueError(f"地点 {name} 的 time_window={window!r} 无效，须为 HH:MM-HH:MM 或空字符串")
         places.append({"id": "guide-" + sha256(name.casefold().encode("utf-8")).hexdigest()[:12],
                        "name": name, "note": note.strip()[:500], "source": "guide_text",
                        "category": category, "day": day, "time_window": window,
                        "location_hint": address.strip(),
                        "duration_minutes": duration, "ticket_required": ticket,
-                       "visit_tips": tips.strip()[:500]})
+                       "visit_tips": note.strip()[:500]})
     constraints = data.get("constraints", [])
     if not isinstance(constraints, list) or len(constraints) > 200:
         raise ValueError("Guide extraction model returned invalid constraints")
-    names = {x["name"]: x["id"] for x in places}
+    names = {x["name"].casefold(): x["id"] for x in places}
     validated = []
     for constraint in constraints:
-        if not isinstance(constraint, dict) or constraint.get("type") not in {"day", "time_window", "order", "duration", "hotel_change"}:
+        if not isinstance(constraint, dict) or set(constraint) - {"type", "places", "source", "hard", "day", "time_window", "duration_minutes"} or constraint.get("type") not in {"day", "time_window", "order", "duration", "hotel_change"}:
             raise ValueError("Guide extraction model returned invalid constraint")
         refs = constraint.get("places", [])
         source = constraint.get("source", "")
-        if not isinstance(refs, list) or any(not isinstance(x, str) or x not in names for x in refs) or not isinstance(source, str):
-            raise ValueError("Guide constraint references an unknown place")
+        if not isinstance(refs, list) or any(not isinstance(x, str) for x in refs) or not isinstance(source, str):
+            raise ValueError("Guide extraction model returned invalid constraint references")
+        unknown = [x for x in refs if x.strip().casefold() not in names]
+        if unknown:
+            raise ValueError(f"Guide constraint references an unknown place: {unknown[0]}")
         kind = constraint["type"]
-        value = {"type": kind, "activity_ids": [names[x] for x in refs], "source": source[:500], "hard": constraint.get("hard", True) is not False}
+        value = {"type": kind, "activity_ids": [names[x.strip().casefold()] for x in refs], "source": source[:500], "hard": constraint.get("hard", True) is not False}
         if kind == "day":
             day = constraint.get("day")
             if isinstance(day, bool) or not isinstance(day, int) or not 1 <= day <= 365:

@@ -133,15 +133,23 @@ class GuidedPlanningTests(unittest.TestCase):
 
     def test_guide_model_output_is_validated_and_never_replaced_by_rules(self):
         with patch("service.travel.guide._extract_with_model", return_value='not json'):
-            with self.assertRaisesRegex(ValueError, "model"):
+            with self.assertRaisesRegex(ValueError, "连续 3 次"):
                 analyze_guide("西湖：上午游玩")
         with patch("service.travel.guide._extract_with_model", side_effect=RuntimeError("offline")):
             with self.assertRaisesRegex(ValueError, "model"):
                 analyze_guide("西湖：上午游玩")
 
+    def test_guide_model_timeout_has_specific_error(self):
+        with patch("service.travel.guide._extract_with_model", side_effect=TimeoutError):
+            with self.assertRaisesRegex(ValueError, "超时"):
+                analyze_guide("西湖：上午游玩")
+
     def test_guide_extractor_uses_configured_model_and_skill(self):
+        data = {"places": [{"name": "西湖", "category": "attraction", "address": "",
+                            "day": None, "time_window": "", "duration_minutes": None,
+                            "ticket_required": None, "note": "上午"}], "constraints": []}
         client = SimpleNamespace(chat=AsyncMock(return_value=SimpleNamespace(
-            message=SimpleNamespace(content='{"places":[{"name":"西湖","note":"上午"}]}'))))
+            message=SimpleNamespace(content=json.dumps(data), tool_calls=[]))))
         with patch("service.utils.model_client.create_model_client", return_value=client), patch(
             "service.utils.model_client.get_model", return_value="guide-test-model"
         ):
@@ -149,7 +157,7 @@ class GuidedPlanningTests(unittest.TestCase):
         self.assertEqual(result["places"][0]["name"], "西湖")
         call = client.chat.await_args.kwargs
         self.assertEqual(call["model"], "guide-test-model")
-        self.assertEqual(call["format"], "json")
+        self.assertEqual(call["format"], guide.GUIDE_SCHEMA)
         self.assertIn("不要补充", call["messages"][0]["content"])
         self.assertIn("西湖：上午", call["messages"][1]["content"])
         with patch("service.travel.guide._extract_with_model") as extract:
@@ -165,15 +173,14 @@ class GuidedPlanningTests(unittest.TestCase):
         self.assertEqual(len(result["places"]), 1)
 
     def test_guide_model_visit_metadata_reaches_activity(self):
-        output = {"places": [{"name": "灵隐寺", "note": "游玩约两小时，需门票",
-                              "duration_minutes": 120, "ticket_required": True,
-                              "visit_tips": "提前预约"}]}
+        output = {"places": [{"name": "灵隐寺", "note": "游玩约两小时，需门票，提前预约",
+                              "duration_minutes": 120, "ticket_required": True}]}
         plan = planning.create_draft(FORM, "trip-1")
         with patch("service.travel.guide._extract_with_model", return_value=json.dumps(output, ensure_ascii=False)):
             plan = planning.build_activities(plan, "灵隐寺：游玩约两小时，需门票，提前预约")
         activity = plan["planning"]["activities"][0]
         self.assertEqual((activity["duration_minutes"], activity["ticket_required"], activity["visit_tips"]),
-                         (120, True, "提前预约"))
+                         (120, True, "游玩约两小时，需门票，提前预约"))
 
     def test_ocr_rejects_non_image_bytes(self):
         with self.assertRaises(ValueError):

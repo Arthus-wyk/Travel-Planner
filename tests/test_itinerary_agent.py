@@ -51,9 +51,9 @@ class ItineraryAgentTests(unittest.TestCase):
         client.start(); model.start()
         self.addCleanup(client.stop); self.addCleanup(model.stop)
 
-    def generate(self, placements, plan=None, feedback=None, *, function="submit_itinerary_schedule"):
-        self.chat.return_value = SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[{"function": {
-            "name": function, "arguments": json.dumps({"placements": placements}, ensure_ascii=False)}}]))
+    def generate(self, placements, plan=None, feedback=None):
+        self.chat.return_value = SimpleNamespace(message=SimpleNamespace(
+            content=json.dumps({"placements": placements}, ensure_ascii=False), tool_calls=[]))
         return itinerary.generate_itinerary_proposal(plan or sample_plan(), feedback)
 
     def test_guide_and_feedback_reach_model_without_internal_ids(self):
@@ -67,14 +67,13 @@ class ItineraryAgentTests(unittest.TestCase):
         self.assertEqual(snapshot["ordered_places"][0]["coordinates"], {"longitude": 120.1001, "latitude": 30.2001})
         self.assertNotIn("temple", request["messages"][1]["content"])
         self.assertIn("输入第 1 个地点", request["messages"][1]["content"])
-        self.assertEqual(request["tools"][0]["function"]["parameters"]["properties"]["placements"]["maxItems"], 2)
+        self.assertEqual(request["format"]["properties"]["placements"]["maxItems"], 2)
 
-    def test_rejects_wrong_function_and_body_only_response(self):
-        with self.assertRaises(ValueError):
-            self.generate([{"day": 1, "time_of_day": "09:00", "reason": "游览"}] * 2, function="wrong")
-        self.chat.return_value = SimpleNamespace(message=SimpleNamespace(content='{"placements":[]}', tool_calls=[]))
-        with self.assertRaises(ValueError):
-            itinerary.generate_itinerary_proposal(sample_plan())
+    def test_rejects_tool_response_and_wrong_shape(self):
+        for content, calls in [('{}', []), ('', [{"function": {"name": "submit_itinerary_schedule"}}])]:
+            self.chat.return_value = SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=calls))
+            with self.assertRaises(ValueError):
+                itinerary.generate_itinerary_proposal(sample_plan())
 
     def test_rejects_invalid_day_time_reason_and_extra_fields(self):
         good = {"day": 2, "time_of_day": "09:00", "reason": "攻略上午"}
@@ -83,6 +82,11 @@ class ItineraryAgentTests(unittest.TestCase):
                       {"day": None, "time_of_day": "09:00", "reason": "冲突"}):
             with self.subTest(entry=entry), self.assertRaises(ValueError):
                 self.generate([entry, {"day": None, "time_of_day": None, "reason": "未安排"}])
+
+    def test_invalid_time_error_explains_value_and_allowed_range(self):
+        with self.assertRaisesRegex(ValueError, "day=4.*time_of_day='9:00'.*1..3.*HH:MM"):
+            self.generate([{"day": 4, "time_of_day": "9:00", "reason": "上午"},
+                           {"day": None, "time_of_day": None, "reason": "未安排"}])
 
     def test_required_place_can_be_unscheduled_for_audit(self):
         result = self.generate([{"day": None, "time_of_day": None, "reason": "与返程冲突"},

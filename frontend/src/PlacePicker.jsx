@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { apiUrl } from "./apiUrl";
 
-const statusLabels = { auto_confirmed: "已自动确认位置", manual_confirmed: "已手动确认位置", ambiguous: "位置待核对：请选择具体分店", failed: "定位失败", unresolved: "位置待确认" };
+const statusLabels = { model_matched: "已根据攻略匹配位置", auto_confirmed: "已自动确认位置", manual_confirmed: "已手动确认位置", ambiguous: "位置待核对：请选择具体分店", failed: "定位失败", unresolved: "位置待确认" };
 
 export default function PlacePicker({ item, planId, api, busy, onResolve }) {
   const [query, setQuery] = useState(item.name);

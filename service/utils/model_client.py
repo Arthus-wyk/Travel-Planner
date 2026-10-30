@@ -10,6 +10,12 @@ from service.config import get_env_or_dotenv as env
 from ollama import AsyncClient
 
 
+class OllamaClient(AsyncClient):
+    async def chat(self, *, tool_choice=None, parallel_tool_calls=None, **kwargs):
+        # Ollama lacks tool_choice; the caller must validate the returned invocation.
+        return await super().chat(**kwargs)
+
+
 def get_model():
     model = env("LLM_MODEL").strip()
     if not model:
@@ -27,7 +33,7 @@ def create_model_client():
         raise ValueError("LLM_BASE_URL must be an HTTP(S) API base URL")
     key = env("LLM_API_KEY").strip()
     if provider == "ollama":
-        client = AsyncClient(host=url, headers={"Authorization": f"Bearer {key}"} if key else None)
+        client = OllamaClient(host=url, headers={"Authorization": f"Bearer {key}"} if key else None)
         if not key:
             # The SDK reads OLLAMA_API_KEY itself; only LLM_API_KEY is allowed here.
             client._client.headers.pop("authorization", None)
@@ -94,12 +100,20 @@ class OpenAICompatibleClient:
         self.api_key = api_key
         self.transport = transport
 
-    async def chat(self, *, model, messages, tools, stream=False, options=None, format=None):
+    async def chat(self, *, model, messages, tools, stream=False, options=None, format=None, tool_choice=None, parallel_tool_calls=None):
         payload = {"model": model, "messages": openai_messages(messages), "stream": stream, "temperature": (options or {}).get("temperature", 0)}
         if tools:
             payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            payload["parallel_tool_calls"] = parallel_tool_calls
         if format:
-            payload["response_format"] = {"type": "json_object"}
+            payload["response_format"] = (
+                {"type": "json_schema", "json_schema": {
+                    "name": "structured_result", "strict": True, "schema": format
+                }} if isinstance(format, dict) else {"type": "json_object"}
+            )
         if stream:
             payload["stream_options"] = {"include_usage": True}
             return self._stream(payload)

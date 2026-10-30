@@ -8,6 +8,7 @@ import { categoryLabels, isMovableStop, transportLabels } from "./planningLabels
 import { refreshAfterCommit } from "./api";
 import { auditDestination } from "./auditActions";
 import { validMoney, focusIssue } from "./planningValidation";
+import PlacePicker from "./PlacePicker";
 import { BusyStatus, LoadError } from "./planningUi";
 
 const encode = encodeURIComponent;
@@ -130,6 +131,19 @@ export default function ReviewPage({ api, refreshPlans }) {
     {notice && <p role="status">{notice}{notice.includes('列表') && <button onClick={() => refreshAfterCommit(refreshPlans, setNotice)}>刷新列表</button>}</p>}
     <BusyStatus task={busy ? '正在保存、计算路线与更新审核' : ''} />
     {uncertain && <div className="guided-error"><p>结果待核实，请重新读取已保存状态；若服务仍在执行，请等待完成。</p><button onClick={() => { setUncertain(false); setRevision(x => x + 1); }}>重新读取并核实</button></div>}
+    {state.guide_auto && <section className="guided-card"><h2>攻略匹配与待处理地点</h2>
+      {state.lodging_assumption && <p>{state.lodging_assumption}</p>}
+      {(state.activities || []).filter(item => item.choice !== "exclude" && !item.place && item.category !== "hotel").map(item => <article key={item.id}>
+        <h3>{item.name}{item.day ? ` · 原文第 ${item.day} 天` : ""}</h3><p>{item.note}</p>
+        <PlacePicker item={item} api={api} planId={planId} busy={busy || !editable} onResolve={poi => action("resolve_place", { activity_id: item.id, poi_id: poi })} />
+        <button disabled={busy || !editable} onClick={() => action("exclude_activity", { activity_id: item.id })}>移除此地点</button>
+      </article>)}
+      {editable && <button disabled={busy || uncertain} onClick={async () => {
+        setBusy(true);
+        try { await api(`/api/plans/${encode(planId)}/generation`, { method: "POST", body: JSON.stringify({ text: state.guide_text || "" }) }); navigate(`/plans/${encode(planId)}/planning`); }
+        catch (cause) { setError(cause.message); } finally { setBusy(false); }
+      }}>按当前地点重新生成</button>}
+    </section>}
     <section className="guided-card review-summary"><h2>{highIssues.length ? `有 ${highIssues.length} 项需要处理` : '审核状态'}</h2><AuditView audit={audit} plan={plan} onIssue={handleIssue} busy={busy || uncertain} />{!editable && <div id="confirmed-repair" className="guided-actions"><p>已确认行程需先返回地点选择，修改后重新生成并审核；购买记录会保留。</p><button disabled={busy || uncertain} onClick={editPlaces}>返回编辑行程</button></div>}</section>
     <section className="review-map-panel" aria-label={`第${day}天的路线地图`}>
       <div className="review-map-caption"><strong>第 {day} 天 · 行程路线图</strong><span>高德地图 · 地点编号对应下方卡片</span></div>

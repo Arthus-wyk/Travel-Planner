@@ -1,6 +1,8 @@
 """FastAPI HTTP adapter for the travel planner API."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import argparse
 import traceback
 import uuid
@@ -10,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import uvicorn
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import WebSocket, WebSocketDisconnect, BackgroundTasks, Body, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from agent.planning_graph import run_planning_action
@@ -23,6 +25,8 @@ from service.storage.travel_db import (
 from service.travel.itinerary_audit import audit_plan
 from service.travel.planning import create_draft, itinerary_sheet
 from service.travel.map_planning import day_map
+from service.storage import planning_jobs
+from service.travel.generation_jobs import execute_job
 from service.mcp.server import amap_search_places
 from service.storage.travel_db import read_map_cache
 from service.utils.model_client import get_model
@@ -166,6 +170,44 @@ def create_app(server_file: Path, model: str) -> FastAPI:
             raise HTTPException(status_code=400, detail="Confirm the itinerary before opening its sheet")
         return {"success": True, "sheet": itinerary_sheet(plan)}
 
+    @app.websocket("/api/plans/{plan_id}/generation/ws")
+    async def generation_socket(websocket: WebSocket, plan_id: str):
+        await websocket.accept()
+        previous = None
+        try:
+            while True:
+                job = await asyncio.to_thread(planning_jobs.read_job, plan_id)
+                packet = {"type": "generation_status", "job": job}
+                if packet != previous:
+                    await websocket.send_json(packet)
+                    previous = packet
+                else:
+                    await websocket.send_json({"type": "heartbeat"})
+                await asyncio.sleep(1)
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            logging.getLogger(__name__).exception("generation websocket failed plan_id=%s", plan_id)
+            try:
+                await websocket.close(code=1011, reason="无法读取生成状态")
+            except Exception:
+                pass
+
+    @app.post("/api/plans/{plan_id}/generation")
+    def generate_from_guide(plan_id: str, background: BackgroundTasks, payload: dict = Body(...)):
+        if not isinstance(payload.get("text", ""), str) or len(payload.get("text", "")) > 20000:
+            raise ValueError("攻略文字最长 20000 字")
+        if not payload.get("image_base64") and not payload.get("text", "").strip():
+            raise ValueError("请上传攻略图片或填写攻略文字")
+        job_id, plan = planning_jobs.create_job(plan_id, payload)
+        if plan is not None:
+            background.add_task(execute_job, plan_id, job_id, plan, payload)
+        return {"success": True, "job_id": job_id}
+
+    @app.get("/api/plans/{plan_id}/generation")
+    def generation_status(plan_id: str):
+        return {"success": True, "job": planning_jobs.read_job(plan_id)}
+
     @app.post("/api/plans/{plan_id}/planning/{action}")
     def planning_action(plan_id: str, action: str, payload: dict = Body(...)):
         plan, error = get_plan(plan_id)
@@ -259,6 +301,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    planning_jobs.recover_jobs()
     uvicorn.run(create_app(args.server.resolve(), args.model), host=args.host, port=args.port)
 
 

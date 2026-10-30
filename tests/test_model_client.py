@@ -95,6 +95,45 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(sent["messages"][0]["tool_calls"][0]["function"]["arguments"], str)
         self.assertEqual(messages[1]["role"], "tool")
 
+    async def test_schema_is_sent_strictly_without_tools(self):
+        requests = []
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={"choices": [{"message": {"content": '{"value":"ok"}'}}]})
+        client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(handler))
+        schema = {"type": "object", "additionalProperties": False,
+                  "required": ["value"], "properties": {"value": {"type": "string"}}}
+        await client.chat(model="demo", messages=[], tools=[], format=schema)
+        self.assertEqual(requests[0]["response_format"], {"type": "json_schema", "json_schema": {
+            "name": "structured_result", "strict": True, "schema": schema}})
+        self.assertNotIn("tools", requests[0])
+
+    async def test_schema_unsupported_is_not_retried_as_json_object(self):
+        requests = []
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(400, json={"error": {"message": "json_schema unsupported"}})
+        client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(handler))
+        with self.assertRaises(httpx.HTTPStatusError):
+            await client.chat(model="demo", messages=[], tools=[], format={"type": "object"})
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["response_format"]["type"], "json_schema")
+
+    async def test_ollama_receives_schema_object(self):
+        requests = []
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={"model": "demo", "message": {"role": "assistant", "content": "{}"}, "done": True})
+        client = model_client.AsyncClient(host="http://localhost:11434")
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(base_url="http://localhost:11434", transport=httpx.MockTransport(handler))
+        try:
+            schema = {"type": "object", "properties": {}, "additionalProperties": False, "required": []}
+            await client.chat(model="demo", messages=[], tools=[], stream=False, format=schema)
+            self.assertEqual(requests[0]["format"], schema)
+        finally:
+            await client._client.aclose()
+
     async def test_stream_merges_tool_arguments_and_usage(self):
         chunks = [
             {"choices": [{"delta": {"content": "hello", "tool_calls": [{"index": 0, "function": {"name": "lookup", "arguments": '{"city":'}}]}}]},

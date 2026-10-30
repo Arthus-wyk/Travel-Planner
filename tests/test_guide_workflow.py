@@ -24,6 +24,61 @@ def prepared():
 
 
 class GuideWorkflowTests(unittest.TestCase):
+    def test_invalid_window_is_explained_to_model_on_retry(self):
+        bad = json.dumps({"places": [{"name": "西湖", "time_window": "上午"}], "constraints": []}, ensure_ascii=False)
+        good = json.dumps({"places": [{"name": "西湖", "time_window": "09:00-12:00"}], "constraints": []}, ensure_ascii=False)
+        with patch.object(guide, "_extract_with_model", side_effect=[bad, good]) as extract:
+            result = guide.analyze_guide("上午去西湖")
+        self.assertEqual(result["places"][0]["time_window"], "09:00-12:00")
+        self.assertIn("上午", extract.call_args_list[1].args[1])
+
+    def test_three_invalid_extractions_require_manual_input(self):
+        bad = json.dumps({"places": [{"name": "西湖", "time_window": "上午"}], "constraints": []}, ensure_ascii=False)
+        with patch.object(guide, "_extract_with_model", return_value=bad) as extract:
+            with self.assertRaises(guide.GuideNeedsInput):
+                guide.analyze_guide("上午去西湖")
+        self.assertEqual(extract.call_count, 3)
+
+    def test_guide_schema_only_requests_cross_place_constraints(self):
+        from jsonschema import ValidationError, validate
+        place = {"name": "西湖", "category": "attraction", "address": "", "day": 1,
+                 "time_window": "", "duration_minutes": None, "ticket_required": None,
+                 "note": ""}
+        data = {"places": [place], "constraints": [{"type": "order", "places": ["西湖"],
+                                                       "source": "先去西湖"}]}
+        validate(data, guide.GUIDE_SCHEMA)
+        with self.assertRaises(ValidationError):
+            validate({**data, "places": [{**place, "visit_tips": "重复提示"}]}, guide.GUIDE_SCHEMA)
+        with self.assertRaises(ValidationError):
+            validate({**data, "constraints": [{"type": "day", "places": ["西湖"],
+                                                "source": "第一天去", "day": 1}]}, guide.GUIDE_SCHEMA)
+
+    def test_extraction_uses_schema_and_rejects_extra_identity(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        chat = AsyncMock(return_value=SimpleNamespace(message=SimpleNamespace(
+            content=json.dumps({"places": [], "constraints": []}), tool_calls=[])))
+        with patch("service.utils.model_client.create_model_client", return_value=SimpleNamespace(chat=chat)), patch("service.utils.model_client.get_model", return_value="test"):
+            self.assertEqual(guide.analyze_guide("攻略")["places"], [])
+        request = chat.call_args.kwargs
+        self.assertEqual(request["tools"], [])
+        self.assertEqual(request["format"], guide.GUIDE_SCHEMA)
+        for data in ({"places": [], "constraints": [], "id": "injected"},
+                     {"places": [{"name": "西湖", "place_id": "injected"}]},
+                     {"places": [], "constraints": [{"type": "order", "places": [], "activity_id": "injected"}]}):
+            with self.subTest(data=data), patch.object(guide, "_extract_with_model", return_value=json.dumps(data)):
+                with self.assertRaises(ValueError):
+                    guide.analyze_guide("西湖")
+
+    def test_provider_schema_response_is_validated_locally(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        chat = AsyncMock(return_value=SimpleNamespace(message=SimpleNamespace(
+            content='{"places":[{"name":"西湖","id":"fake"}],"constraints":[]}', tool_calls=[])))
+        with patch("service.utils.model_client.create_model_client", return_value=SimpleNamespace(chat=chat)), patch("service.utils.model_client.get_model", return_value="test"):
+            with self.assertRaises(ValueError):
+                guide.analyze_guide("西湖")
+
     def test_transport_has_four_modes_and_hotel_is_optional_at_step_one(self):
         plan = planning.build_candidates(planning.create_draft(FORM, "transport"))
         options = plan["planning"]["transport_candidates"]
@@ -66,6 +121,22 @@ class GuideWorkflowTests(unittest.TestCase):
         self.assertEqual([x["category"] for x in result["places"]], ["attraction", "food", "hotel", "other"])
         self.assertEqual(result["places"][0]["day"], 2)
         self.assertEqual(result["constraints"][0]["source"], "先西湖再午饭")
+
+    def test_constraint_place_names_allow_incidental_spacing(self):
+        data = {"places": [{"name": "西湖", "category": "attraction"}],
+                "constraints": [{"type": "day", "places": [" 西湖 "], "day": 1,
+                                 "source": "第一天去西湖", "hard": True}]}
+        with patch.object(guide, "_extract_with_model", return_value=json.dumps(data, ensure_ascii=False)):
+            result = guide.analyze_guide("第一天去西湖")
+        self.assertEqual(result["constraints"][0]["activity_ids"], [result["places"][0]["id"]])
+
+    def test_unknown_constraint_place_identifies_reference(self):
+        data = {"places": [{"name": "西湖", "category": "attraction"}],
+                "constraints": [{"type": "day", "places": ["雷峰塔"], "day": 1,
+                                 "source": "第一天去雷峰塔", "hard": True}]}
+        with patch.object(guide, "_extract_with_model", return_value=json.dumps(data, ensure_ascii=False)):
+            with self.assertRaisesRegex(ValueError, "雷峰塔"):
+                guide.analyze_guide("第一天去雷峰塔")
 
     def test_hotel_group_selects_lodging_without_becoming_a_ticket(self):
         plan = planning.add_manual_activity(prepared(), "攻略酒店", "杭州湖滨", category="hotel")
