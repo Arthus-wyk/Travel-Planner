@@ -58,6 +58,11 @@ class AmapTests(unittest.TestCase):
         self.assertEqual(place["rating"], 4.8)
         self.assertEqual(place["address"], "浙江省杭州市西湖区")
 
+    def test_poi_cost_is_per_person_only(self):
+        place = amap.place_summary({"id": "food", "name": "知味观", "location": "120.1,30.2",
+                                    "biz_ext": {"cost": "68"}})
+        self.assertEqual(place["cost_per_person"], 68.0)
+
     def test_geocoding_and_empty_result(self):
         with patch.object(amap, "request_amap", return_value={"geocodes": []}) as call:
             self.assertFalse(server.amap_geocode("西湖", "杭州")["success"])
@@ -76,6 +81,27 @@ class AmapTests(unittest.TestCase):
                 self.assertEqual(call.call_args.args[1]["show_fields"], "cost,polyline")
                 if mode == "TRANSIT":
                     self.assertEqual(call.call_args.args[1]["city2"], "021")
+
+    def test_route_exposes_only_returned_fares(self):
+        with patch.object(amap, "resolve_location", return_value={"location": "120,30", "citycode": "0571"}), patch.object(amap, "request_amap", return_value={"route": {"transits": [{"distance": "1000", "cost": {"duration": "600", "transit_fee": "3"}}]}}):
+            route = server.amap_compute_route("a", "b", "TRANSIT")
+        self.assertEqual(route["fare"], 3.0)
+        with patch.object(amap, "resolve_location", return_value={"location": "120,30", "citycode": "0571"}), patch.object(amap, "request_amap", return_value={"route": {"paths": [{"distance": "1000", "cost": {"duration": "300"}}], "taxi_cost": "16"}}):
+            route = server.amap_compute_route("a", "b", "DRIVE")
+        self.assertEqual(route["fare"], 16.0)
+
+    def test_invalid_fare_does_not_hide_valid_route(self):
+        with patch.object(amap, "resolve_location", return_value={"location": "120,30", "citycode": "0571"}), patch.object(amap, "request_amap", return_value={"route": {"transits": [{"distance": "1000", "cost": {"duration": "600", "transit_fee": "[]"}}]}}):
+            route = server.amap_compute_route("a", "b", "TRANSIT")
+        self.assertTrue(route["success"])
+        self.assertIsNone(route["fare"])
+
+    def test_shortest_path_within_one_mode_is_returned(self):
+        with patch.object(amap, "resolve_location", return_value={"location": "120,30", "citycode": "0571"}), patch.object(amap, "request_amap", return_value={"route": {"paths": [
+            {"distance": "1000", "cost": {"duration": "900"}},
+            {"distance": "1300", "cost": {"duration": "600"}}]}}):
+            route = server.amap_compute_route("a", "b", "WALK")
+        self.assertEqual((route["duration"], route["distance_meters"]), ("600s", 1300))
 
     def test_coordinates_and_transit_city_resolution(self):
         with patch.object(amap, "request_amap", side_effect=[{"regeocode": {"addressComponent": {"citycode": "0571"}}}, {"regeocode": {"addressComponent": {"citycode": "0571"}}}, {"route": {"transits": []}}]) as call:

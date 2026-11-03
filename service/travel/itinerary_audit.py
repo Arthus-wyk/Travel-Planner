@@ -8,6 +8,11 @@ from typing import Any
 from service.validation import time_minutes
 
 
+def _scheduled_minutes(item):
+    value = time_minutes(item.get("time_of_day"))
+    return value + item.get("day_offset", 0) * 1440 if value is not None else None
+
+
 def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
     """检查天数、每日强度、餐饮空缺、预算和预订风险，并生成建议。"""
     itinerary = plan.get("itinerary") or []
@@ -19,6 +24,11 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
     suggestions: list[str] = []
     guide_results = []
+
+    for item in itinerary:
+        start = time_minutes(item.get("time_of_day"))
+        if item.get("day_offset", 0) or (start is not None and start + number(item.get("duration_minutes")) > 1440):
+            issues.append(issue("schedule_overflow", "high", f"第 {item.get('day')} 天的{item.get('title', '活动')}超出当天，请调整日期或减少停留。", item.get("item_id")))
 
     if trip_days is not None:
         for item in itinerary:
@@ -42,8 +52,8 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
         ordered = sorted(
             items,
             key=lambda item: (
-                time_minutes(item.get("time_of_day"))
-                if time_minutes(item.get("time_of_day")) is not None
+                _scheduled_minutes(item)
+                if _scheduled_minutes(item) is not None
                 else 1440
             ),
         )
@@ -58,8 +68,8 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
                     )
                 )
         for previous, current in zip(ordered, ordered[1:]):
-            previous_start = time_minutes(previous.get("time_of_day"))
-            current_start = time_minutes(current.get("time_of_day"))
+            previous_start = _scheduled_minutes(previous)
+            current_start = _scheduled_minutes(current)
             previous_duration = previous.get("duration_minutes")
             if (
                 previous_start is not None
@@ -71,17 +81,20 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
                     issue(
                         "time_conflict",
                         "high",
-                        f"第 {day} 天 {previous.get('item_id')} 与 {current.get('item_id')} 时间重叠。",
+                        f"第 {day} 天 {previous.get('title', '前一活动')} 与 {current.get('title', '后一活动')} 时间重叠。",
                         [previous.get("item_id"), current.get("item_id")],
                     )
                 )
-        total_minutes = sum(number(item.get("duration_minutes")) for item in items)
-        if len(items) >= 5:
+        local_items = [x for x in items if x.get("category") in {"attraction", "food", "other"}]
+        local_ids = {x.get("item_id") for x in items}
+        total_minutes = sum(number(item.get("duration_minutes")) for item in local_items) + sum(
+            number(r.get("duration_minutes")) for r in plan.get("routes", []) if r.get("origin_item_id") in local_ids)
+        if len(local_items) >= 5:
             issues.append(
                 issue(
                     "pace_risk",
                     "medium",
-                    f"第 {day} 天安排了 {len(items)} 个项目，可能过于紧凑。",
+                    f"第 {day} 天安排了 {len(local_items)} 个停留地点，可能过于紧凑。",
                     day,
                 )
             )
@@ -106,6 +119,7 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
             )
 
     planning = plan.get("planning") or {}
+    issues.extend(planning.get("generation_issues", []))
     if planning.get("needs_replan"):
         issues.append(issue("itinerary_outdated", "high", "旅行基础信息已变化，请重新查询候选并生成行程。", None))
     if planning.get("stage") in {"review", "confirmed"}:
@@ -119,9 +133,9 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
         unresolved_places = [x["id"] for x in planning.get("activities", [])
                              if x.get("choice") != "exclude" and x.get("category") != "hotel" and not x.get("place")]
         if planning.get("guide_auto") and unresolved_places:
-            issues.append(issue("unresolved_places", "high", "部分地点位置待确定，请选择候选或移除后重新生成。", unresolved_places))
+            issues.append(issue("unresolved_places", "high", "、".join(activities["name"] for activities in planning.get("activities", []) if activities["id"] in unresolved_places) + "未找到有效位置，请补充地点线索后重新匹配。", unresolved_places))
         for day in range(1, (trip_days or 0) + 1):
-            ordered = sorted(by_day.get(day, []), key=lambda x: time_minutes(x.get("time_of_day")) if time_minutes(x.get("time_of_day")) is not None else 1440)
+            ordered = sorted(by_day.get(day, []), key=lambda x: _scheduled_minutes(x) if _scheduled_minutes(x) is not None else 1440)
             expected_start = "home_anchor" if day == 1 else "hotel_anchor"
             expected_end = "home_anchor" if day == trip_days else "hotel_anchor"
             start_location = home_location if day == 1 else hotel_location
@@ -138,12 +152,12 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 else:
                     if route.get("origin") != previous.get("arrival_location", previous.get("location")) or route.get("destination") != current.get("location"):
                         issues.append(issue("stale_route", "high", f"第 {day} 天 {previous.get('title')} 至 {current.get('title')} 的路线地点已变化，请重新计算。", [previous.get("item_id"), current.get("item_id")]))
-                    previous_start = time_minutes(previous.get("time_of_day"))
-                    current_start = time_minutes(current.get("time_of_day"))
+                    previous_start = _scheduled_minutes(previous)
+                    current_start = _scheduled_minutes(current)
                     travel_minutes = number(route.get("duration_minutes"))
                     if previous_start is not None and current_start is not None and previous_start + number(previous.get("duration_minutes")) + travel_minutes > current_start:
                         issues.append(issue("transport_buffer", "high", f"第 {day} 天 {previous.get('title')} 至 {current.get('title')} 的交通缓冲不足。", [previous.get("item_id"), current.get("item_id")]))
-        if planning.get("unplaced_activities"):
+        if planning.get("unplaced_activities") and (planning.get("generation") or {}).get("contract_version") != 3:
             missing = set(planning["unplaced_activities"])
             must_missing = any(x["id"] in missing and x.get("choice") == "must" for x in planning.get("activities", []))
             issues.append(issue("unplaced_activities", "high" if must_missing else "medium", "部分已选地点仍在未确定行程中，请查看原因或返回地点选择调整。", planning["unplaced_activities"]))
@@ -166,8 +180,12 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
             issues.append(issue("budget_overrun", "high", f"当前估算与已付金额合计 {guided_budget['estimated_total']}，超过预算 {budget}。", None))
         if guided_budget["has_unknown_ticket_costs"]:
             issues.append(issue("unknown_ticket_cost", "medium", "部分活动门票价格未知，预算可能继续增加。", None))
+        if guided_budget.get("has_unknown_hotel_costs"):
+            issues.append(issue("unknown_hotel_cost", "medium", "酒店每晚房价未知，未计入已知费用合计。", None))
+        if guided_budget.get("has_unknown_food_costs"):
+            issues.append(issue("unknown_food_cost", "medium", "部分饭店没有可用的人均消费，未计入已知费用合计。", None))
         if guided_budget.get("has_unknown_transport_costs"):
-            issues.append(issue("unknown_transport_cost", "medium", "自驾燃油和路桥费用待补充，请按实际车辆费用记录，当前预算尚不完整。", None))
+            issues.append(issue("unknown_transport_cost", "medium", "部分交通费用未知，未计入已知费用合计。", None))
         if guided_budget["has_possible_duplicates"]:
             issues.append(issue("budget_item_overlap", "medium", "聊天中添加的费用已计入预算，请核对是否与机酒、门票或每日预算重复。", None))
 
@@ -252,6 +270,7 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
             "budget": budget,
         },
         "issues": issues,
+        "budget": guided_budget if planning.get("stage") in {"review", "confirmed"} else None,
         "suggestions": suggestions,
         "guide_constraints": guide_results,
     }
@@ -260,6 +279,7 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
 def _check_guide_constraints(plan: dict) -> list[dict]:
     planning = plan.get("planning", {})
     activities = {x["id"]: x for x in planning.get("activities", [])}
+    pending_ids = {x.get("reference_id") for x in planning.get("unscheduled_items", []) if x.get("manual_pending")}
     visits = {x.get("reference_id"): x for x in plan.get("itinerary", []) if x.get("category") in {"attraction", "food", "other"}}
     constraints = list(planning.get("guide_constraints", []))
     for activity in activities.values():
@@ -270,7 +290,7 @@ def _check_guide_constraints(plan: dict) -> list[dict]:
     results = []
     for constraint in constraints:
         ids = constraint.get("activity_ids", [])
-        active = [key for key in ids if key in activities and activities[key].get("choice") != "exclude"]
+        active = [key for key in ids if key in activities and activities[key].get("choice") != "exclude" and key not in pending_ids]
         if ids and not active:
             continue
         kind = constraint["type"]
@@ -279,14 +299,14 @@ def _check_guide_constraints(plan: dict) -> list[dict]:
         if kind == "hotel_change":
             satisfied = False
         elif satisfied and kind == "day":
-            satisfied = all(x["day"] == constraint.get("day") for x in scheduled)
+            satisfied = all(x["day"] + x.get("day_offset", 0) == constraint.get("day") for x in scheduled)
         elif satisfied and kind == "time_window":
             bounds = constraint.get("time_window", "").split("-")
             satisfied = len(bounds) == 2 and all(bounds[0] <= x["time_of_day"] <= bounds[1] for x in scheduled)
         elif satisfied and kind == "duration":
             satisfied = all(x.get("duration_minutes") == constraint.get("duration_minutes") for x in scheduled)
         elif satisfied and kind == "order":
-            ordering = [(x["day"], x["time_of_day"]) for x in scheduled]
+            ordering = [(x["day"], _scheduled_minutes(x)) for x in scheduled]
             satisfied = ordering == sorted(ordering) and len(set(ordering)) == len(ordering)
         names = "、".join(activities[key]["name"] for key in active)
         label = {"day": "指定日期", "time_window": "指定时间段", "duration": "停留时长", "order": "先后顺序", "hotel_change": "更换住宿酒店"}.get(kind, kind)

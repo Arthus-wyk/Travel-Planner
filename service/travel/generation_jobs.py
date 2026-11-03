@@ -3,7 +3,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 logger = logging.getLogger("travel.generation")
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 4
 if not logger.handlers:
     directory = Path(__file__).resolve().parents[2] / "logs"
     directory.mkdir(exist_ok=True)
@@ -23,6 +23,8 @@ def next_stage(stage, state):
               "place_match_agent": "default_choices", "default_choices": "prepare_draft",
               "prepare_draft": "itinerary_agent", "route_agent": "schedule_agent", "schedule_agent": "audit_agent"}
     if stage == "itinerary_agent":
+        if state.get("revision_failed"):
+            return "audit_agent"
         return "itinerary_agent" if state.get("proposal_error") else "route_agent"
     if stage == "audit_agent":
         return after_audit(state)
@@ -34,9 +36,8 @@ def execute_job(plan_id, job_id, plan, payload):
     digest = store.fingerprint({"plan": plan, "payload": payload})
     def progress(stage, state):
         following = next_stage(stage, state)
-        logger.info("checkpoint plan_id=%s job_id=%s stage=%s next=%s attempts=%s proposal_error=%s audit=%s",
-                    plan_id, job_id, stage, following, state.get("attempts", 0), state.get("proposal_error", ""),
-                    json.dumps(state.get("audit", {}), ensure_ascii=False, default=str))
+        logger.info("checkpoint plan_id=%s job_id=%s stage=%s next=%s attempts=%s",
+                    plan_id, job_id, stage, following, state.get("attempts", 0))
         store.save_checkpoint(plan_id, digest, {**state, "payload": {}, "resume_stage": following,
                                                 "schema_version": CHECKPOINT_SCHEMA_VERSION})
         store.update_job(plan_id, job_id, "running", stage)
@@ -46,6 +47,8 @@ def execute_job(plan_id, job_id, plan, payload):
             resume = None
         if resume:
             resume["payload"] = payload
+            if resume.get("resume_stage") == "itinerary_agent":
+                resume["format_attempts"] = 0
             logger.info("resuming plan_id=%s job_id=%s next=%s", plan_id, job_id, resume["resume_stage"])
         store.update_job(plan_id, job_id, "running", "starting")
         token = generation_job_id.set(job_id)
@@ -62,5 +65,7 @@ def execute_job(plan_id, job_id, plan, payload):
         logger.warning("needs_input plan_id=%s job_id=%s reason=%s", plan_id, job_id, exc)
         store.update_job(plan_id, job_id, "needs_input", "guide_agent", str(exc)[:500])
     except Exception as exc:
+        from service.utils.request_log import log_error
+        log_error(exc, plan_id=plan_id, job_id=job_id, stage="generation_job")
         logger.exception("failed plan_id=%s job_id=%s", plan_id, job_id)
         store.update_job(plan_id, job_id, "failed", "failed", str(exc)[:500])

@@ -45,9 +45,9 @@ class PlanningGraphTests(unittest.TestCase):
         plan = run_planning_action(plan, "choose_activities", {
             "choices": {suggestion["id"]: "must"}
         })["plan"]
-        with self.assertRaisesRegex(ValueError, suggestion["name"]):
-            run_planning_action(located_plan(plan), "draft", {})
-        self.model.assert_not_called()
+        result = run_planning_action(located_plan(plan), "draft", {})
+        self.assertIn("unresolved_activity", {x["type"] for x in result["audit"]["issues"]})
+        self.assertEqual(result["plan"]["planning"]["unscheduled_items"], [])
         with self.assertRaises(ValueError):
             run_planning_action(plan, "confirm", {})
 
@@ -68,7 +68,7 @@ class PlanningGraphTests(unittest.TestCase):
             "activity_id": item["reference_id"], "duration_minutes": 120,
             "ticket_required": False, "estimated_cost": 0, "visit_tips": "带水",
         })
-        self.assertEqual(result["trace"], ["coordinator", "route_agent", "audit_agent"])
+        self.assertEqual(result["trace"], ["coordinator", "route_agent", "schedule_agent", "audit_agent"])
         self.assertEqual(next(x for x in result["plan"]["itinerary"] if x.get("reference_id") == item["reference_id"])["visit_tips"], "带水")
         moved = run_planning_action(result["plan"], "move_activity", {
             "item_id": item["item_id"], "target_day": 2,
@@ -93,7 +93,7 @@ class PlanningGraphTests(unittest.TestCase):
             self.assertEqual(result["trace"], ["coordinator", "guide_agent", "activity_agent", "place_agent"])
             plan = result["plan"]
             result = run_planning_action(located_plan(plan), "draft", {})
-            self.assertEqual(result["trace"], ["coordinator", "prepare_draft", "itinerary_agent", "route_agent", "audit_agent"])
+            self.assertEqual(result["trace"], ["coordinator", "prepare_draft", "itinerary_agent", "route_agent", "schedule_agent", "audit_agent"])
             self.assertTrue(result["plan"]["itinerary"])
 
     def test_selecting_candidates_immediately_recommends_activities(self):
@@ -122,9 +122,10 @@ class PlanningGraphTests(unittest.TestCase):
             "return": next(x["id"] for x in transport if x["direction"] == "return"),
             "hotel": plan["planning"]["hotel_candidates"][0]["id"],
         })["plan"]
+        plan["budget_items"].append({"description": "已知费用", "amount": 100})
         result = run_planning_action(located_plan(plan), "draft", {})
         plan = result["plan"]
-        self.assertEqual(result["trace"], ["coordinator", "prepare_draft"] + ["itinerary_agent", "route_agent", "audit_agent"] * 3)
+        self.assertEqual(result["trace"], ["coordinator", "prepare_draft", "itinerary_agent", "route_agent", "schedule_agent", "audit_agent"])
         with self.assertRaises(ValueError):
             run_planning_action(plan, "confirm", {})
 

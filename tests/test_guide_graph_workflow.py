@@ -45,7 +45,7 @@ class GuideGraphWorkflowTests(unittest.TestCase):
     def test_draft_submits_latest_text_and_preserves_selected_poi(self):
         plan = ready()
         text = "第二天中午12点去知味观"
-        parsed = {"places": [{"name": "知味观", "category": "food", "day": 2, "time_window": "12:00-12:00"}]}
+        parsed = {"places": [{"name": "知味观", "category": "food", "day": 2, "note": "中午12点"}]}
         with patch("service.travel.guide._extract_with_model", return_value=json.dumps(parsed, ensure_ascii=False)), patch(
             "agent.planning_graph.generate_itinerary_proposal", side_effect=proposal
         ) as model, patch("service.travel.map_planning.amap_search_places") as search:
@@ -55,15 +55,25 @@ class GuideGraphWorkflowTests(unittest.TestCase):
         self.assertEqual(result["plan"]["planning"]["activities"][0]["id"], "manual-1")
         self.assertEqual(result["plan"]["planning"]["activities"][0]["place_status"], "manual_confirmed")
 
-    def test_missing_required_location_fails_before_model_and_preserves_input(self):
+    def test_missing_required_location_stays_pending_without_user_confirmation(self):
         plan = ready()
         plan["planning"]["activities"][-1].pop("place")
         before = deepcopy(plan)
-        with patch("agent.planning_graph.generate_itinerary_proposal") as model:
-            with self.assertRaisesRegex(ValueError, "位置"):
-                run_planning_action(plan, "draft", {})
-        model.assert_not_called()
+        with patch("agent.planning_graph.generate_itinerary_proposal", side_effect=proposal) as model:
+            result = run_planning_action(plan, "draft", {})
+        self.assertEqual(result["plan"]["planning"]["unscheduled_items"], [])
+        self.assertEqual(model.call_args.args[0]["planning"]["activities"][-1]["choice"], "exclude")
         self.assertEqual(plan, before)
+
+    def test_invalid_input_is_not_retried(self):
+        from agent import itinerary
+        plan = ready()
+        activity = plan["planning"]["activities"][-1]
+        plan["planning"]["activities"].append(deepcopy(activity))
+        with patch("agent.planning_graph.generate_itinerary_proposal", wraps=itinerary.generate_itinerary_proposal) as model:
+            with self.assertRaisesRegex(ValueError, "activity_id"):
+                run_planning_action(plan, "draft", {})
+        self.assertEqual(model.call_count, 1)
 
     def test_model_format_retry_is_bounded_and_does_not_mutate_old_plan(self):
         plan = ready()

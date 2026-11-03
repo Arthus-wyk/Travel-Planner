@@ -84,11 +84,11 @@ class GuidedApiTests(unittest.TestCase):
         self.request(f"/api/plans/{plan_id}/planning/confirm", {})
         before = self.get(f"/api/plans/{plan_id}/sheet")["sheet"]["budget"]["estimated_total"]
         self.request(f"/api/plans/{plan_id}/planning/purchase", {
-            "reference_id": outbound["id"], "actual_total": outbound["estimated_total"] + 80,
+            "reference_id": outbound["id"], "actual_total": 80,
         })
         sheet = self.get(f"/api/plans/{plan_id}/sheet")["sheet"]
         self.assertEqual(sheet["budget"]["estimated_total"], before + 80)
-        self.assertEqual(sheet["purchases"][0]["actual_total"], outbound["estimated_total"] + 80)
+        self.assertEqual(sheet["purchases"][0]["actual_total"], 80)
 
     def test_budget_repair_persists_and_returns_new_audit(self):
         plan_id = self.request("/api/plans/drafts", FORM)["plan"]["plan_id"]

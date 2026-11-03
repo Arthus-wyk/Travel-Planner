@@ -10,6 +10,9 @@ import urllib.parse
 import urllib.request
 from hashlib import sha256
 from typing import Any
+from time import perf_counter
+from uuid import uuid4
+from service.utils.request_log import write_event, log_error, body_value
 
 from service.config import AMAP_API_KEY, AMAP_TIMEOUT_SECONDS
 from service.storage.travel_db import read_map_cache, write_map_cache
@@ -34,24 +37,44 @@ def request_amap(path: str, params: dict, image: bool = False):
     if not AMAP_API_KEY:
         raise RuntimeError("Set AMAP_API_KEY in .env before using Amap tools.")
     url = "https://restapi.amap.com" + path + "?" + urllib.parse.urlencode({**params, "key": AMAP_API_KEY})
+    details = {"call_id": uuid4().hex, "method": "GET", "url": "https://restapi.amap.com" + path,
+               "direction": "outbound", "params": params}
+    started = perf_counter()
+    write_event("api.requests", details)
     try:
         with urllib.request.urlopen(url, timeout=AMAP_TIMEOUT_SECONDS) as response:
             body = response.read()
             mime = response.headers.get_content_type()
+            write_event("api.responses", {**details, "status": getattr(response, "status", 200),
+                        "headers": dict(response.headers), "body": body_value(body),
+                        "duration_ms": round((perf_counter() - started) * 1000, 2)})
     except urllib.error.HTTPError as exc:
+        result = {**details, "status": exc.code, "body": body_value(exc.read()),
+                  "duration_ms": round((perf_counter() - started) * 1000, 2)}
+        write_event("api.responses", result)
+        log_error(exc, **result)
         raise RuntimeError(f"Amap HTTP {exc.code}") from None
-    except urllib.error.URLError:
-        raise RuntimeError("Amap network request failed") from None
+    except Exception as exc:
+        log_error(exc, **details)
+        if isinstance(exc, urllib.error.URLError):
+            raise RuntimeError("Amap network request failed") from None
+        raise
     if image and mime in {"image/png", "image/jpeg", "image/gif"}:
         data = f"data:{mime};base64," + base64.b64encode(body).decode("ascii")
         write_map_cache(key, data, 30 * 86400)
         return data
-    data = json.loads(body)
+    try:
+        data = json.loads(body)
+    except ValueError as exc:
+        log_error(exc, **details)
+        raise
     if str(data.get("status")) != "1":
         if path == "/v3/staticmap":
             logger.error("Amap static map failed: infocode=%s info=%s params=%s url_length=%d",
                          data.get("infocode"), data.get("info"), params, len(url))
-        raise RuntimeError(f"{data.get('infocode')}: {data.get('info', 'Request failed')}")
+        error = RuntimeError(f"{data.get('infocode')}: {data.get('info', 'Request failed')}")
+        log_error(error, **details, body=data)
+        raise error
     if image:
         raise RuntimeError("Amap did not return a map image")
     # Empty results may be transient; never persist failures or empty searches.
@@ -126,11 +149,18 @@ def place_summary(place: dict) -> dict:
     lon, lat = coordinates(place["location"]).split(",")
     business = place.get("biz_ext") or {}
     rating = business.get("rating")
+    try:
+        per_person = float(business.get("cost"))
+        if not math.isfinite(per_person) or per_person <= 0:
+            per_person = None
+    except (TypeError, ValueError):
+        per_person = None
     return {"place_id": place.get("id"), "name": place.get("name"),
             "address": "".join(str(place.get(key) or "") for key in ("pname", "cityname", "adname", "address")) or place.get("name"),
             "latitude": float(lat), "longitude": float(lon), "coordinate_system": "GCJ-02",
             "citycode": place.get("citycode"), "adcode": place.get("adcode"),
             "rating": float(rating) if rating and rating != "[]" else None,
+            "cost_per_person": per_person,
             "user_rating_count": None, "price_level": None, "business_status": None,
             "types": (place.get("type") or "").split(";"),
             "amap_uri": "https://uri.amap.com/marker?" + urllib.parse.urlencode({"position": f"{lon},{lat}", "name": place.get("name", "")})}
@@ -179,9 +209,26 @@ def compute_route(payload: dict) -> list[dict]:
         duration = (path.get("cost") or {}).get("duration", path.get("duration"))
         if duration in (None, "", []):
             raise ValueError("Amap route is missing duration")
+        fare = (path.get("cost") or {}).get("transit_fee") if mode == "TRANSIT" else data.get("taxi_cost") if mode == "DRIVE" else None
+        if fare in (None, "", []):
+            fare = (path.get("cost") or {}).get("taxi_fee") if mode == "DRIVE" else None
+        if fare in (None, "", []) and mode == "TRANSIT":
+            segment_fares = [(segment.get("cost") or {}).get("transit_fee") for segment in path.get("segments", [])]
+            if segment_fares and all(value not in (None, "", []) for value in segment_fares):
+                try:
+                    fare = sum(float(value) for value in segment_fares)
+                except (TypeError, ValueError):
+                    fare = None
+        try:
+            fare = float(fare)
+            if not math.isfinite(fare) or fare < 0:
+                fare = None
+        except (TypeError, ValueError):
+            fare = None
         result.append({"distanceMeters": int(float(path["distance"])),
                        "duration": f"{int(float(duration))}s", "legs": path.get("segments", path.get("steps", [])),
-                       "source": "高德地图", "amap_route": path})
+                       "source": "高德地图", "amap_route": path,
+                       "fare": fare})
     return result
 
 

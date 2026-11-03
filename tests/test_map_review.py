@@ -66,7 +66,7 @@ class MapReviewTests(unittest.TestCase):
         self.assertFalse(changed["planning"]["unscheduled_items"])
         moved = next(x for x in changed["itinerary"] if x.get("reference_id") == original["reference_id"])
         self.assertEqual(moved["day"], 3)
-        self.assertFalse(changed["planning"]["unplaced_activities"])
+        self.assertFalse(changed["planning"].get("unplaced_activities"))
         self.assertTrue(any(r["destination_item_id"] == moved["item_id"] for r in changed["routes"]))
         self.assertEqual(len([x for x in changed["itinerary"] if x["category"] == "attraction"]), 3)
         with self.assertRaises(ValueError):
@@ -76,15 +76,21 @@ class MapReviewTests(unittest.TestCase):
         plan = planning.draft_itinerary(prepared_plan())
         # A second-day hotel departure at 08:00 with a two-hour trip moves the visit to 10:00.
         route = next(r for r in plan["routes"] if r["origin_item_id"] == "guided-2-start")
-        with patch("agent.planning_graph.AMAP_API_KEY", "test"), patch("agent.planning_graph.amap_compute_route", return_value={"success": True, "duration": "7200s", "distance_meters": 1000, "legs": [{"polyline": "120,30;120.1,30.1"}]}) as compute:
+        def route_result(origin, destination, travel_mode):
+            return {"success": True, "duration": {"WALK": "7200s", "TRANSIT": "1800s", "DRIVE": "600s"}[travel_mode],
+                    "distance_meters": 1000, "legs": [{"polyline": "120,30;120.1,30.1"}]}
+        with patch("agent.planning_graph.AMAP_API_KEY", "test"), patch("agent.planning_graph.amap_compute_route", side_effect=route_result) as compute:
             result = run_planning_action(plan, "route_mode", {**route, "travel_mode": "WALK"})
         changed = result["plan"]
         visit = next(x for x in changed["itinerary"] if x["item_id"] == route["destination_item_id"])
         self.assertEqual(visit["time_of_day"], "10:00")
         self.assertTrue(any(call.kwargs["travel_mode"] == "WALK" for call in compute.call_args_list))
-        with patch("agent.planning_graph.AMAP_API_KEY", "test"), patch("agent.planning_graph.amap_compute_route", return_value={"success": True, "duration": "600s", "distance_meters": 1000}):
+        self.assertEqual(set(next(r for r in changed["routes"] if r["origin_item_id"] == route["origin_item_id"])["route_options"]), {"WALK", "TRANSIT", "DRIVE"})
+        with patch("agent.planning_graph.AMAP_API_KEY", "test"), patch("agent.planning_graph.amap_compute_route") as api:
             faster = run_planning_action(changed, "route_mode", {**route, "travel_mode": "DRIVE"})["plan"]
+        api.assert_not_called()
         self.assertEqual(next(x for x in faster["itinerary"] if x["item_id"] == visit["item_id"])["time_of_day"], "09:30")
+        self.assertEqual(next(r for r in faster["routes"] if r["origin_item_id"] == route["origin_item_id"])["travel_mode"], "DRIVE")
         again = planning.update_activity_details(changed, visit["reference_id"], {"duration_minutes": 90, "ticket_required": False, "estimated_cost": 0, "visit_tips": "", "time_of_day": "11:15"})
         self.assertEqual(next(x for x in again["itinerary"] if x["item_id"] == visit["item_id"])["time_of_day"], "11:15")
         self.assertEqual(next(r for r in again["routes"] if r["origin_item_id"] == "guided-2-start")["travel_mode"], "WALK")
@@ -119,11 +125,26 @@ class MapReviewTests(unittest.TestCase):
         route["legs"] = [{"polyline": "120.1,30.1;120.2,30.2"}]
         with patch("service.travel.map_planning.resolve_location", return_value={"location": "120.1,30.1"}), patch("service.travel.map_planning.static_map", return_value={"image_cache_key": "a" * 64}) as render:
             first = day_map(plan, 2)
-            self.assertIn("120.2,30.2", render.call_args.args[5][0])
+            self.assertIn("120.2,30.2", first["paths"][0])
             second = day_map(plan, 3)
         self.assertNotEqual([x["item_id"] for x in first["points"]], [x["item_id"] for x in second["points"]])
         with self.assertRaises(ValueError):
             day_map(plan, 0)
+
+    def test_dynamic_map_preserves_full_route_without_requesting_image(self):
+        plan = planning.draft_itinerary(prepared_plan())
+        route = next(r for r in plan["routes"] if r["origin_item_id"] == "guided-2-start")
+        line = ";".join(f"{120 + n / 10000},30.2" for n in range(500))
+        route["legs"] = [{"polyline": line}]
+        with patch("service.travel.map_planning.resolve_location", return_value={"location": "120.1,30.2"}), patch("service.travel.map_planning.static_map") as render:
+            result = day_map(plan, 2)
+        self.assertIn(line, result["paths"])
+        render.assert_not_called()
+
+    def test_first_day_map_renders(self):
+        plan = planning.draft_itinerary(prepared_plan())
+        with patch("service.travel.map_planning.resolve_location", return_value={"location": "120.1,30.2"}), patch("service.travel.map_planning.static_map", return_value={"image_cache_key": "a" * 64}):
+            self.assertTrue(day_map(plan, 1)["success"])
 
     def test_http_search_image_and_move_persist_without_image_payload_in_plan(self):
         plan = planning.draft_itinerary(prepared_plan())

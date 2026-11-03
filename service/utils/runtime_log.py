@@ -13,7 +13,7 @@ from time import perf_counter
 
 current_run = ContextVar("travel_log_run", default=None)
 logger = logging.getLogger(__name__)
-SECRET_KEY = re.compile(r"^(authorization|proxy.authorization|.*api[_-]?key|.*token|.*password|.*secret|cookie|set-cookie)$", re.I)
+SECRET_KEY = re.compile(r"^(key|authorization|proxy.authorization|.*api[_-]?key|.*token|.*password|.*secret|cookie|set-cookie)$", re.I)
 SECRET_TEXT = re.compile(
     r"((?:Bearer|Basic)\s+)[^\s\"',;]+|((?:[\w-]*(?:api[_-]?key|token|password|secret)|authorization|cookie)[\"']?\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|(?:Bearer|Basic)\s+[^\s\"'&,;}]+|[^\s\"'&,;}]+)",
     re.I,
@@ -34,11 +34,15 @@ def redact(value):
             else:
                 cleaned = redact(parsed)
                 return json.dumps(cleaned, ensure_ascii=False) if cleaned != parsed else value
+        value = re.sub(r"((?:^|[?&])key=)[^&\s\"']+", r"\1[REDACTED]", value, flags=re.I)
         return SECRET_TEXT.sub(lambda match: (match[1] or match[2]) + "[REDACTED]", value)
     return value
 
 
 def record_event(event_type, payload):
+    if event_type.endswith("error"):
+        from service.utils.request_log import write_event
+        write_event("errors", {"event": event_type, **payload})
     run = current_run.get()
     if run is not None:
         run.record(event_type, payload)

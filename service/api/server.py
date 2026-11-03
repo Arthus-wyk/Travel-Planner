@@ -54,6 +54,7 @@ def _require_local_log_request(request: Request) -> None:
 
 def create_app(server_file: Path, model: str) -> FastAPI:
     app = FastAPI(title="Travel Planner API", version="0.1")
+    from service.api.request_logging import RequestLoggingMiddleware
 
     @app.middleware("http")
     async def api_headers(request: Request, call_next):
@@ -148,8 +149,7 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         plan, error = get_plan(plan_id)
         if error or plan is None:
             raise HTTPException(status_code=404, detail="Plan not found")
-        result = day_map(plan, day)
-        return {**result, "image_url": f"/api/maps/images/{result['image_cache_key']}"}
+        return day_map(plan, day)
 
     @app.get("/api/maps/images/{image_key}")
     def map_image(image_key: str):
@@ -186,7 +186,9 @@ def create_app(server_file: Path, model: str) -> FastAPI:
                 await asyncio.sleep(1)
         except WebSocketDisconnect:
             pass
-        except Exception:
+        except Exception as exc:
+            from service.utils.request_log import log_error
+            log_error(exc, plan_id=plan_id, stage="generation_websocket")
             logging.getLogger(__name__).exception("generation websocket failed plan_id=%s", plan_id)
             try:
                 await websocket.close(code=1011, reason="无法读取生成状态")
@@ -285,6 +287,7 @@ def create_app(server_file: Path, model: str) -> FastAPI:
             raise HTTPException(status_code=404, detail="Run log not found.")
         return {"success": True, **data}
 
+    app.add_middleware(RequestLoggingMiddleware)
     return app
 
 

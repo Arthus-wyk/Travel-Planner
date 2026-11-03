@@ -30,6 +30,24 @@ def base_plan():
 
 
 class GenerationTests(TestCase):
+    def test_old_checkpoint_is_rebuilt(self):
+        checkpoint = {"schema_version": 3, "resume_stage": "itinerary_agent"}
+        with patch.object(planning_jobs, "read_checkpoint", return_value=checkpoint), patch.object(planning_jobs, "update_job"), patch.object(planning_jobs, "commit_result"), patch("service.travel.generation_jobs.run_planning_action", return_value={"plan": {"planning": {}}}) as run:
+            execute_job("plan", "job", {}, {})
+        self.assertIsNone(run.call_args.kwargs["resume"])
+
+    def test_manual_retry_resets_format_budget_but_keeps_revision_state(self):
+        from service.travel.generation_jobs import CHECKPOINT_SCHEMA_VERSION
+        checkpoint = {"schema_version": CHECKPOINT_SCHEMA_VERSION, "resume_stage": "itinerary_agent",
+                      "format_attempts": 2, "attempts": 5, "revision_attempts": 1, "feedback": [{"message": "missing"}]}
+        with patch.object(planning_jobs, "read_checkpoint", return_value=checkpoint), patch.object(planning_jobs, "update_job"), patch.object(planning_jobs, "commit_result"), patch("service.travel.generation_jobs.run_planning_action", return_value={"plan": {"planning": {}}}) as run:
+            execute_job("plan", "job", {}, {})
+        resumed = run.call_args.kwargs["resume"]
+        self.assertEqual(resumed["format_attempts"], 0)
+        self.assertEqual(resumed["revision_attempts"], 1)
+        self.assertEqual(resumed["attempts"], 5)
+        self.assertEqual(resumed["feedback"], [{"message": "missing"}])
+
     def test_checkpoint_next_stage_keeps_retry_and_audit_loop(self):
         self.assertEqual(next_stage("activity_agent", {}), "search_places")
         self.assertEqual(next_stage("itinerary_agent", {"proposal_error": "invalid"}), "itinerary_agent")
@@ -37,6 +55,12 @@ class GenerationTests(TestCase):
         self.assertEqual(next_stage("route_agent", {}), "schedule_agent")
         self.assertEqual(next_stage("schedule_agent", {}), "audit_agent")
         self.assertEqual(next_stage("audit_agent", {"action": "generate_from_guide", "attempts": 3, "audit": {"issues": []}}), "done")
+
+    def test_unlocated_place_does_not_reinvoke_ordering_model(self):
+        from agent.planning_graph import after_audit
+        state = {"action": "generate_from_guide", "revision_attempts": 1,
+                 "audit": {"issues": [{"type": "unplaced_activities", "severity": "high"}]}}
+        self.assertEqual(after_audit(state), "done")
 
     def test_failed_stage_preserves_last_checkpoint_for_retry(self):
         plan = base_plan()
@@ -71,18 +95,25 @@ class GenerationTests(TestCase):
         self.assertEqual(progress.call_args.args[0], "audit_agent")
         generate.assert_not_called()
 
-    def test_graph_node_logs_output_without_image_or_key(self):
+    def test_graph_node_does_not_log_state(self):
         with patch("agent.planning_graph.logging.getLogger") as get_logger:
             result = _logged_node("guide_agent", lambda state: {
                 "guide_text": "西湖", "image_base64": "large-image",
                 "nested": {"api_key": "secret"},
             })({})
         self.assertEqual(result["guide_text"], "西湖")
-        message = get_logger.return_value.info.call_args.args[3]
-        self.assertEqual(get_logger.return_value.info.call_args.args[2], "guide_agent")
-        self.assertIn("西湖", message)
-        self.assertNotIn("large-image", message)
-        self.assertNotIn("secret", message)
+        get_logger.assert_not_called()
+
+    def test_model_output_logs_content_and_tool_calls(self):
+        from types import SimpleNamespace
+        from service.travel.generation_model_log import log_model_output
+        message = SimpleNamespace(content="模型生成内容", tool_calls=[{"function": {"name": "search_map_places"}}])
+        with patch("service.travel.generation_model_log.write_event") as write:
+            log_model_output("place_search", message)
+        kind, data = write.call_args.args
+        self.assertEqual(kind, "model.responses")
+        self.assertEqual(data["body"]["content"], "模型生成内容")
+        self.assertEqual(data["body"]["tool_calls"][0]["function"]["name"], "search_map_places")
 
     def client(self, handler):
         return OpenAICompatibleClient("https://example.com/v1", "test", transport=httpx.MockTransport(handler))
@@ -101,10 +132,10 @@ class GenerationTests(TestCase):
             else:
                 self.assertNotIn("real-poi", str(body))
                 message = {"content": json.dumps({"days": [
-                    {"day": 1, "visits": []}, {"day": 2, "visits": [{"position": 1, "travel_mode": "WALK"}]},
-                    {"day": 3, "visits": []}], "unscheduled": []})}
+                    {"day": 1, "visits": []}, {"day": 2, "visits": [{"position": 1}]},
+                    {"day": 3, "visits": []}]})}
             return httpx.Response(200, json={"choices": [{"message": message}]})
-        with patch("service.utils.model_client.create_model_client", return_value=self.client(handler)), patch("service.utils.model_client.get_model", return_value="test"), patch("service.travel.place_matching.create_model_client", return_value=self.client(handler)), patch("service.travel.place_matching.get_model", return_value="test"), patch("service.travel.planning.analyze_guide", return_value={"text": "西湖", "places": [{"id": "internal", "name": "西湖", "category": "attraction"}], "constraints": []}), patch("service.travel.place_matching.amap_search_places", return_value={"success": True, "places": [POINT, {**POINT, "place_id": "shop", "name": "西湖商场", "types": ["购物服务"]}]}) as search, patch("agent.planning_graph.AMAP_API_KEY", ""):
+        with patch("service.utils.model_client.create_model_client", return_value=self.client(handler)), patch("service.utils.model_client.get_model", return_value="test"), patch("service.travel.place_matching.create_model_client", return_value=self.client(handler)), patch("service.travel.place_matching.get_model", return_value="test"), patch("service.travel.planning.analyze_guide", return_value={"text": "西湖", "places": [{"id": "internal", "name": "西湖", "category": "attraction"}], "constraints": []}), patch("service.travel.place_matching.amap_search_places", return_value={"success": True, "places": [POINT, {**POINT, "place_id": "other", "name": "西湖公园", "types": ["风景名胜"]}]}) as search, patch("agent.planning_graph.AMAP_API_KEY", ""):
             outcome = run_planning_action(base_plan(), "generate_from_guide", {"text": "西湖"})
         search.assert_called_once_with("西湖", region_code="杭州", max_results=5)
         self.assertEqual(outcome["plan"]["planning"]["stage"], "review")
@@ -131,6 +162,26 @@ class GenerationTests(TestCase):
             self.assertEqual(search_and_match(plan)["planning"]["activities"][0]["place"], POINT)
         chat.assert_not_called()
 
+    def test_match_model_only_sees_same_city_compatible_candidates(self):
+        from types import SimpleNamespace
+        tool = SimpleNamespace(tool_calls=[{"function": {"name": "search_map_places", "arguments": {"place_position": 1, "query": "西湖"}}}])
+        seen = []
+        def chat(messages, **kwargs):
+            if kwargs.get("tools"):
+                return tool
+            seen.append(json.loads(messages[1]["content"])["candidates"])
+            return SimpleNamespace(content=json.dumps({"candidate_position": 1, "reason": "同城景区"}), tool_calls=[])
+        candidates = [POINT, {**POINT, "place_id": "wrong-type", "name": "西湖商场", "types": ["购物服务"]},
+                      {**POINT, "place_id": "wrong-city", "address": "上海市黄浦区"},
+                      {**POINT, "place_id": "second", "name": "西湖公园"}]
+        plan = base_plan(); plan["planning"]["activities"] = [{"id": "p", "name": "西湖", "category": "attraction"}]
+        with patch("service.travel.place_matching._chat", side_effect=chat), patch("service.travel.place_matching.amap_search_places", return_value={"success": True, "places": candidates}):
+            result = search_and_match(plan)
+        self.assertEqual([x["name"] for x in seen[0]], [POINT["name"], "西湖公园"])
+        self.assertEqual(result["planning"]["activities"][0]["place_status"], "model_matched")
+        from service.travel.place_matching import MATCH_SCHEMA
+        self.assertEqual(MATCH_SCHEMA["properties"]["candidate_position"]["type"], "integer")
+
     def test_excluded_hotel_is_not_automatically_selected(self):
         plan = base_plan()
         plan["planning"].update(hotel_candidates=[{"id": "h", "name": "酒店", "place": POINT}], selected_hotel="h", activities=[{"id": "h", "category": "hotel", "choice": "exclude"}])
@@ -145,8 +196,8 @@ class GenerationTests(TestCase):
     def test_null_or_out_of_range_match_keeps_unresolved(self):
         from types import SimpleNamespace
         tool = SimpleNamespace(tool_calls=[{"function": {"name": "search_map_places", "arguments": {"place_position": 1, "query": "西湖"}}}])
-        for choice in (None, 99, 2):
-            with self.subTest(choice=choice), patch("service.travel.place_matching._chat", side_effect=[tool, SimpleNamespace(content=json.dumps({"candidate_position": choice, "reason": "核对类别"}), tool_calls=[])]), patch("service.travel.place_matching.amap_search_places", return_value={"success": True, "places": [POINT, {**POINT, "name": "西湖商场", "types": ["购物服务"]}]}):
+        for choice in (None, 99, 3):
+            with self.subTest(choice=choice), patch("service.travel.place_matching._chat", side_effect=[tool, SimpleNamespace(content=json.dumps({"candidate_position": choice, "reason": "核对类别"}), tool_calls=[])]), patch("service.travel.place_matching.amap_search_places", return_value={"success": True, "places": [POINT, {**POINT, "name": "西湖公园", "types": ["风景名胜"]}]}):
                 plan = base_plan(); plan["planning"]["activities"] = [{"id": "p", "name": "西湖", "category": "attraction"}]
                 self.assertNotIn("place", search_and_match(plan)["planning"]["activities"][0])
 

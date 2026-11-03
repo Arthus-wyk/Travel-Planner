@@ -12,10 +12,11 @@ from copy import deepcopy
 from hashlib import sha256
 import json
 import logging
+from math import isfinite
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from agent.itinerary import generate_itinerary_proposal
+from agent.itinerary import ItineraryInputError, generate_itinerary_proposal
 
 from service.config import AMAP_API_KEY
 from service.mcp.server import amap_compute_route, amap_search_hotels, amap_search_places
@@ -45,6 +46,7 @@ class PlanningState(TypedDict, total=False):
     attempts: int
     format_attempts: int
     revision_attempts: int
+    revision_failed: bool
     feedback: list
     proposal_error: str
     input_hash: str
@@ -141,6 +143,8 @@ def coordinator(state: PlanningState) -> dict:
                                "duration_minutes": old.get(pair, {}).get("duration_minutes", 30),
                                "travel_mode": old.get(pair, {}).get("travel_mode", "TRANSIT"),
                                "source": "provisional_estimate", "legs": []})
+                routes[-1].pop("fare", None)
+                routes[-1].pop("mode_locked", None)
         plan["routes"] = routes
     elif action not in {"candidates", "guide", "activities", "draft", "generate_from_guide", "confirm"}:
         raise ValueError("Unknown planning action")
@@ -228,21 +232,17 @@ def prepare_draft(state: PlanningState) -> dict:
         plan = build_activities(plan, text)
         if AMAP_API_KEY:
             plan = locate_activities(plan)
-    _, _, hotel = _selected(plan)
-    if hotel and not has_coordinates(hotel.get("place")) and state["action"] != "generate_from_guide":
-        raise ValueError("请先在第二步确认住宿酒店的具体位置")
+    pending_ids = {x.get("reference_id") for x in plan["planning"].get("unscheduled_items", []) if x.get("manual_pending")}
     forced = []
     for item in plan["planning"].get("activities", []):
         if item.get("choice") == "exclude" or item.get("category") == "hotel":
             continue
-        if not has_coordinates(item.get("place")):
-            if item.get("choice") == "must" and state["action"] != "generate_from_guide":
-                raise ValueError(f"请先在第二步确认 {item['name']} 的具体位置")
+        if item["id"] in pending_ids or not has_coordinates(item.get("place")):
             forced.append({"activity_id": item["id"], "reason": "位置尚未确认，暂不安排"})
     snapshot = {key: plan.get(key) for key in ("destination", "departure_city", "start_date", "end_date", "travelers", "budget", "pace", "interests", "constraints")}
     snapshot["planning"] = {key: value for key, value in plan["planning"].items() if key not in {"generation", "stage", "unscheduled_items", "unplaced_activities", "needs_replan"}}
     digest = sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-    return {"plan": plan, "attempts": 0, "format_attempts": 0, "revision_attempts": 0,
+    return {"plan": plan, "attempts": 0, "format_attempts": 0, "revision_attempts": 0, "revision_failed": False,
             "feedback": [], "proposal_error": "", "forced_unscheduled": forced,
             "input_hash": digest, "trace": state["trace"] + ["prepare_draft"]}
 
@@ -259,13 +259,22 @@ def itinerary_agent(state: PlanningState) -> dict:
             activity["choice"] = "exclude"
     try:
         proposal = generate_itinerary_proposal(model_plan, state.get("feedback", []))
+    except ItineraryInputError:
+        raise
     except ValueError as exc:
+        from service.utils.request_log import log_error
+        log_error(exc, stage="itinerary_agent", attempt=attempts, format_attempt=format_attempts)
         if format_attempts >= 3:
+            if state.get("revision_attempts", 0) and (state["plan"]["planning"].get("generation") or {}).get("contract_version") == 3:
+                plan = deepcopy(state["plan"])
+                plan["planning"].setdefault("generation_issues", []).append({"type": "revision_failed", "severity": "high",
+                    "message": "自动调整未能满足全部要求，已保留上一份完整草稿及风险，请调整日期或停留时长。", "target": None})
+                return {"plan": plan, "proposal_error": "", "revision_failed": True,
+                        "trace": state["trace"] + ["itinerary_agent"]}
             raise ValueError(f"行程 Agent 生成失败，请重试：{exc}") from exc
         return {"attempts": attempts, "format_attempts": format_attempts, "proposal_error": str(exc),
                 "feedback": [{"type": "invalid_proposal", "message": str(exc)}],
                 "trace": state["trace"] + ["itinerary_agent"]}
-    proposal["unscheduled"] += forced
     plan = draft_itinerary(state["plan"], proposal)
     plan["planning"]["generation"].update(input_hash=state["input_hash"], revisions=attempts - 1)
     return {"plan": plan, "attempts": attempts, "format_attempts": 0,
@@ -273,6 +282,8 @@ def itinerary_agent(state: PlanningState) -> dict:
 
 
 def after_itinerary(state: PlanningState) -> str:
+    if state.get("revision_failed"):
+        return "audit_agent"
     return "itinerary_agent" if state.get("proposal_error") else "route_agent"
 
 
@@ -296,25 +307,44 @@ def route_agent(state: PlanningState) -> dict:
                     return item["arrival_location"]
                 place = item.get("place") or {}
                 return f"{place['longitude']},{place['latitude']}" if place else item["location"]
-            result = amap_compute_route(waypoint(origin, arriving=True), waypoint(destination), travel_mode=route["travel_mode"])
-            if not result.get("success"):
-                route.update(source="provisional_estimate", duration_minutes=30, legs=[], error=result.get("message", "路线计算失败"))
-                continue
-            duration = result.get("duration") or ""
-            if isinstance(duration, str) and duration.endswith("s"):
+            choices = []
+            errors = []
+            points = [waypoint(origin, arriving=True), waypoint(destination)]
+            options = route.get("route_options") if state["action"] != "recalculate_routes" and route.get("route_options_key") == points else None
+            if options is None:
+                options = {}
+                for mode in ("WALK", "TRANSIT", "DRIVE"):
+                    options[mode] = amap_compute_route(*points, travel_mode=mode)
+                route["route_options"] = options
+                route["route_options_key"] = points
+            for mode in ((route["travel_mode"],) if route.get("mode_locked") else ("WALK", "TRANSIT", "DRIVE")):
+                result = options.get(mode) or {}
                 try:
-                    route["duration_minutes"] = (int(float(duration[:-1])) + 59) // 60
-                    route["distance_meters"] = result.get("distance_meters")
-                    route["source"] = "高德地图"
-                    route["legs"] = result.get("legs", [])
-                    if route["station_transfer"] and any(x["category"] == "intercity_transport" and not x.get("station_confirmed") for x in (origin, destination)):
-                        route["source"] = "provisional_estimate"
-                        route["error"] = "尚未确认具体车站或机场，接驳按城市位置估算，请填写出发站和到达站。"
-                        route["legs"] = []
-                    else:
-                        route.pop("error", None)
-                except ValueError:
-                    pass
+                    seconds = float(str(result.get("duration", "")).removesuffix("s"))
+                    if not result.get("success") or not 0 < seconds < float("inf"):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errors.append(result.get("message", f"{mode} 路线不可用"))
+                    continue
+                choices.append((seconds, mode, result))
+            if not choices:
+                route.update(source="provisional_estimate", duration_minutes=30, legs=[], error="；".join(errors))
+                route.pop("fare", None)
+                continue
+            seconds, mode, result = min(choices, key=lambda x: x[0])
+            route.update(travel_mode=mode, duration_minutes=(int(seconds) + 59) // 60,
+                         distance_meters=result.get("distance_meters"), source="高德地图",
+                         legs=result.get("legs", []))
+            route.pop("fare", None)
+            if isinstance(result.get("fare"), (int, float)) and not isinstance(result["fare"], bool) and isfinite(result["fare"]) and result["fare"] >= 0:
+                route["fare"] = result["fare"]
+            if route["station_transfer"] and any(x["category"] == "intercity_transport" and not x.get("station_confirmed") for x in (origin, destination)):
+                route["source"] = "provisional_estimate"
+                route["error"] = "尚未确认具体车站或机场，接驳按城市位置估算，请填写出发站和到达站。"
+                route["legs"] = []
+                route.pop("fare", None)
+            else:
+                route.pop("error", None)
     if state["action"] == "generate_from_guide" or state["action"] == "draft":
         return {"plan": plan, "trace": state["trace"] + ["route_agent"]}
     return {"plan": apply_route_times(plan), "trace": state["trace"] + ["route_agent"]}
@@ -337,16 +367,24 @@ def audit_agent(state: PlanningState) -> dict:
         if any(item["severity"] == "high" for item in audit["issues"]):
             raise ValueError("Resolve high-severity itinerary issues before confirmation")
         plan = {**plan, "planning": {**plan["planning"], "stage": "confirmed"}}
-    return {"plan": plan, "audit": audit, "feedback": audit["issues"],
+    ordering_feedback = [x for x in audit["issues"] if x["type"] in {
+        "time_conflict", "transport_buffer", "schedule_overflow", "guide_constraint", "pace_risk"}]
+    return {"plan": plan, "audit": audit, "feedback": ordering_feedback,
             "revision_attempts": state.get("revision_attempts", 0) + 1,
             "trace": state["trace"] + ["audit_agent"]}
 
 
 def after_audit(state: PlanningState) -> str:
-    repairable = {"time_conflict", "transport_buffer", "guide_constraint", "unplaced_activities", "budget_overrun"}
-    if state["action"] in {"draft", "generate_from_guide"} and state.get("revision_attempts", 0) < 3 and any(
-        x["severity"] == "high" and x["type"] in repairable for x in state.get("audit", {}).get("issues", [])
-    ):
+    audit = state.get("audit", {})
+    route_or_time = any(x["severity"] == "high" and x["type"] in {"time_conflict", "transport_buffer", "schedule_overflow"}
+                        for x in audit.get("issues", []))
+    pending_ids = {x.get("reference_id") for x in state.get("plan", {}).get("planning", {}).get("unscheduled_items", []) if x.get("manual_pending")}
+    routable = {x["id"] for x in state.get("plan", {}).get("planning", {}).get("activities", [])
+                if x.get("choice") != "exclude" and x["id"] not in pending_ids and has_coordinates(x.get("place"))}
+    guide_order = any(not x.get("satisfied") and x.get("hard") and x.get("type") in {"day", "time_window", "order", "duration"}
+                      and (not state.get("plan") or set(x.get("activity_ids", [])) <= routable)
+                      for x in audit.get("guide_constraints", []))
+    if not state.get("revision_failed") and state["action"] in {"draft", "generate_from_guide"} and state.get("revision_attempts", 0) < 3 and (route_or_time or guide_order):
         return "itinerary_agent"
     return "done"
 
@@ -376,26 +414,25 @@ def default_choices(state: PlanningState) -> dict:
     chosen = next((x for x in hotels if x["id"] == planning.get("selected_hotel")), None)
     if not chosen and hotels:
         guide_ids = {x["id"] for x in planning.get("activities", []) if x.get("source") == "guide_text"}
-        chosen = sorted(hotels, key=lambda x: (x["id"] not in guide_ids, x.get("estimated_total") or 0, x["id"]))[0]
+        guide_ids.update(x["id"] for x in planning.get("activities", []) if x.get("source") == "lodging_search")
+        chosen = sorted(hotels, key=lambda x: (x["id"] not in guide_ids, x.get("estimated_total") or 0))[0]
         planning["lodging_assumption"] = "按攻略住宿和已定位候选自动建议住宿，可修改"
     planning["selected_hotel"] = chosen["id"] if chosen else None
     return {"plan": plan, "trace": state["trace"] + ["default_choices"]}
 
 
 def _logged_node(name, node):
-    def redact(value):
-        if isinstance(value, dict):
-            return {key: "[redacted]" if any(word in key.lower() for word in
-                    ("base64", "api_key", "password", "secret", "token", "authorization"))
-                    else redact(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [redact(item) for item in value]
-        return value
-
     def run(state):
-        result = node(state)
-        logging.getLogger("travel.generation").info("job_id=%s node=%s result=%s", generation_job_id.get(), name, json.dumps(redact(result), ensure_ascii=False, default=str))
-        return result
+        from service.utils.request_log import context, log_error
+        token = context.set({**context.get(), "stage": name, "job_id": generation_job_id.get(),
+                             "plan_id": state.get("plan", {}).get("plan_id")})
+        try:
+            return node(state)
+        except Exception as exc:
+            log_error(exc)
+            raise
+        finally:
+            context.reset(token)
 
     return run
 
@@ -428,7 +465,7 @@ def build_planning_graph():
     graph.add_edge("activity_agent", "place_agent")
     graph.add_edge("place_agent", END)
     graph.add_edge("prepare_draft", "itinerary_agent")
-    graph.add_conditional_edges("itinerary_agent", after_itinerary, {"itinerary_agent": "itinerary_agent", "route_agent": "route_agent"})
+    graph.add_conditional_edges("itinerary_agent", after_itinerary, {"itinerary_agent": "itinerary_agent", "route_agent": "route_agent", "audit_agent": "audit_agent"})
     graph.add_edge("route_agent", "schedule_agent")
     graph.add_edge("schedule_agent", "audit_agent")
     graph.add_conditional_edges("audit_agent", after_audit, {"itinerary_agent": "itinerary_agent", "done": END})

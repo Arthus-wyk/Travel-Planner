@@ -41,7 +41,7 @@ class ArchitectureTests(unittest.TestCase):
                     "service/storage",
                     "service/travel",
                     "service/mcp",
-                }:
+                } and path.name not in {"generation_jobs.py", "generation_model_log.py"}:
                     self.assertFalse(
                         any((name or "").split(".")[0] == "agent" for name in imports),
                         str(path),

@@ -8,9 +8,14 @@ import httpx
 
 from service.config import get_env_or_dotenv as env
 from ollama import AsyncClient
+from service.utils.request_log import instrument_client
 
 
 class OllamaClient(AsyncClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        instrument_client(self._client)
+
     async def chat(self, *, tool_choice=None, parallel_tool_calls=None, **kwargs):
         # Ollama lacks tool_choice; the caller must validate the returned invocation.
         return await super().chat(**kwargs)
@@ -124,7 +129,8 @@ class OpenAICompatibleClient:
             return response_chunk(data["choices"][0]["message"], data.get("usage"))
 
     def _client(self):
-        return httpx.AsyncClient(headers={"Authorization": f"Bearer {self.api_key}"}, timeout=120, transport=self.transport)
+        return instrument_client(httpx.AsyncClient(headers={"Authorization": f"Bearer {self.api_key}"},
+                                                    timeout=120, transport=self.transport))
 
     async def _stream(self, payload):
         calls = {}

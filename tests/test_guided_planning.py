@@ -42,15 +42,14 @@ class GuidedPlanningTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             planning.create_draft({**form, "trip_days": 0}, "trip-2")
 
-    def test_simulated_candidates_are_stable_and_labeled(self):
+    def test_candidates_are_stable_and_unpriced(self):
         plan = planning.create_draft(FORM, "trip-1")
         first = planning.build_candidates(plan)
         second = planning.build_candidates(plan)
         self.assertEqual(first["planning"]["transport_candidates"], second["planning"]["transport_candidates"])
         self.assertEqual(first["planning"]["hotel_candidates"], second["planning"]["hotel_candidates"])
         all_candidates = first["planning"]["transport_candidates"] + first["planning"]["hotel_candidates"]
-        self.assertTrue(all(item["price_source"] == "simulation" for item in all_candidates if item.get("kind") != "drive"))
-        self.assertTrue(all(item["price_source"] == "unknown" and item["cost_unknown"] for item in all_candidates if item.get("kind") == "drive"))
+        self.assertTrue(all(item["price_source"] == "unknown" and item["cost_unknown"] for item in all_candidates))
 
     def test_candidate_identity_changes_when_trip_dates_change(self):
         first = planning.build_candidates(planning.create_draft(FORM, "trip-1"))
@@ -146,7 +145,7 @@ class GuidedPlanningTests(unittest.TestCase):
 
     def test_guide_extractor_uses_configured_model_and_skill(self):
         data = {"places": [{"name": "西湖", "category": "attraction", "address": "",
-                            "day": None, "time_window": "", "duration_minutes": None,
+                            "day": None, "duration_minutes": None,
                             "ticket_required": None, "note": "上午"}], "constraints": []}
         client = SimpleNamespace(chat=AsyncMock(return_value=SimpleNamespace(
             message=SimpleNamespace(content=json.dumps(data), tool_calls=[]))))
@@ -158,7 +157,7 @@ class GuidedPlanningTests(unittest.TestCase):
         call = client.chat.await_args.kwargs
         self.assertEqual(call["model"], "guide-test-model")
         self.assertEqual(call["format"], guide.GUIDE_SCHEMA)
-        self.assertIn("不要补充", call["messages"][0]["content"])
+        self.assertIn("不补充", call["messages"][0]["content"])
         self.assertIn("西湖：上午", call["messages"][1]["content"])
         with patch("service.travel.guide._extract_with_model") as extract:
             self.assertEqual(guide.analyze_guide("")["places"], [])
@@ -268,13 +267,13 @@ class GuidedPlanningTests(unittest.TestCase):
         })
         self.assertFalse(any(x["reference_id"] == activity["id"] for x in planning.budget_summary(free)["items"]))
 
-    def test_audit_flags_missing_anchor_and_guided_budget_overrun(self):
+    def test_audit_flags_missing_anchor_and_unknown_budget(self):
         plan = planning.draft_itinerary(self.prepared_plan())
         plan["itinerary"] = [i for i in plan["itinerary"] if not (i["day"] == 2 and i["category"] == "hotel_anchor" and i["anchor_role"] == "start")]
         plan["budget"] = 100
         kinds = {item["type"] for item in audit_plan(plan)["issues"]}
         self.assertIn("missing_start_anchor", kinds)
-        self.assertIn("budget_overrun", kinds)
+        self.assertIn("unknown_hotel_cost", kinds)
 
     def test_audit_flags_insufficient_transfer_buffer(self):
         plan = planning.draft_itinerary(self.prepared_plan())
@@ -293,19 +292,18 @@ class GuidedPlanningTests(unittest.TestCase):
         plan = planning.draft_itinerary(self.prepared_plan())
         outbound = plan["planning"]["selected_transport"]["outbound"]
         estimate = planning.budget_summary(plan)["estimated_total"]
-        expected = next(item["estimated_total"] for item in plan["planning"]["transport_candidates"] if item["id"] == outbound)
-        bought = planning.record_purchase(plan, {"reference_id": outbound, "actual_total": expected + 100})
+        bought = planning.record_purchase(plan, {"reference_id": outbound, "actual_total": 100})
         self.assertEqual(planning.budget_summary(bought)["estimated_total"], estimate + 100)
         replanned = planning.draft_itinerary(bought)
         self.assertEqual(replanned["planning"]["purchases"], bought["planning"]["purchases"])
-        self.assertEqual(planning.itinerary_sheet(replanned)["purchases"][0]["actual_total"], expected + 100)
+        self.assertEqual(planning.itinerary_sheet(replanned)["purchases"][0]["actual_total"], 100)
 
-    def test_budget_includes_daily_food_and_local_transit_allowances(self):
+    def test_budget_does_not_count_daily_allowances_as_api_prices(self):
         plan = self.prepared_plan()
         summary = planning.budget_summary(plan)
         categories = {item["category"]: item for item in summary["items"]}
-        self.assertEqual(categories["food"]["estimate"], 3 * 2 * 100)
-        self.assertEqual(categories["local_transit"]["estimate"], 3 * 2 * 30)
+        self.assertNotIn("food", categories)
+        self.assertNotIn("local_transit", categories)
         with self.assertRaises(ValueError):
             planning.record_purchase(plan, {"reference_id": "allowance-food", "actual_total": 200})
 

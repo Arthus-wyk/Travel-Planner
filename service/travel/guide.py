@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -23,10 +24,9 @@ _DAY = {"type": "integer", "minimum": 1, "maximum": 365}
 _DURATION = {"type": "integer", "minimum": 30, "maximum": 600}
 _PLACE_PROPERTIES = {
     "name": {"type": "string", "minLength": 1, "maxLength": 80},
-    "category": {"type": "string", "enum": ["attraction", "food", "hotel", "other"]},
+    "category": {"type": "string", "enum": ["attraction", "food", "hotel", "lodging_area", "other"]},
     "address": {"type": "string", "maxLength": 300},
     "day": {"anyOf": [_DAY, {"type": "null"}]},
-    "time_window": _TEXT,
     "duration_minutes": {"anyOf": [_DURATION, {"type": "null"}]},
     "ticket_required": {"type": ["boolean", "null"]},
     "note": {"type": "string", "maxLength": 500},
@@ -103,16 +103,20 @@ def analyze_guide(text: str) -> dict[str, Any]:
         try:
             raw = _extract_with_model(text, feedback)
         except GuideOutputError as exc:
+            from service.utils.request_log import log_error
+            log_error(exc, stage="guide_extraction", attempt=attempt)
             feedback = str(exc)[:1000]
             logging.getLogger("travel.generation").warning("guide_extraction_invalid attempt=%s reason=%s", attempt, feedback)
             continue
-        except TimeoutError as exc:
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             raise ValueError("攻略提取模型响应超时（180 秒），请检查模型服务状态后重试") from exc
         except Exception as exc:
             raise ValueError("Guide extraction model failed; please retry or check model configuration") from exc
         try:
             return _parse_guide_data(json.loads(raw), text)
         except ValueError as exc:
+            from service.utils.request_log import log_error
+            log_error(exc, stage="guide_extraction", attempt=attempt)
             feedback = str(exc)[:1000]
             logging.getLogger("travel.generation").warning("guide_extraction_invalid attempt=%s reason=%s", attempt, feedback)
     raise GuideNeedsInput(f"攻略地点提取连续 3 次校验失败：{feedback}。请手动添加或修正地点后继续规划。")
@@ -122,6 +126,7 @@ def _parse_guide_data(data: Any, text: str) -> dict[str, Any]:
     if not isinstance(data, dict) or set(data) - {"places", "constraints"} or not isinstance(data.get("places"), list):
         raise ValueError("Guide extraction model returned invalid places")
     places = []
+    lodging_areas = []
     seen = set()
     for item in data["places"]:
         if not isinstance(item, dict) or set(item) - set(_PLACE_PROPERTIES):
@@ -140,23 +145,27 @@ def _parse_guide_data(data: Any, text: str) -> dict[str, Any]:
         if not isinstance(ticket, bool):
             ticket = None
         category = item.get("category", "attraction")
-        if category not in {"attraction", "food", "hotel", "other"}:
+        if category not in {"attraction", "food", "hotel", "lodging_area", "other"}:
             raise ValueError("Guide extraction model returned invalid category")
+        if category == "lodging_area":
+            lodging_areas.append({"name": name, "note": note.strip()[:500]})
+            continue
         day = item.get("day")
         if day is not None and (isinstance(day, bool) or not isinstance(day, int) or not 1 <= day <= 365):
             raise ValueError("Guide extraction model returned invalid day")
         address = item.get("address") or ""
-        window = item.get("time_window") or ""
         if not isinstance(address, str) or len(address) > 300:
             raise ValueError(f"地点 {name} 的地址无效，必须为不超过 300 字的文字")
-        if not _valid_window(window):
-            raise ValueError(f"地点 {name} 的 time_window={window!r} 无效，须为 HH:MM-HH:MM 或空字符串")
         places.append({"id": "guide-" + sha256(name.casefold().encode("utf-8")).hexdigest()[:12],
                        "name": name, "note": note.strip()[:500], "source": "guide_text",
-                       "category": category, "day": day, "time_window": window,
+                       "category": category, "day": day,
                        "location_hint": address.strip(),
                        "duration_minutes": duration, "ticket_required": ticket,
                        "visit_tips": note.strip()[:500]})
+    for match in re.finditer(r'(?:优先住|建议住|推荐住|也可以选|也可选)\s*[「“"]([^」”"\n]{2,50})[」”"]', text):
+        name = match.group(1).strip()
+        if name not in {x["name"] for x in lodging_areas}:
+            lodging_areas.append({"name": name, "note": "原文住宿区域建议"})
     constraints = data.get("constraints", [])
     if not isinstance(constraints, list) or len(constraints) > 200:
         raise ValueError("Guide extraction model returned invalid constraints")
@@ -169,6 +178,9 @@ def _parse_guide_data(data: Any, text: str) -> dict[str, Any]:
         source = constraint.get("source", "")
         if not isinstance(refs, list) or any(not isinstance(x, str) for x in refs) or not isinstance(source, str):
             raise ValueError("Guide extraction model returned invalid constraint references")
+        area_names = {x["name"].casefold() for x in lodging_areas}
+        if any(x.strip().casefold() in area_names for x in refs):
+            continue
         unknown = [x for x in refs if x.strip().casefold() not in names]
         if unknown:
             raise ValueError(f"Guide constraint references an unknown place: {unknown[0]}")
@@ -190,7 +202,7 @@ def _parse_guide_data(data: Any, text: str) -> dict[str, Any]:
                 raise ValueError("Invalid guide duration constraint")
             value["duration_minutes"] = duration
         validated.append(value)
-    return {"text": text, "places": places, "constraints": validated}
+    return {"text": text, "places": places, "lodging_areas": lodging_areas, "constraints": validated}
 
 
 def _valid_window(value: str) -> bool:

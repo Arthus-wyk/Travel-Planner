@@ -232,7 +232,7 @@ def amap_compute_route(
             "message": f"No route found from {origin} to {destination}.",
         }
 
-    route = routes[0]
+    route = min(routes, key=lambda item: int(item["duration"].removesuffix("s")))
     return {
         "success": True,
         "origin": origin,
@@ -240,6 +240,7 @@ def amap_compute_route(
         "travel_mode": normalized_travel_mode,
         "distance_meters": route.get("distanceMeters"),
         "duration": route.get("duration"),
+        "fare": route.get("fare"),
         "static_duration": route.get("staticDuration"),
         "localized_values": route.get("localizedValues"),
         "legs": route.get("legs", []),

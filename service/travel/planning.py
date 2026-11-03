@@ -59,7 +59,7 @@ def create_draft(form: dict[str, Any], plan_id: str) -> dict[str, Any]:
         raise ValueError("travelers must be a positive integer")
     budget = _positive_money(form.get("budget"), "budget")
     if form.get("currency", "CNY") != "CNY":
-        raise ValueError("Guided simulated prices currently use CNY only")
+        raise ValueError("Guided planning currently uses CNY only")
     daily_food = _positive_money(form.get("daily_food_per_person", 100), "daily_food_per_person")
     daily_transit = _positive_money(form.get("daily_local_transit_per_person", 30), "daily_local_transit_per_person")
     interests = form.get("interests") or []
@@ -98,11 +98,6 @@ def create_draft(form: dict[str, Any], plan_id: str) -> dict[str, Any]:
     }
 
 
-def _simulated_price(*parts: str, base: int, spread: int) -> int:
-    token = "|".join(parts).encode("utf-8")
-    return base + int.from_bytes(sha256(token).digest()[:4], "big") % spread
-
-
 def _candidate_id(prefix: str, *parts: str) -> str:
     return prefix + "-" + sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
@@ -110,7 +105,6 @@ def _candidate_id(prefix: str, *parts: str) -> str:
 def build_candidates(plan: dict[str, Any], hotel_places: list[dict] | None = None) -> dict[str, Any]:
     updated = deepcopy(plan)
     planning = updated.setdefault("planning", {})
-    people = updated["travelers"]
     origin, destination = updated["departure_city"], updated["destination"]
     candidates = []
     for direction, day, start, end in (
@@ -123,13 +117,12 @@ def build_candidates(plan: dict[str, Any], hotel_places: list[dict] | None = Non
             ("bus", (("07:00", "11:00"),) if direction == "outbound" else (("17:00", "21:00"),), 70, 100),
         ):
             for index, (depart, arrive) in enumerate(times, 1):
-                price = _simulated_price(start, end, day, direction, mode, str(index), base=base, spread=spread)
                 candidates.append({
                     "id": _candidate_id(f"{direction}-{mode}", start, end, day, str(index)), "kind": mode,
                     "direction": direction, "origin": start, "destination": end,
                     "date": day, "depart_time": depart, "arrive_time": arrive,
-                    "price_per_person": price, "estimated_total": price * people,
-                    "price_source": "simulation",
+                    "price_per_person": None, "estimated_total": None,
+                    "price_source": "unknown", "cost_unknown": True,
                 })
         candidates.append({
             "id": _candidate_id(f"{direction}-drive", start, end, day), "kind": "drive",
@@ -142,6 +135,8 @@ def build_candidates(plan: dict[str, Any], hotel_places: list[dict] | None = Non
     for candidate in candidates:
         if candidate["id"] in old_transport:
             candidate.update(old_transport[candidate["id"]])
+        if candidate.get("price_source") == "simulation":
+            candidate.update(price_per_person=None, estimated_total=None, price_source="unknown", cost_unknown=True)
     nights = (date.fromisoformat(updated["end_date"]) - date.fromisoformat(updated["start_date"])).days
     places = (hotel_places or [])[:3]
     if not places and nights:
@@ -149,15 +144,14 @@ def build_candidates(plan: dict[str, Any], hotel_places: list[dict] | None = Non
     hotels = []
     for index, place in enumerate(places, 1):
         hotel_key = str(place.get("place_id") or place.get("name") or f"住宿方案 {index}")
-        price = _simulated_price(destination, updated["start_date"], updated["end_date"], hotel_key, base=220, spread=380)
         hotels.append({
             "id": _candidate_id("hotel", destination, updated["start_date"], updated["end_date"], hotel_key),
             "name": place.get("name") or f"{destination}住宿方案 {index}",
             "location": place.get("address") or destination,
             "place_id": place.get("place_id"), "nights": nights,
             "place": place if place.get("latitude") is not None else None,
-            "price_per_night": price, "estimated_total": price * nights,
-            "price_source": "simulation",
+            "price_per_night": None, "estimated_total": None,
+            "price_source": "unknown", "cost_unknown": True,
             "listing_source": "高德 POI" if place.get("place_id") else "simulation",
         })
     planning["transport_candidates"] = candidates
@@ -229,7 +223,7 @@ def build_hotel_activities(plan: dict, hotel_places: list[dict] | None = None) -
         if hotel["id"] not in existing:
             activities.append({"id": hotel["id"], "name": hotel["name"], "location": hotel["location"],
                                "category": "hotel", "source": hotel.get("listing_source", "simulation"),
-                               "choice": "optional", "note": "住宿候选，价格为模拟估算", "duration_minutes": 90,
+                               "choice": "optional", "note": "住宿候选，价格待查询", "duration_minutes": 90,
                                "ticket_required": False, "estimated_cost": 0, "visit_tips": "",
                                "place": hotel.get("place"), "place_status": "unresolved"})
     return _sync_hotels(updated)
@@ -243,9 +237,10 @@ def _sync_hotels(plan: dict) -> dict:
         if activity.get("category", "attraction") != "hotel":
             hotels.pop(activity["id"], None)
             continue
-        price = _simulated_price(plan["destination"], plan["start_date"], plan["end_date"], activity["id"], base=220, spread=380)
-        hotel = hotels.setdefault(activity["id"], {"id": activity["id"], "price_per_night": price,
-                                                 "estimated_total": price * nights, "price_source": "simulation"})
+        hotel = hotels.setdefault(activity["id"], {"id": activity["id"], "price_per_night": None,
+                                                 "estimated_total": None, "price_source": "unknown", "cost_unknown": True})
+        if hotel.get("price_source") == "simulation":
+            hotel.update(price_per_night=None, estimated_total=None, price_source="unknown", cost_unknown=True)
         hotel.update(name=activity["name"], location=activity.get("location") or activity["name"],
                      nights=nights, place=activity.get("place"), place_id=(activity.get("place") or {}).get("place_id"))
     state["hotel_candidates"] = list(hotels.values()) if nights else []
@@ -262,8 +257,9 @@ def build_activities(
     guide = analyze_guide(guide_text)
     planning["guide_text"] = guide["text"]
     planning["guide_places"] = guide["places"]
+    planning["lodging_areas"] = guide.get("lodging_areas", [])
     planning["guide_constraints"] = guide.get("constraints", [])
-    previous = {item["name"].casefold(): item for item in planning.get("activities") or []}
+    previous = {(item.get("source_name") or item["name"]).casefold(): item for item in planning.get("activities") or []}
     activities = [
         {**item, "location": item.get("location_hint") or item["name"], "source_name": item["name"],
          "choice": previous.get(item["name"].casefold(), {}).get("choice", "optional"),
@@ -295,26 +291,45 @@ def build_activities(
             "visit_tips": previous.get(name.casefold(), {}).get("visit_tips", place.get("note", "")),
         })
     id_mapping = {}
-    for activity in activities:
-        old = next((x for x in planning.get("activities", []) if x["id"] == activity["id"] or x["name"].casefold() == activity["name"].casefold()), {})
-        if not old:
-            old = next((x for x in planning.get("activities", []) if (x.get("source_name") or "").casefold() == activity["name"].casefold()), {})
+    matched, used = {}, set()
+    # Reserve stable identities before matching mutable map display names.
+    for field in ("id", "source_name", "name"):
+        for index, activity in enumerate(activities):
+            if index in matched:
+                continue
+            old = next((x for x in planning.get("activities", [])
+                        if x["id"] not in used and
+                        (x["id"] == activity["id"] if field == "id" else
+                         (x.get(field) or "").casefold() == activity["name"].casefold())), None)
+            if old is not None:
+                matched[index] = old
+                used.add(old["id"])
+    for index, activity in enumerate(activities):
+        old = matched.get(index, {})
         if old:
             id_mapping[activity["id"]] = old["id"]
             activity["id"] = old["id"]
-            activity.update({key: old[key] for key in ("choice", "estimated_cost", "duration_minutes", "ticket_required", "visit_tips") if key in old})
+            activity.update({key: old[key] for key in ("choice", "estimated_cost", "duration_minutes", "ticket_required", "visit_tips", "manual_added") if key in old})
+            if old.get("source") == "manual" or old["id"].startswith("manual-"):
+                activity["manual_added"] = True
             if old.get("category_manual"):
                 activity.update(category=old.get("category", "attraction"), category_manual=True)
         hint_changed = old.get("location_hint", "") != activity.get("location_hint", "")
-        if old.get("place") and (not hint_changed or old.get("place_status") != "auto_confirmed"):
+        if old.get("place") and (not hint_changed or old.get("place_status") == "manual_confirmed" or old.get("manual_added") or old.get("source") == "manual"):
             activity.update({key: old[key] for key in ("name", "location", "source", "place", "place_status") if key in old})
             if hint_changed:
                 activity["place_error"] = "原文地址已变化，已保留手动位置，请核对"
         activity.setdefault("category", "attraction")
         activity.setdefault("place_status", "unresolved")
     included = {x["id"] for x in activities}
+    pending_ids = {x.get("reference_id") for x in planning.get("unscheduled_items", []) if x.get("manual_pending")}
     activities += [item for item in planning.get("activities") or []
-                   if (item.get("source") == "manual" or item.get("place") or item.get("category") == "hotel" or item.get("choice") == "exclude") and item["id"] not in included and item["name"].casefold() not in names]
+                   if (item.get("manual_added") or item.get("source") == "manual" or item["id"].startswith("manual-") or item["id"] in pending_ids or
+                       item.get("category") == "hotel" and not planning["lodging_areas"] and (not guide_text or item["id"] == planning.get("selected_hotel")))
+                   and item["id"] not in included and item["name"].casefold() not in names]
+    active_ids = {x["id"] for x in activities}
+    planning["hotel_candidates"] = [x for x in planning.get("hotel_candidates", []) if x["id"] in active_ids or
+        x["id"] == planning.get("selected_hotel") and not planning["lodging_areas"]]
     for constraint in planning["guide_constraints"]:
         constraint["activity_ids"] = [id_mapping.get(x, x) for x in constraint.get("activity_ids", [])]
     planning["activities"] = activities
@@ -336,7 +351,7 @@ def add_manual_activity(plan: dict[str, Any], name: str, location: str = "", cat
     while any(item["id"] == f"manual-{number}" for item in activities):
         number += 1
     activities.append({"id": f"manual-{number}", "name": name,
-                       "location": location.strip() or name, "source": "manual",
+                       "location": location.strip() or name, "source": "manual", "manual_added": True,
                        "location_hint": location.strip(), "category": category, "category_manual": True,
                        "place_status": "unresolved",
                        "note": "", "choice": "must", "estimated_cost": 0,
@@ -410,8 +425,16 @@ def _minute(value: str) -> int:
 
 
 def _clock(value: int) -> str:
-    value = max(0, min(value, 1439))
+    value = max(0, value) % 1440
     return f"{value // 60:02d}:{value % 60:02d}"
+
+
+def _set_start(item: dict, minutes: int) -> None:
+    item.update(time_of_day=_clock(minutes), day_offset=max(0, minutes) // 1440)
+
+
+def _start_minutes(item: dict) -> int:
+    return _minute(item["time_of_day"]) + item.get("day_offset", 0) * 1440
 
 
 def _validate_clock(value: str) -> None:
@@ -428,7 +451,7 @@ def _item(day: int, key: str, time: int, title: str, location: str,
     return {
         "item_id": f"guided-{day}-{key}", "day": day, "time_of_day": _clock(time),
         "title": title, "location": location, "category": category,
-        "duration_minutes": duration, "estimated_cost": 0, **extra,
+        "duration_minutes": duration, "estimated_cost": 0, "day_offset": max(0, time) // 1440, **extra,
     }
 
 
@@ -439,15 +462,16 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
     days = (date.fromisoformat(updated["end_date"]) - date.fromisoformat(updated["start_date"])).days + 1
     home = planning.get("home_location") or updated["departure_city"]
     lodging = hotel["location"] if hotel else None
+    pending = [deepcopy(x) for x in planning.get("unscheduled_items", []) if x.get("manual_pending")]
+    pending_ids = {x["reference_id"] for x in pending}
     activities = sorted(
-        [x for x in planning.get("activities", []) if x.get("choice") != "exclude" and x.get("category", "attraction") != "hotel"],
+        [x for x in planning.get("activities", []) if x.get("choice") != "exclude" and x.get("category", "attraction") != "hotel" and x["id"] not in pending_ids],
         key=lambda x: x.get("choice") != "must",
     )
     pace_limit = {"relaxed": 2, "moderate": 3, "active": 4}.get(updated.get("pace"), 3)
     daily_target = min(pace_limit, ceil(len(activities) / days)) if activities else 0
     itinerary: list[dict[str, Any]] = []
     routes: list[dict[str, Any]] = []
-    unplaced = []
     next_activity = 0
     activity_by_id = {x["id"]: x for x in activities}
     for day in range(1, days + 1):
@@ -468,10 +492,10 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
             itinerary[-1]["location"] = outbound.get("departure_location") or updated["departure_city"]
             if not last and hotel:
                 itinerary.append(_item(day, "arrival", arrivals + 60, "抵达酒店", lodging,
-                                       "hotel_arrival", place=hotel.get("place")))
+                                       "hotel_arrival", place=hotel.get("place"), hotel_name=hotel["name"]))
         elif hotel:
             itinerary.append(_item(day, "start", 8 * 60, "从酒店出发", lodging,
-                                   "hotel_anchor", anchor_role="start", place=hotel.get("place")))
+                                       "hotel_anchor", anchor_role="start", place=hotel.get("place"), hotel_name=hotel["name"]))
 
         slot = window_start
         planned_today = 0
@@ -501,7 +525,7 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
                                         activity.get("duration_minutes") or 90, reference_id=activity["id"], place=activity.get("place"),
                                        ticket_required=activity.get("ticket_required"), estimated_cost=activity.get("estimated_cost", 0),
                                        visit_tips=activity.get("visit_tips") or activity.get("note", ""),
-                                        reason="按每日顺序安排"))
+                                        ))
                 itinerary[-1]["suggested_travel_mode"] = stop.get("travel_mode")
                 slot = max(slot, start + int(activity.get("duration_minutes") or 90) + 30)
 
@@ -517,10 +541,11 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
                                    "回到家", home, "home_anchor", anchor_role="end"))
         elif hotel:
             itinerary.append(_item(day, "end", max(slot, 20 * 60), "返回酒店", lodging,
-                                   "hotel_anchor", anchor_role="end", place=hotel.get("place")))
+                                   "hotel_anchor", anchor_role="end", place=hotel.get("place"), hotel_name=hotel["name"]))
 
-    unscheduled = [x for x in activities[next_activity:]] if proposal is None else [activity_by_id[x["activity_id"]] for x in proposal["unscheduled"]]
-    unplaced = [x["id"] for x in unscheduled]
+    scheduled_ids = ({stop["activity_id"] for day in proposal["days"] for stop in day["visits"]}
+                     if "days" in proposal else {stop["activity_id"] for stop in proposal["stops"]}) if proposal is not None else None
+    unscheduled = [x for x in activities[next_activity:]] if scheduled_ids is None else [x for x in activities if x["id"] not in scheduled_ids]
     for day in range(1, days + 1):
         items = [x for x in itinerary if x["day"] == day]
         for origin, destination in zip(items, items[1:]):
@@ -532,15 +557,15 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
             })
     updated["itinerary"] = itinerary
     updated["routes"] = routes
-    planning["unplaced_activities"] = unplaced
-    planning["unscheduled_items"] = [
-        _item(0, x["id"], 0, x["name"], x.get("location") or x["name"], x.get("category", "attraction"),
-              int(x.get("duration_minutes") or 90), reference_id=x["id"], place=x.get("place"),
-              ticket_required=x.get("ticket_required"), estimated_cost=x.get("estimated_cost", 0),
-              visit_tips=x.get("visit_tips", "")) for x in unscheduled
-    ]
+    planning.pop("unplaced_activities", None)
+    planning["unscheduled_items"] = pending
+    planning["generation_issues"] = [{"type": "generation_omission", "severity": "high",
+        "message": f"{x['name']}未进入生成结果，请重新生成或调整要求。", "target": x["id"]}
+        for x in unscheduled if x.get("place")]
     if proposal is not None:
         planning["generation"] = deepcopy(proposal)
+        planning["generation"].pop("unscheduled", None)
+        planning["generation"]["contract_version"] = 3
     planning["stage"] = "review"
     planning["needs_replan"] = False
     return updated
@@ -556,21 +581,24 @@ def _reflow_review(plan: dict[str, Any]) -> dict[str, Any]:
         attractions = [x for x in plan["itinerary"] if x["day"] == day and x["category"] in MOVABLE_CATEGORIES]
         slot = max(9 * 60, _minute(outbound["arrive_time"]) + 90) if day == 1 else 9 * 60 + 30
         for item in attractions:
-            item["time_of_day"] = item.get("requested_time") or _clock(slot)
+            _set_start(item, _minute(item["requested_time"]) if item.get("requested_time") else slot)
             item["item_id"] = f"guided-{day}-{item['reference_id']}"
             slot += item["duration_minutes"] + 30
         if day < days:
             end = next((x for x in plan["itinerary"] if x["day"] == day and x.get("anchor_role") == "end"), None)
             if end:
-                end["time_of_day"] = _clock(max(slot, 20 * 60))
-        ordered = sorted((x for x in plan["itinerary"] if x["day"] == day), key=lambda x: x["time_of_day"])
+                _set_start(end, max(slot, 20 * 60))
+        ordered = sorted((x for x in plan["itinerary"] if x["day"] == day), key=_start_minutes)
         for origin, destination in zip(ordered, ordered[1:]):
             old = existing.get((origin["item_id"], destination["item_id"]), {})
+            start = origin.get("arrival_location", origin["location"])
+            end = destination["location"]
+            cached = {key: old[key] for key in ("route_options", "route_options_key", "mode_locked") if key in old} if old.get("origin") == start and old.get("destination") == end else {}
             routes.append({"origin_item_id": origin["item_id"], "destination_item_id": destination["item_id"],
-                           "origin": origin.get("arrival_location", origin["location"]), "destination": destination["location"],
+                           "origin": start, "destination": end,
                            "duration_minutes": 30, "source": "provisional_estimate",
-                           "travel_mode": old.get("travel_mode", "TRANSIT")})
-    plan["itinerary"].sort(key=lambda x: (x["day"], x["time_of_day"]))
+                           "travel_mode": old.get("travel_mode", "TRANSIT"), **cached})
+    plan["itinerary"].sort(key=lambda x: (x["day"], _start_minutes(x)))
     plan["routes"] = routes
     return plan
 
@@ -604,8 +632,10 @@ def move_activity(plan: dict[str, Any], item_id: str, target_day: int | None,
     else:
         target.append(moving)
     moving["day"] = target_day
+    moving["day_offset"] = 0
+    moving["manual_pending"] = target_day is None
     moving.pop("requested_time", None)
-    updated["planning"]["unplaced_activities"] = [x["reference_id"] for x in pending]
+    updated["planning"].pop("unplaced_activities", None)
     anchors = [x for x in updated["itinerary"] if x["category"] not in MOVABLE_CATEGORIES]
     updated["itinerary"] = anchors + [x for day in range(1, days + 1) for x in by_day[day]]
     return _reflow_review(updated)
@@ -654,8 +684,9 @@ def update_route_mode(plan: dict[str, Any], origin_id: str, destination_id: str,
     if route is None:
         raise ValueError("Local route not found")
     route["travel_mode"] = mode
-    route.update(source="provisional_estimate", duration_minutes=30, legs=[])
+    route.update(source="provisional_estimate", duration_minutes=30, legs=[], mode_locked=True)
     route.pop("distance_meters", None)
+    route.pop("fare", None)
     return _reflow_review(updated)
 
 
@@ -679,14 +710,14 @@ def apply_route_times(plan: dict) -> dict:
     routes = {(r["origin_item_id"], r["destination_item_id"]): r for r in plan["routes"]}
     for day in sorted({x["day"] for x in plan["itinerary"]}):
         ordered = [x for x in plan["itinerary"] if x["day"] == day]
-        ordered.sort(key=lambda x: x["time_of_day"])
+        ordered.sort(key=_start_minutes)
         for previous, item in zip(ordered, ordered[1:]):
             route = routes.get((previous["item_id"], item["item_id"]), {})
-            earliest = _minute(previous["time_of_day"]) + previous.get("duration_minutes", 0) + route.get("duration_minutes", 30)
+            earliest = _start_minutes(previous) + previous.get("duration_minutes", 0) + route.get("duration_minutes", 30)
             if item["category"] in MOVABLE_CATEGORIES:
-                item["time_of_day"] = item.get("requested_time") or _clock(max(_minute(item["time_of_day"]), earliest))
+                _set_start(item, _minute(item["requested_time"]) if item.get("requested_time") else max(_start_minutes(item), earliest))
             elif item.get("anchor_role") == "end" and item["category"] == "hotel_anchor":
-                item["time_of_day"] = _clock(max(20 * 60, earliest))
+                _set_start(item, max(20 * 60, earliest))
     return plan
 
 
@@ -695,37 +726,75 @@ def schedule_itinerary(plan: dict) -> dict:
     routes = {(r["origin_item_id"], r["destination_item_id"]): r for r in plan["routes"]}
     for day in sorted({item["day"] for item in plan["itinerary"]}):
         items = [item for item in plan["itinerary"] if item["day"] == day]
+        first_visit = True
         for previous, item in zip(items, items[1:]):
             if item["category"] not in MOVABLE_CATEGORIES and not (item["category"] == "hotel_anchor" and item.get("anchor_role") == "end"):
                 continue
             route = routes.get((previous["item_id"], item["item_id"]))
             duration = route.get("duration_minutes", 0) if route else 0
-            earliest = _minute(previous["time_of_day"]) + previous.get("duration_minutes", 0) + duration
-            item["time_of_day"] = _clock(max(_minute(item["time_of_day"]), earliest))
+            earliest = _start_minutes(previous) + previous.get("duration_minutes", 0) + duration
+            if item["category"] in MOVABLE_CATEGORIES:
+                start = _minute(item["requested_time"]) if item.get("requested_time") else max(earliest, _start_minutes(item)) if first_visit else earliest
+                _set_start(item, start)
+                first_visit = False
+            else:
+                _set_start(item, max(20 * 60, earliest))
     return plan
 
 
 def _billable_items(plan: dict[str, Any]) -> list[dict[str, Any]]:
     planning = plan.get("planning") or {}
+    visits = {}
+    for stop in plan.get("itinerary", []):
+        if stop.get("category") in MOVABLE_CATEGORIES and stop.get("reference_id"):
+            visits[stop["reference_id"]] = visits.get(stop["reference_id"], 0) + 1
     selected = set((planning.get("selected_transport") or {}).values())
     if planning.get("selected_hotel"):
         selected.add(planning["selected_hotel"])
     hotel_ids = {x["id"] for x in planning.get("hotel_candidates", [])}
     items = [
-        {"reference_id": item["id"], "label": item.get("name") or item.get("kind", "交通"),
+        {"reference_id": item["id"], "label": item.get("name") or f"{'去程' if item.get('direction') == 'outbound' else '返程'}{TRANSPORT_LABELS.get(item.get('kind'), '交通')}：{item.get('origin', '')} → {item.get('destination', '')}",
          "category": "hotel" if item["id"] in hotel_ids else "transport",
-         "estimate": item["estimated_total"], "cost_unknown": item.get("cost_unknown", False)}
+         "estimate": item.get("estimated_total") or 0,
+         "source": "实际记录" if item.get("price_source") == "actual" else "API" if item.get("price_source") not in {None, "simulation", "unknown"} else "未知",
+         "basis": f"{item.get('nights', 0)} 晚" if item["id"] in hotel_ids else "往返交通选项",
+         "cost_unknown": item.get("price_source") in {"simulation", "unknown"} or item.get("cost_unknown", False)
+                         or item.get("estimated_total") is None}
         for item in (planning.get("transport_candidates") or []) + (planning.get("hotel_candidates") or [])
         if item["id"] in selected
     ]
+    for item in items:
+        if item["cost_unknown"]:
+            item["estimate"] = 0
     items += [
         {"reference_id": item["id"], "label": item["name"], "category": "ticket" if item.get("category", "attraction") == "attraction" else item["category"],
-         "estimate": _positive_money(item.get("estimated_cost") or 0, "estimated_cost")}
+         "source": "用户填写" if item.get("estimated_cost") else "高德地图" if (item.get("place") or {}).get("cost_per_person") and item.get("category") == "food" else "未知",
+         "basis": f"{plan['travelers']} 人 × {visits.get(item['id'], 0)} 次" if item.get("category") == "food" else f"{visits.get(item['id'], 0)} 次",
+         "estimate": visits.get(item["id"], 0) * _positive_money(item.get("estimated_cost") or
+                                    ((item.get("place") or {}).get("cost_per_person") or 0) * plan["travelers"]
+                                    if item.get("category") == "food" else item.get("estimated_cost") or 0, "estimated_cost"),
+         "cost_unknown": not item.get("estimated_cost") and not (item.get("category") == "food" and (item.get("place") or {}).get("cost_per_person"))}
         for item in planning.get("activities") or []
-        if item.get("choice") != "exclude" and item.get("category", "attraction") != "hotel"
+        if item["id"] in visits and item.get("choice") != "exclude" and item.get("category", "attraction") != "hotel"
         and (item.get("category", "attraction") == "attraction" and item.get("ticket_required") is not False
-             or item.get("category") in {"food", "other"} and item.get("estimated_cost", 0) > 0)
+             or item.get("category") == "food" or item.get("category") == "other" and item.get("estimated_cost", 0) > 0)
     ]
+    self_drive = next((x for x in planning.get("transport_candidates", [])
+                       if x.get("id") == (planning.get("selected_transport") or {}).get("outbound") and x.get("kind") == "drive"), None)
+    for index, route in enumerate(plan.get("routes") or []):
+        if route.get("source") != "高德地图" or route.get("travel_mode") not in {"TRANSIT", "DRIVE"}:
+            continue
+        fare = route.get("fare")
+        known = isinstance(fare, (int, float)) and not isinstance(fare, bool) and isfinite(fare) and fare >= 0
+        if route["travel_mode"] == "DRIVE" and self_drive:
+            known = False
+        count = plan["travelers"] if route["travel_mode"] == "TRANSIT" else ceil(plan["travelers"] / 4)
+        stops = {x["item_id"]: x for x in plan.get("itinerary", []) if x.get("item_id")}
+        leg = " → ".join(stops[key].get("title", "地点") for key in (route.get("origin_item_id"), route.get("destination_item_id")) if key in stops)
+        items.append({"reference_id": f"route-{index}", "label": ("公交：" if route["travel_mode"] == "TRANSIT" else "打车：") + leg,
+                      "category": "local_transit", "estimate": round(fare * count, 2) if known else 0,
+                      "source": "高德地图" if known else "未知", "basis": f"{count} {'人' if route['travel_mode'] == 'TRANSIT' else '辆车'}",
+                      "cost_unknown": not known, "bookable": False})
     return items
 
 
@@ -744,19 +813,6 @@ def budget_summary(plan: dict[str, Any]) -> dict[str, Any]:
                "actual_total": item["actual_total"], "counted_total": item["actual_total"],
                "purchased": True, "retained_expense": True, "bookable": False,
                "selection_changed": not item.get("change_acknowledged", False)} for item in purchases.values()]
-    days = (date.fromisoformat(plan["end_date"]) - date.fromisoformat(plan["start_date"])).days + 1
-    for reference_id, label, category, amount in (
-        ("allowance-food", "餐饮预算", "food", planning.get("daily_food_per_person", 100)),
-        ("allowance-local-transit", "市内交通预算", "local_transit", planning.get("daily_local_transit_per_person", 30)),
-    ):
-        estimate = round(_positive_money(amount, category) * plan["travelers"] * days, 2)
-        if category == "food":
-            # A priced meal replaces half a day's allowance, up to two meals a day.
-            meals = min(days * 2, sum(x["category"] == "food" and x["counted_total"] > 0 for x in items))
-            estimate = round(max(0, estimate - meals * _positive_money(amount, category) * plan["travelers"] / 2), 2)
-        items.append({"reference_id": reference_id, "label": label, "category": category,
-                      "estimate": estimate, "actual_total": None,
-                      "counted_total": estimate, "purchased": False, "bookable": False})
     for index, item in enumerate(plan.get("budget_items") or [], 1):
         amount = _positive_money(item.get("amount"), "budget_item.amount")
         items.append({"reference_id": f"chat-budget-{item.get('budget_item_id') or index}",
@@ -770,8 +826,13 @@ def budget_summary(plan: dict[str, Any]) -> dict[str, Any]:
         "paid_total": round(sum(item["actual_total"] for item in items if item["purchased"]), 2),
         "remaining": round(float(plan["budget"]) - total, 2),
         "has_possible_duplicates": bool(plan.get("budget_items")),
-        "has_unknown_ticket_costs": any(x["category"] == "ticket" and x["estimate"] == 0 and not x["purchased"] for x in items),
-        "has_unknown_transport_costs": any(x.get("cost_unknown") and not x["purchased"] for x in items),
+        "has_unknown_ticket_costs": any(x["category"] == "ticket" and x.get("cost_unknown") and not x["purchased"] for x in items),
+        "has_unknown_hotel_costs": any(x["category"] == "hotel" and x.get("cost_unknown") and not x["purchased"] for x in items),
+        "has_unknown_transport_costs": any(x["category"] in {"transport", "local_transit"} and x.get("cost_unknown") and not x["purchased"] for x in items),
+        "has_unknown_food_costs": any(x.get("category") == "food" and x.get("choice") != "exclude"
+                                      and any(stop.get("reference_id") == x["id"] for stop in plan.get("itinerary", []))
+                                      and not x.get("estimated_cost") and not (x.get("place") or {}).get("cost_per_person")
+                                      for x in planning.get("activities") or []),
     }
 
 
