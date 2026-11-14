@@ -36,17 +36,13 @@ class GenerationTests(TestCase):
             execute_job("plan", "job", {}, {})
         self.assertIsNone(run.call_args.kwargs["resume"])
 
-    def test_manual_retry_resets_format_budget_but_keeps_revision_state(self):
+    def test_manual_regeneration_ignores_checkpoint(self):
         from service.travel.generation_jobs import CHECKPOINT_SCHEMA_VERSION
         checkpoint = {"schema_version": CHECKPOINT_SCHEMA_VERSION, "resume_stage": "itinerary_agent",
                       "format_attempts": 2, "attempts": 5, "revision_attempts": 1, "feedback": [{"message": "missing"}]}
         with patch.object(planning_jobs, "read_checkpoint", return_value=checkpoint), patch.object(planning_jobs, "update_job"), patch.object(planning_jobs, "commit_result"), patch("service.travel.generation_jobs.run_planning_action", return_value={"plan": {"planning": {}}}) as run:
             execute_job("plan", "job", {}, {})
-        resumed = run.call_args.kwargs["resume"]
-        self.assertEqual(resumed["format_attempts"], 0)
-        self.assertEqual(resumed["revision_attempts"], 1)
-        self.assertEqual(resumed["attempts"], 5)
-        self.assertEqual(resumed["feedback"], [{"message": "missing"}])
+        self.assertIsNone(run.call_args.kwargs["resume"])
 
     def test_checkpoint_next_stage_keeps_retry_and_audit_loop(self):
         self.assertEqual(next_stage("activity_agent", {}), "search_places")
@@ -189,9 +185,10 @@ class GenerationTests(TestCase):
 
     def test_image_text_is_not_replaced_by_stale_text_in_prepare(self):
         with patch("agent.planning_graph.recognize_guide", return_value="图片中的西湖"), patch("service.travel.planning.analyze_guide", return_value={"text": "图片中的西湖", "places": [{"id": "p", "name": "西湖"}], "constraints": []}) as analyze, patch("agent.planning_graph.search_and_match", side_effect=lambda plan: plan), patch("agent.planning_graph.generate_itinerary_proposal", return_value={"days": [{"day": day, "visits": []} for day in range(1, 4)], "unscheduled": [{"activity_id": "p", "reason": "位置待确认"}], "assumptions": [], "constraint_results": []}), patch("agent.planning_graph.AMAP_API_KEY", ""):
-            result = run_planning_action(base_plan(), "generate_from_guide", {"image_base64": "eA==", "text": "旧攻略"})
+            with self.assertRaises(GuideNeedsInput) as raised:
+                run_planning_action(base_plan(), "generate_from_guide", {"image_base64": "eA==", "text": "旧攻略"})
         analyze.assert_called_once_with("图片中的西湖")
-        self.assertEqual(result["plan"]["planning"]["guide_text"], "图片中的西湖")
+        self.assertEqual(raised.exception.plan["planning"]["guide_text"], "图片中的西湖")
 
     def test_null_or_out_of_range_match_keeps_unresolved(self):
         from types import SimpleNamespace
@@ -256,3 +253,120 @@ class GenerationTests(TestCase):
                 self.assertEqual(client.post("/api/plans/p/generation", json={"text": "西湖"}).json()["job_id"], "job")
                 self.assertEqual(client.get("/api/plans/p/generation").json()["job"]["status"], "running")
         execute.assert_not_called()
+
+
+class DegradationTests(TestCase):
+    def test_search_retries_only_transient_errors(self):
+        from service.travel.place_matching import _search
+        for message, count in [('INVALID_PARAMS', 1), ('Amap network request failed', 2)]:
+            with self.subTest(message=message), patch('service.travel.place_matching.amap_search_places', return_value={'success': False, 'message': message}) as search:
+                _search('lake')
+                self.assertEqual(search.call_count, count)
+
+    def test_ordering_exhaustion_preserves_every_located_place(self):
+        from agent.planning_graph import prepare_draft, itinerary_agent
+        plan = base_plan()
+        plan['planning']['guide_auto'] = True
+        plan['planning']['activities'] = [
+            {'id': 'a', 'name': 'A', 'category': 'attraction', 'choice': 'must', 'place': POINT, 'day': 2},
+            {'id': 'b', 'name': 'B', 'category': 'attraction', 'choice': 'optional', 'place': POINT},
+            {'id': 'c', 'name': 'C', 'category': 'attraction', 'choice': 'optional'}]
+        state = {'plan': plan, 'action': 'generate_from_guide', 'trace': []}
+        state.update(prepare_draft(state))
+        state['format_attempts'] = 2
+        with patch('agent.planning_graph.generate_itinerary_proposal', side_effect=ValueError('bad')):
+            result = itinerary_agent(state)
+        planning_state = result['plan']['planning']
+        days = planning_state['generation']['days']
+        self.assertCountEqual([v['activity_id'] for d in days for v in d['visits']], ['a', 'b'])
+        self.assertIn({'activity_id': 'a'}, days[1]['visits'])
+        self.assertTrue(any(x['type'] == 'ordering_fallback' for x in planning_state['generation_issues']))
+        self.assertTrue(any(x['target'] == 'c' for x in planning_state['generation_issues']))
+
+    def test_needs_input_saves_partial_without_replacing_itinerary(self):
+        plan = base_plan()
+        partial = deepcopy(plan)
+        partial['planning']['activities'] = [{'id': 'a', 'name': 'A'}]
+        partial['itinerary'] = []
+        exc = GuideNeedsInput('confirm location')
+        exc.plan = partial
+        with patch.object(planning_jobs, 'read_checkpoint', return_value=None), patch.object(planning_jobs, 'update_job'), patch.object(planning_jobs, 'commit_result') as commit, patch('service.travel.generation_jobs.run_planning_action', side_effect=exc):
+            execute_job(plan['plan_id'], 'job', plan, {})
+        self.assertEqual(commit.call_args.kwargs['needs_input'], 'confirm location')
+        self.assertEqual(commit.call_args.args[3]['itinerary'], plan['itinerary'])
+        self.assertEqual(commit.call_args.args[3]['planning']['activities'][0]['id'], 'a')
+
+
+class RouteOptionsTests(TestCase):
+    def test_generated_routes_include_all_modes_time_and_unknown_fares(self):
+        from agent.planning_graph import route_agent
+        plan = {'itinerary': [
+            {'item_id': 'a', 'category': 'attraction', 'location': 'A', 'place': POINT},
+            {'item_id': 'b', 'category': 'attraction', 'location': 'B', 'place': POINT}],
+            'routes': [{'origin_item_id': 'a', 'destination_item_id': 'b'}]}
+        def compute(*args, travel_mode):
+            return {'success': True, 'duration': '121s', 'fare': None if travel_mode != 'TRANSIT' else 2, 'legs': []}
+        with patch('agent.planning_graph.AMAP_API_KEY', 'test'), patch('agent.planning_graph.amap_compute_route', side_effect=compute) as compute_route:
+            result = route_agent({'plan': plan, 'action': 'generate_from_guide', 'trace': []})
+        options = result['plan']['routes'][0]['route_options']
+        self.assertEqual(set(options), {'WALK', 'TRANSIT', 'DRIVE'})
+        self.assertTrue(all(option['duration_minutes'] == 3 for option in options.values()))
+        self.assertEqual(options['WALK']['fare'], 0)
+        self.assertEqual(options['TRANSIT']['fare'], 2)
+        self.assertIsNone(options['DRIVE']['fare'])
+        self.assertEqual(compute_route.call_count, 3)
+
+    def test_batch_selection_uses_existing_route_options(self):
+        from agent.planning_graph import coordinator
+        plan = base_plan()
+        plan['planning']['stage'] = 'review'
+        plan['routes'] = [{'origin_item_id': 'a', 'destination_item_id': 'b'}]
+        with patch('agent.planning_graph.update_route_mode', return_value=plan) as update:
+            coordinator({'plan': plan, 'action': 'route_modes', 'payload': {'selections': [
+                {'origin_item_id': 'a', 'destination_item_id': 'b', 'travel_mode': 'WALK'}]}})
+        update.assert_called_once_with(plan, 'a', 'b', 'WALK')
+
+
+class ReviewBatchTests(TestCase):
+    def test_repeated_moves_resolve_changed_item_ids_and_apply_details(self):
+        from agent.planning_graph import coordinator
+        plan = base_plan()
+        plan['planning']['guide_auto'] = True
+        plan['planning']['activities'] = [{'id': 'a', 'name': 'A', 'category': 'attraction', 'choice': 'must', 'place': POINT}]
+        plan = planning.draft_itinerary(plan, {'days': [{'day': n, 'visits': [{'activity_id': 'a'}] if n == 1 else []} for n in range(1, 4)], 'assumptions': [], 'constraint_results': []})
+        original = deepcopy(plan)
+        item_id = next(x['item_id'] for x in plan['itinerary'] if x.get('reference_id') == 'a')
+        operations = [
+            {'action': 'move_activity', 'payload': {'item_id': item_id, 'target_day': 2}},
+            {'action': 'move_activity', 'payload': {'item_id': item_id, 'target_day': 3}},
+            {'action': 'update_activity', 'payload': {'activity_id': 'a', 'duration_minutes': 60, 'ticket_required': None, 'estimated_cost': 0, 'visit_tips': 'test', 'time_of_day': '11:00'}},
+            {'action': 'update_budget', 'payload': {'budget': 1234}}]
+        result = coordinator({'plan': plan, 'action': 'review_changes', 'payload': {'operations': operations}})['plan']
+        visit = next(x for x in result['itinerary'] if x.get('reference_id') == 'a')
+        self.assertEqual(visit['day'], 3)
+        self.assertEqual(visit['duration_minutes'], 60)
+        self.assertEqual(result['budget'], 1234)
+        self.assertEqual(plan, original)
+        with self.assertRaises(ValueError):
+            coordinator({'plan': plan, 'action': 'review_changes', 'payload': {'operations': operations + [{'action': 'confirm', 'payload': {}}]}})
+        self.assertEqual(plan, original)
+
+
+class ReviewSaveTests(TestCase):
+    def test_stale_browser_draft_is_rejected_before_execution(self):
+        with patch.object(server, 'get_plan', return_value=({'budget': 2000}, None)), patch.object(server, 'run_planning_action') as run:
+            with TestClient(server.create_app(Path('mcp_server.py'), 'test')) as client:
+                response = client.post('/api/plans/p/planning/review_changes', json={'base_plan': {'budget': 1000}, 'operations': []})
+        self.assertEqual(response.status_code, 409)
+        run.assert_not_called()
+
+    def test_save_returns_persisted_version_and_uses_atomic_commit(self):
+        original = {'budget': 1000.0}
+        persisted = {'budget': 1200.0, 'updated_at': 'new'}
+        with patch.object(server, 'get_plan', side_effect=[(original, None), (persisted, None)]), patch.object(server, 'run_planning_action', return_value={'plan': {'budget': 1200}, 'trace': [], 'audit': {'issues': []}}), patch.object(planning_jobs, 'save_review_changes') as commit, patch.object(server, 'save_plan') as legacy:
+            with TestClient(server.create_app(Path('mcp_server.py'), 'test')) as client:
+                response = client.post('/api/plans/p/planning/review_changes', json={'base_plan': {'budget': 1000}, 'operations': []})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['plan'], persisted)
+        commit.assert_called_once()
+        legacy.assert_not_called()

@@ -12,12 +12,12 @@ from datetime import datetime
 from pathlib import Path
 
 import uvicorn
-from fastapi import WebSocket, WebSocketDisconnect, BackgroundTasks, Body, FastAPI, HTTPException, Request
+from fastapi import WebSocket, WebSocketDisconnect, BackgroundTasks, Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from agent.planning_graph import run_planning_action
 from service.chat import handle_chat, public_message_items
-from service.runtime_logs import list_runs, read_run
+from service.runtime_logs import event_entries, list_runs, read_run
 from service.storage.travel_db import (
     delete_plan, get_conversation, get_plan, list_conversations, list_messages,
     list_plan_summaries, save_conversation, save_plan,
@@ -30,6 +30,22 @@ from service.travel.generation_jobs import execute_job
 from service.mcp.server import amap_search_places
 from service.storage.travel_db import read_map_cache
 from service.utils.model_client import get_model
+
+
+def _public_plan(plan):
+    if "routes" not in plan:
+        return plan
+    routes = []
+    for route in plan.get("routes") or []:
+        item = {key: value for key, value in route.items() if key not in {"legs", "route_options", "route_options_key"}}
+        if route.get("route_options"):
+            item["route_options"] = {
+                mode: {key: option[key] for key in ("success", "duration", "duration_minutes", "fare",
+                                                   "distance_meters", "message", "source") if key in option}
+                for mode, option in route["route_options"].items() if isinstance(option, dict)
+            }
+        routes.append(item)
+    return {**plan, "routes": routes}
 
 
 def new_conversation(*, conversation_id: str, plan_id: str | None, title: str) -> dict:
@@ -95,17 +111,18 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         return {"ok": True, "model": model, "routes": ["plans", "planning", "conversations", "messages", "chat"]}
 
     @app.get("/api/plans")
-    async def plans():
+    def plans():
         data, error = list_plan_summaries()
         return _result({"plans": data}, error)
 
     @app.get("/api/plans/{plan_id}")
-    async def plan_detail(plan_id: str):
+    def plan_detail(plan_id: str):
         data, error = get_plan(plan_id)
-        return _result({"plan": data}, error, 404 if error and error.get("message") == "Travel plan not found." else 500)
+        return _result({"plan": _public_plan(data), "plan_version": planning_jobs.fingerprint(data)} if data is not None else {},
+                       error, 404 if error and error.get("message") == "Travel plan not found." else 500)
 
     @app.delete("/api/plans/{plan_id}")
-    async def remove_plan(plan_id: str):
+    def remove_plan(plan_id: str):
         deleted, error = delete_plan(plan_id)
         if error:
             return _result({}, error)
@@ -114,18 +131,18 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         return {"success": True}
 
     @app.post("/api/plans/drafts")
-    async def plan_draft(payload: dict = Body(...)):
+    def plan_draft(payload: dict = Body(...)):
         plan = create_draft(payload, uuid.uuid4().hex)
         save_plan(plan)
         return {"success": True, "plan": plan}
 
     @app.get("/api/plans/{plan_id}/conversations")
-    async def plan_conversations(plan_id: str):
+    def plan_conversations(plan_id: str):
         data, error = list_conversations(plan_id)
         return _result({"conversations": data}, error)
 
     @app.get("/api/plans/{plan_id}/planning/audit")
-    async def plan_audit(plan_id: str):
+    def plan_audit(plan_id: str):
         plan, error = get_plan(plan_id)
         if error or plan is None:
             raise HTTPException(status_code=404, detail=(error or {}).get("message", "Plan not found"))
@@ -162,13 +179,13 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         return Response(base64.b64decode(body), media_type=header[5:].split(";")[0], headers={"Cache-Control": "private, max-age=3600"})
 
     @app.get("/api/plans/{plan_id}/sheet")
-    async def plan_sheet(plan_id: str):
+    def plan_sheet(plan_id: str):
         plan, error = get_plan(plan_id)
         if error or plan is None:
             raise HTTPException(status_code=404, detail=(error or {}).get("message", "Plan not found"))
         if (plan.get("planning") or {}).get("stage") != "confirmed":
             raise HTTPException(status_code=400, detail="Confirm the itinerary before opening its sheet")
-        return {"success": True, "sheet": itinerary_sheet(plan)}
+        return {"success": True, "sheet": itinerary_sheet(_public_plan(plan))}
 
     @app.websocket("/api/plans/{plan_id}/generation/ws")
     async def generation_socket(websocket: WebSocket, plan_id: str):
@@ -211,24 +228,46 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         return {"success": True, "job": planning_jobs.read_job(plan_id)}
 
     @app.post("/api/plans/{plan_id}/planning/{action}")
-    def planning_action(plan_id: str, action: str, payload: dict = Body(...)):
+    def planning_action(plan_id: str, action: str, payload: dict = Body(...), include_version: bool = False):
         plan, error = get_plan(plan_id)
         if error or plan is None:
             raise HTTPException(status_code=404, detail=(error or {}).get("message", "Plan not found"))
+        if action == 'review_changes' and (
+            payload.get('plan_version') != planning_jobs.fingerprint(plan)
+            if 'plan_version' in payload else payload.get('base_plan') != plan
+        ):
+            raise HTTPException(status_code=409, detail='行程已在其他页面修改，请重新读取后保存')
         outcome = run_planning_action(plan, action, payload)
-        save_plan(outcome["plan"])
-        response = {"success": True, "plan": outcome["plan"], "trace": outcome["trace"]}
+        if action == 'review_changes':
+            try:
+                planning_jobs.save_review_changes(plan_id, plan, outcome['plan'])
+            except planning_jobs.PlanConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            saved, saved_error = get_plan(plan_id)
+            if saved_error or saved is None:
+                raise HTTPException(status_code=500, detail='修改已保存，但读取结果失败，请重新读取核实')
+            outcome['plan'] = saved
+        else:
+            save_plan(outcome["plan"])
+            if include_version:
+                saved, saved_error = get_plan(plan_id)
+                if saved_error or saved is None:
+                    raise HTTPException(status_code=500, detail='修改已保存，但读取结果失败，请重新读取核实')
+                outcome['plan'] = saved
+        response = {"success": True, "plan": _public_plan(outcome["plan"]), "trace": outcome["trace"]}
+        if action == 'review_changes' or include_version:
+            response["plan_version"] = planning_jobs.fingerprint(outcome["plan"])
         if outcome.get("audit"):
             response["audit"] = outcome["audit"]
         return response
 
     @app.get("/api/conversations")
-    async def conversations():
+    def conversations():
         data, error = list_conversations()
         return _result({"conversations": data}, error)
 
     @app.post("/api/conversations")
-    async def create_conversation(payload: dict = Body(...)):
+    def create_conversation(payload: dict = Body(...)):
         conversation = new_conversation(
             conversation_id=str(payload.get("conversation_id") or uuid.uuid4().hex),
             plan_id=payload.get("plan_id") or None,
@@ -238,13 +277,13 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         return {"success": True, "conversation": conversation}
 
     @app.get("/api/conversations/{conversation_id}")
-    async def conversation_detail(conversation_id: str):
+    def conversation_detail(conversation_id: str):
         data, error = get_conversation(conversation_id)
         missing = error and "not found" in error.get("message", "").lower()
         return _result({"conversation": data}, error, 404 if missing else 500)
 
     @app.get("/api/conversations/{conversation_id}/messages")
-    async def conversation_messages(conversation_id: str):
+    def conversation_messages(conversation_id: str):
         data, error = list_messages(conversation_id)
         missing = error and "not found" in error.get("message", "").lower()
         return _result({"messages": public_message_items(data or [])}, error, 404 if missing else 500)
@@ -263,29 +302,48 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         conversation_id = str(payload.get("conversation_id") or uuid.uuid4().hex)
         if not message:
             raise HTTPException(status_code=400, detail="message must not be empty.")
-        if not get_conversation(conversation_id)[0]:
-            save_conversation(new_conversation(conversation_id=conversation_id, plan_id=payload.get("plan_id"), title="新对话"))
+        def ensure_conversation():
+            if not get_conversation(conversation_id)[0]:
+                save_conversation(new_conversation(conversation_id=conversation_id, plan_id=payload.get("plan_id"), title="新对话"))
+        await asyncio.to_thread(ensure_conversation)
         return await handle_chat(server_file=server_file, model=str(payload.get("model") or model),
                                  conversation_id=conversation_id, user_message=message)
 
     @app.get("/api/logs/runs")
-    async def runtime_runs(
+    def runtime_runs(
         request: Request,
         conversation_id: str = "",
+        job_id: str = "",
         status: str = "",
         since: str = "",
         until: str = "",
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
     ):
         _require_local_log_request(request)
-        return {"success": True, **list_runs(Path.cwd(), conversation_id=conversation_id, status=status, since=since, until=until)}
+        return {"success": True, **list_runs(Path.cwd(), conversation_id=conversation_id, job_id=job_id,
+                                             status=status, since=since, until=until, page=page, page_size=page_size)}
 
     @app.get("/api/logs/runs/{run_id}")
-    async def runtime_run(request: Request, run_id: str, conversation_id: str = ""):
+    def runtime_run(request: Request, run_id: str, conversation_id: str = "", view: str = "", search: str = ""):
         _require_local_log_request(request)
         data = read_run(Path.cwd(), run_id, conversation_id=conversation_id)
         if data is None:
             raise HTTPException(status_code=404, detail="Run log not found.")
+        if view == "timeline":
+            events = [summary for summary, _, _ in event_entries(data["events"], search)]
+            return {"success": True, **data, "events": events}
         return {"success": True, **data}
+
+    @app.get("/api/logs/runs/{run_id}/events/{event_id}")
+    def runtime_event(request: Request, run_id: str, event_id: str, conversation_id: str = ""):
+        _require_local_log_request(request)
+        data = read_run(Path.cwd(), run_id, conversation_id=conversation_id)
+        if data:
+            for summary, event, paired_request in event_entries(data["events"]):
+                if summary["eventId"] == event_id:
+                    return {"success": True, "event": event, "request": paired_request}
+        raise HTTPException(status_code=404, detail="Event log not found.")
 
     app.add_middleware(RequestLoggingMiddleware)
     return app

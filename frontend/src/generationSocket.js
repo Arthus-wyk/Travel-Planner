@@ -8,6 +8,7 @@ export function watchGenerationSocket(planId, onJob, onConnection) {
     socket = new WebSocket(apiUrl(`/api/plans/${encodeURIComponent(planId)}/generation/ws`).replace(/^http/, 'ws'));
     socket.onopen = () => { attempts = 0; onConnection('connected'); };
     socket.onmessage = event => {
+      if (stopped) return;
       try { const data = JSON.parse(event.data); if (data.type === 'generation_status') onJob(data.job); }
       catch { onConnection('invalid'); }
     };

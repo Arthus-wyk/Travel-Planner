@@ -24,6 +24,28 @@ def prepared():
 
 
 class GuideWorkflowTests(unittest.TestCase):
+    def test_extraction_retry_replays_failed_reply_only_for_same_request(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        bad = "invalid JSON"
+        good = '{"places":[],"constraints":[]}'
+        chat = AsyncMock(side_effect=[
+            SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=[]))
+            for content in (bad, good, good)
+        ])
+        with patch("service.utils.model_client.create_model_client", return_value=SimpleNamespace(chat=chat)), patch(
+            "service.utils.model_client.get_model", return_value="test-model"
+        ):
+            guide.analyze_guide("第一份攻略")
+            guide.analyze_guide("另一份攻略")
+        original, retry, independent = [call.kwargs["messages"] for call in chat.call_args_list]
+        self.assertEqual(retry[:2], original)
+        self.assertEqual(retry[2], {"role": "assistant", "content": bad})
+        self.assertEqual(retry[3]["role"], "user")
+        self.assertIn("JSON 或 Schema 无效", retry[3]["content"])
+        self.assertEqual(len(independent), 2)
+
     def test_old_identity_is_reserved_before_display_name_matching(self):
         plan = prepared()
         plan["planning"]["activities"] = [{"id": "stable", "name": "峡谷", "source_name": "城区", "choice": "must"}]
@@ -60,7 +82,7 @@ class GuideWorkflowTests(unittest.TestCase):
 
     def test_guide_schema_only_requests_cross_place_constraints(self):
         from jsonschema import ValidationError, validate
-        place = {"name": "西湖", "category": "attraction", "address": "", "day": 1,
+        place = {"name": "西湖", "category": "attraction", "day": 1,
                  "duration_minutes": None, "ticket_required": None,
                  "note": "全天可游览"}
         data = {"places": [place], "constraints": [{"type": "order", "places": ["西湖"],
@@ -90,6 +112,55 @@ class GuideWorkflowTests(unittest.TestCase):
             with self.subTest(data=data), patch.object(guide, "_extract_with_model", return_value=json.dumps(data)):
                 with self.assertRaises(ValueError):
                     guide.analyze_guide("西湖")
+
+    def test_siliconflow_glm_guide_requests_json_object(self):
+        import httpx
+        from service.utils.model_client import OpenAICompatibleClient
+
+        requests = []
+
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={"choices": [{"message": {
+                "content": '{"places":[],"constraints":[]}',
+            }}]})
+
+        client = OpenAICompatibleClient("https://api.siliconflow.cn/v1", "test",
+                                        transport=httpx.MockTransport(handler))
+        with patch.dict("os.environ", {"LLM_PROVIDER": "siliconflow", "SILICONFLOW_MODEL": "zai-org/GLM-5.3-Flash"}), patch(
+            "service.utils.model_client.create_model_client", return_value=client,
+        ):
+            self.assertEqual(guide.analyze_guide("攻略")["places"], [])
+        self.assertEqual(requests[0]["response_format"], {"type": "json_object"})
+
+    def test_siliconflow_glm_guide_accepts_only_valid_reasoning_json_after_stop(self):
+        import httpx
+        from service.utils.model_client import OpenAICompatibleClient
+
+        result = {"places": [], "constraints": []}
+        for content, reasoning, finish, accepted in (
+            ("", json.dumps(result), "stop", True),
+            (None, result, "stop", True),
+            ("", "Draft: " + json.dumps(result), "stop", False),
+            ("", {"places": []}, "stop", False),
+            ("", result, "length", False),
+            ("invalid", result, "stop", False),
+            (json.dumps(result), "draft", "stop", True),
+        ):
+            with self.subTest(content=content, reasoning=reasoning, finish=finish):
+                response = {"choices": [{"finish_reason": finish, "message": {
+                    "content": content, "reasoning_content": reasoning,
+                }}]}
+                client = OpenAICompatibleClient("https://api.siliconflow.cn/v1", "test",
+                                                transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)))
+                with patch.dict("os.environ", {"LLM_PROVIDER": "siliconflow", "SILICONFLOW_MODEL": "zai-org/GLM-5.3-Flash"}), patch(
+                    "service.utils.model_client.create_model_client", return_value=client,
+                ):
+                    if accepted:
+                        self.assertEqual(json.loads(guide._extract_with_model("攻略")), result)
+                    else:
+                        with self.assertRaises(guide.GuideOutputError):
+                            guide._extract_with_model("攻略")
 
     def test_provider_schema_response_is_validated_locally(self):
         from types import SimpleNamespace

@@ -22,21 +22,27 @@ class OllamaClient(AsyncClient):
 
 
 def get_model():
-    model = env("LLM_MODEL").strip()
+    name = "SILICONFLOW_MODEL" if env("LLM_PROVIDER").strip().lower() == "siliconflow" else "LLM_MODEL"
+    model = env(name).strip()
     if not model:
-        raise ValueError("LLM_MODEL is required")
+        raise ValueError(f"{name} is required")
     return model
 
 
 def create_model_client():
     provider = env("LLM_PROVIDER").strip().lower()
-    if provider not in {"ollama", "openai", "openai-compatible", "deepseek", "qwen"}:
+    if provider not in {"ollama", "openai", "openai-compatible", "deepseek", "qwen", "siliconflow"}:
         raise ValueError("LLM_PROVIDER must specify a supported provider")
-    url = env("LLM_BASE_URL").strip()
+    url_name, key_name = "LLM_BASE_URL", "LLM_API_KEY"
+    if provider == "siliconflow":
+        url_name, key_name = "SILICONFLOW_BASE_URL", "SILICONFLOW_API_KEY"
+    url = env(url_name).strip()
+    if provider == "siliconflow" and not url:
+        url = "https://api.siliconflow.cn/v1"
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.query or parsed.fragment:
-        raise ValueError("LLM_BASE_URL must be an HTTP(S) API base URL")
-    key = env("LLM_API_KEY").strip()
+        raise ValueError(f"{url_name} must be an HTTP(S) API base URL")
+    key = env(key_name).strip()
     if provider == "ollama":
         client = OllamaClient(host=url, headers={"Authorization": f"Bearer {key}"} if key else None)
         if not key:
@@ -44,7 +50,7 @@ def create_model_client():
             client._client.headers.pop("authorization", None)
         return client
     if not key:
-        raise ValueError("LLM_API_KEY is required")
+        raise ValueError(f"{key_name} is required")
     return OpenAICompatibleClient(url, key)
 
 
@@ -126,7 +132,11 @@ class OpenAICompatibleClient:
             response = await client.post(self.base_url + "/chat/completions", json=payload)
             response.raise_for_status()
             data = response.json()
-            return response_chunk(data["choices"][0]["message"], data.get("usage"))
+            choice = data["choices"][0]
+            result = response_chunk(choice["message"], data.get("usage"))
+            result.finish_reason = choice.get("finish_reason")
+            result.message.reasoning_content = choice["message"].get("reasoning_content")
+            return result
 
     def _client(self):
         return instrument_client(httpx.AsyncClient(headers={"Authorization": f"Bearer {self.api_key}"},

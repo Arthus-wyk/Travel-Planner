@@ -31,6 +31,24 @@ class ItineraryAgentTests(unittest.TestCase):
         self.chat.return_value = SimpleNamespace(message=SimpleNamespace(content=json.dumps({"days": days}), tool_calls=[]))
         return itinerary.generate_itinerary_proposal(sample_plan(), feedback)
 
+    def test_retry_uses_its_own_previous_request_and_result(self):
+        from agent.planning_graph import itinerary_agent
+
+        plan = sample_plan()
+        plan["planning"]["activities"][1]["choice"] = "exclude"
+        invalid = '{"days":[]}'
+        self.chat.return_value = SimpleNamespace(message=SimpleNamespace(content=invalid, tool_calls=[]))
+        first = {"plan": plan, "trace": [], "input_hash": "test"}
+        failed = itinerary_agent(first)
+        itinerary_agent({**first, **failed})
+        itinerary_agent(first)
+        original, retry, independent = [call.kwargs["messages"] for call in self.chat.call_args_list]
+        self.assertEqual(retry[:2], original)
+        self.assertEqual(retry[2], {"role": "assistant", "content": invalid})
+        self.assertEqual(retry[3]["role"], "user")
+        self.assertIn("重新", retry[3]["content"])
+        self.assertEqual(independent, original)
+
     def test_model_gets_guide_and_feedback_but_only_returns_order(self):
         result = self.propose([{"day": 1, "visits": []}, {"day": 2, "visits": [{"position": 1}, {"position": 2}]},
                                {"day": 3, "visits": []}], [{"message": "temple 应在第2天"}])

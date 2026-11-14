@@ -1,9 +1,10 @@
 """Persistent generation jobs and atomic compare-before-commit on the plan row."""
 import json
 from contextlib import contextmanager
+from functools import lru_cache
 from hashlib import sha256
 from uuid import uuid4
-from service.storage.travel_db import connect, ensure_schema, row_to_plan
+from service.storage.travel_db import compact_routes, connect, ensure_schema, row_to_plan
 
 
 @contextmanager
@@ -22,6 +23,11 @@ def fingerprint(plan):
     return sha256(json.dumps(plan, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
 
 
+class PlanConflict(ValueError):
+    pass
+
+
+@lru_cache(maxsize=1)
 def ensure_jobs():
     ensure_schema()
     with connect() as conn, conn.cursor() as cur:
@@ -97,7 +103,7 @@ def update_job(plan_id, job_id, status, stage, error=""):
                     (status, stage, error, plan_id, job_id))
 
 
-def commit_result(plan_id, job_id, original, result):
+def commit_result(plan_id, job_id, original, result, *, needs_input=None):
     with transaction() as conn, conn.cursor() as cur:
         cur.execute("SELECT * FROM travel_plans WHERE plan_id=%s FOR UPDATE", (plan_id,))
         row = cur.fetchone()
@@ -109,7 +115,20 @@ def commit_result(plan_id, job_id, original, result):
             raise ValueError("生成任务已失效")
         cur.execute("""UPDATE travel_plans SET itinerary=%s,routes=%s,planning=%s,budget_items=%s,
             updated_at=UTC_TIMESTAMP() WHERE plan_id=%s""",
-            tuple(json.dumps(result.get(k, [] if k != "planning" else {}), ensure_ascii=False)
+            tuple(json.dumps(compact_routes(result.get(k) or []) if k == "routes" else
+                             result.get(k, [] if k != "planning" else {}), ensure_ascii=False)
                   for k in ("itinerary", "routes", "planning", "budget_items")) + (plan_id,))
-        cur.execute("UPDATE planning_jobs SET status='completed',stage='completed',updated_at=UTC_TIMESTAMP() WHERE plan_id=%s AND job_id=%s", (plan_id, job_id))
+        cur.execute("UPDATE planning_jobs SET status=%s,stage=%s,error=%s,updated_at=UTC_TIMESTAMP() WHERE plan_id=%s AND job_id=%s",
+                    ('needs_input' if needs_input else 'completed', 'prepare_draft' if needs_input else 'completed', needs_input or '', plan_id, job_id))
         cur.execute("DELETE FROM planning_job_checkpoints WHERE plan_id=%s", (plan_id,))
+
+
+def save_review_changes(plan_id, original, result):
+    with transaction() as conn, conn.cursor() as cur:
+        cur.execute('SELECT * FROM travel_plans WHERE plan_id=%s FOR UPDATE', (plan_id,))
+        row = cur.fetchone()
+        if not row or fingerprint(row_to_plan(row)) != fingerprint(original):
+            raise PlanConflict('行程已在其他页面修改，请重新读取后保存')
+        cur.execute('UPDATE travel_plans SET itinerary=%s,routes=%s,planning=%s,budget=%s,updated_at=UTC_TIMESTAMP() WHERE plan_id=%s',
+                    tuple(json.dumps(compact_routes(result[k]) if k == 'routes' else result[k], ensure_ascii=False)
+                          for k in ('itinerary', 'routes', 'planning')) + (result['budget'], plan_id))

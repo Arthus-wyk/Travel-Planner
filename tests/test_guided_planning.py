@@ -144,7 +144,7 @@ class GuidedPlanningTests(unittest.TestCase):
                 analyze_guide("西湖：上午游玩")
 
     def test_guide_extractor_uses_configured_model_and_skill(self):
-        data = {"places": [{"name": "西湖", "category": "attraction", "address": "",
+        data = {"places": [{"name": "西湖", "category": "attraction",
                             "day": None, "duration_minutes": None,
                             "ticket_required": None, "note": "上午"}], "constraints": []}
         client = SimpleNamespace(chat=AsyncMock(return_value=SimpleNamespace(

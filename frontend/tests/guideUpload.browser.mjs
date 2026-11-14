@@ -19,32 +19,73 @@ try {
   const page = await browser.newPage();
   page.setDefaultTimeout(5000);
   const plan = { plan_id: 'upload', destination: '杭州', start_date: '2026-11-01', end_date: '2026-11-03', planning: {
-    stage: 'activities', selected_transport: { outbound: 'o', return: 'r' }, activities: [],
+    stage: 'review', selected_transport: { outbound: 'o', return: 'r' }, activities: [],
   } };
-  await page.route('http://127.0.0.1:8788/**', route => {
+  let planningWrites = 0;
+  let releaseSubmission;
+  const submission = new Promise(resolve => { releaseSubmission = resolve; });
+  await page.route('http://127.0.0.1:8788/**', async route => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
+    if (request.method() === 'POST' && path.includes('/planning/')) planningWrites++;
+    if (request.method() === 'POST' && path.endsWith('/generation')) await submission;
     const data = path.endsWith('/generation') && request.method() === 'POST'
       ? { job_id: 'job' }
       : path.endsWith('/generation') ? { job: null }
+      : path.endsWith('/planning/audit') ? { audit: { issues: [] } }
       : path === '/api/plans/upload' ? { plan }
       : { plans: [plan] };
     return route.fulfill({ status: 200, contentType: 'application/json', headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': '*' }, body: JSON.stringify(data) });
   });
-  let statusSocket;
-  let connected;
-  const reconnected = new Promise(resolve => { connected = resolve; });
-  await page.routeWebSocket('**/generation/ws', socket => { if (statusSocket) connected(); statusSocket = socket; socket.send(JSON.stringify({ type: 'generation_status', job: null })); });
+  const sockets = [];
+  await page.routeWebSocket('**/generation/ws', socket => {
+    sockets.push(socket);
+    socket.send(JSON.stringify({ type: 'generation_status', job: null }));
+  });
+  async function socketAfter(count) {
+    await expectSocketCount(count + 1);
+    return sockets.at(-1);
+  }
+  async function expectSocketCount(count) {
+    for (let attempt = 0; sockets.length < count && attempt < 100; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(sockets.length >= count, 'generation socket connected');
+  }
   await page.goto('http://127.0.0.1:4178/plans/upload/planning');
-  await page.getByText('请选择一家住宿酒店').waitFor({ state: 'attached' });
+  await page.waitForURL('**/review');
+  await page.getByRole('heading', { name: /路线与预算审核/ }).waitFor();
+  await page.getByRole('button', { name: /选活动与攻略/ }).click();
+  await page.getByLabel('攻略文字').fill('还没有保存的攻略');
+  const dismissed = page.waitForEvent('dialog').then(dialog => dialog.dismiss());
+  await page.getByRole('button', { name: /审核路线/ }).click();
+  await dismissed;
+  assert.equal(await page.getByLabel('攻略文字').inputValue(), '还没有保存的攻略');
+  const discarded = page.waitForEvent('dialog').then(dialog => dialog.accept());
+  await page.getByRole('button', { name: /审核路线/ }).click();
+  await discarded;
+  await page.waitForURL('**/review');
+  await page.getByRole('button', { name: /选活动与攻略/ }).click();
+  await page.getByRole('button', { name: /审核路线/ }).click();
+  await page.waitForURL('**/review');
+  assert.equal(planningWrites, 0);
+  const beforeUpload = sockets.length;
+  await page.getByRole('button', { name: /选活动与攻略/ }).click();
+  await socketAfter(beforeUpload);
+  console.log('PASS the wizard opens review directly and steps preserve the saved route');
   const upload = page.getByLabel('攻略图片');
   assert.equal(await upload.isEnabled(), true);
   await upload.setInputFiles({ name: 'guide.png', mimeType: 'image/png', buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64') });
   const submitted = page.waitForRequest(request => request.url().endsWith('/generation') && request.method() === 'POST');
   await page.getByRole('button', { name: '生成每日行程' }).click();
+  await page.getByRole('status').filter({ hasText: '正在提交攻略' }).waitFor();
+  assert.equal(await page.getByRole('button', { name: /审核路线/ }).isDisabled(), true);
   assert.ok((await submitted).postDataJSON().image_base64);
+  const beforeReconnect = sockets.length;
+  releaseSubmission();
   assert.equal(await page.getByText('把想去的地方，整理成旅程').count(), 0);
-  await reconnected;
+  let statusSocket = await socketAfter(beforeReconnect);
+  await page.getByRole('status').filter({ hasText: '等待生成' }).waitFor();
   const sendStatus = job => statusSocket.send(JSON.stringify({ type: 'generation_status', job }));
   sendStatus({ job_id: 'job', status: 'running', stage: 'route_agent' });
   await page.getByRole('status').filter({ hasText: '计算路线' }).waitFor();
@@ -57,6 +98,22 @@ try {
   assert.equal(await page.getByRole('button', { name: '重新生成', exact: true }).isEnabled(), true);
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+  await page.getByRole('button', { name: '移除图片' }).click();
+  await page.getByRole('button', { name: /审核路线/ }).click();
+  await page.waitForURL('**/review');
+  const beforeReopen = sockets.length;
+  await page.getByRole('button', { name: /选活动与攻略/ }).click();
+  statusSocket = await socketAfter(beforeReopen);
+  sendStatus({ job_id: 'old', status: 'completed' });
+  await page.getByLabel('攻略文字').fill('继续编辑攻略');
+  assert.match(page.url(), /planning\?step=activities$/);
+  const resubmitted = page.waitForRequest(request => request.url().endsWith('/generation') && request.method() === 'POST');
+  const beforeRegeneration = sockets.length;
+  await page.getByRole('button', { name: '生成每日行程' }).click();
+  assert.equal((await resubmitted).postDataJSON().text, '继续编辑攻略');
+  statusSocket = await socketAfter(beforeRegeneration);
+  sendStatus({ job_id: 'job', status: 'completed' });
+  await page.waitForURL('**/review');
   console.log('PASS progress, failure recovery, and mobile layout');
   console.log('PASS guide upload and generation remain available with unresolved place issues');
 } finally {

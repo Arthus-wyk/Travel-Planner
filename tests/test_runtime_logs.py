@@ -130,7 +130,7 @@ class RuntimeLogSafetyTests(unittest.TestCase):
                 await asyncio.gather(task('one'), task('two'), task('cancel'), return_exceptions=True)
                 self.assertIsNone(current_run.get())
             asyncio.run(execute())
-            runs = list_runs(Path.cwd())['runs']
+            runs = list_runs(Path.cwd(), conversation_id='concurrent')['runs']
             self.assertEqual(len(runs), 3)
             self.assertEqual(len({item['runId'] for item in runs}), 3)
             for run in runs:
@@ -153,7 +153,7 @@ class ChatRuntimeLogTests(unittest.IsolatedAsyncioTestCase):
              patch.object(chat, 'save_turn_message'), patch.object(chat, 'connect_tools', broken_connection):
             with self.assertRaisesRegex(OSError, 'MCP unavailable'):
                 await chat.handle_chat(server_file=Path('mcp_server.py'), model='test', conversation_id='broken-chat', user_message='hello')
-            runs = list_runs(Path.cwd())['runs']
+            runs = list_runs(Path.cwd(), conversation_id='broken-chat')['runs']
             self.assertEqual(len(runs), 1)
             self.assertEqual(runs[0]['status'], 'failed')
             events = read_run(Path.cwd(), runs[0]['runId'])['events']

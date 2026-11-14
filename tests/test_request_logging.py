@@ -12,6 +12,25 @@ from service.utils.model_client import OpenAICompatibleClient
 
 
 class RequestLogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reading_runtime_logs_does_not_write_copies_back_to_api_logs(self):
+        from service.api.request_logging import RequestLoggingMiddleware
+        sent = []
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b'{"events":[]} '})
+        async def receive():
+            return {"type": "http.request", "body": b""}
+        async def send(message):
+            sent.append(message)
+        with tempfile.TemporaryDirectory() as folder, patch.object(request_log, "LOG_DIR", Path(folder)):
+            try:
+                await RequestLoggingMiddleware(app)(
+                    {"type": "http", "method": "GET", "path": "/api/logs/runs", "headers": []}, receive, send)
+                self.assertEqual(sent[-1]["body"], b'{"events":[]} ')
+                self.assertEqual(list(Path(folder).glob("*.log")), [])
+            finally:
+                request_log.close_handlers()
+
     async def test_compressed_response_is_readable(self):
         import gzip
         events = []
@@ -82,6 +101,8 @@ class RequestLogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent[-1]["body"], b'{"hello":"world"}')
         self.assertEqual([k for k, _ in events], ["api.requests", "api.responses", "errors"])
         self.assertEqual(events[0][1]["call_id"], events[1][1]["call_id"])
+        self.assertEqual(events[1][1]["body_bytes"], len(sent[-1]["body"]))
+        self.assertNotIn("body", events[1][1])
 
     async def test_websocket_messages_are_separate_and_correlated(self):
         from service.api.request_logging import RequestLoggingMiddleware

@@ -1,5 +1,6 @@
 """HTTP 聊天用例：读会话、调用 Agent、保存本轮产物；不包含图内部决策。"""
 
+import asyncio
 import json
 import re
 import uuid
@@ -94,15 +95,15 @@ async def _handle_chat(
     *, server_file: Path, model: str, conversation_id: str, user_message: str,
     transcript: TranscriptLogger,
 ) -> dict[str, Any]:
-    conversation, error = get_conversation(conversation_id)
+    conversation, error = await asyncio.to_thread(get_conversation, conversation_id)
     if error is not None or conversation is None:
         raise ValueError((error or {}).get("message", "Conversation not found."))
-    stored, error = list_messages(conversation_id)
+    stored, error = await asyncio.to_thread(list_messages, conversation_id)
     if error is not None:
         raise ValueError(error.get("message", "Unable to load messages."))
     plan = None
     if conversation.get("plan_id"):
-        plan, error = get_plan(conversation["plan_id"])
+        plan, error = await asyncio.to_thread(get_plan, conversation["plan_id"])
         if error is not None:
             raise ValueError(error.get("message", "Unable to load plan."))
     history = [
@@ -113,7 +114,7 @@ async def _handle_chat(
     telemetry = ApiTelemetryLogger(
         session_id=transcript.session_id, project_path=str(transcript.project_path)
     )
-    save_turn_message(conversation_id, "user", user_message)
+    await asyncio.to_thread(save_turn_message, conversation_id, "user", user_message)
     async with connect_tools(server_file) as registry:
         try:
             result = await run_turn(
@@ -136,9 +137,9 @@ async def _handle_chat(
                         "content": "执行中断，部分操作可能已经完成，请先检查当前行程。",
                     }
                 ]
-            persist_result(conversation, partial)
+            await asyncio.to_thread(persist_result, conversation, partial)
             raise
-    actions = persist_result(conversation, result)
+    actions = await asyncio.to_thread(persist_result, conversation, result)
     # HTTP 兼容转换只在边界做；核心中的 ToolResult.data 始终是结构化对象。
     events = [
         {
@@ -158,7 +159,7 @@ async def _handle_chat(
         "plan": result.plan,
         "actions": actions,
         "memory": result.memory,
-        "messages": public_messages_from_db(conversation_id),
+        "messages": await asyncio.to_thread(public_messages_from_db, conversation_id),
     }
 
 

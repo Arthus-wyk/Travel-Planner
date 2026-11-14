@@ -10,6 +10,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from service.config import get_env_or_dotenv
+
 
 SKILL_PATH = Path(__file__).resolve().parents[2] / ".agents" / "skills" / "guide-recognition" / "SKILL.md"
 
@@ -25,7 +27,6 @@ _DURATION = {"type": "integer", "minimum": 30, "maximum": 600}
 _PLACE_PROPERTIES = {
     "name": {"type": "string", "minLength": 1, "maxLength": 80},
     "category": {"type": "string", "enum": ["attraction", "food", "hotel", "lodging_area", "other"]},
-    "address": {"type": "string", "maxLength": 300},
     "day": {"anyOf": [_DAY, {"type": "null"}]},
     "duration_minutes": {"anyOf": [_DURATION, {"type": "null"}]},
     "ticket_required": {"type": ["boolean", "null"]},
@@ -43,7 +44,9 @@ GUIDE_SCHEMA = _object({
 
 
 class GuideOutputError(ValueError):
-    pass
+    def __init__(self, reason: str, output: str | None = None):
+        super().__init__(reason)
+        self.output = output
 
 
 class GuideNeedsInput(ValueError):
@@ -70,24 +73,43 @@ def _skill_prompt() -> str:
     return content.split("---", 2)[-1].strip()
 
 
-def _extract_with_model(text: str, feedback: str = "") -> str:
+def _extract_with_model(text: str, feedback: str = "", *, history=()) -> str:
     from service.utils.model_client import create_model_client, get_model
 
     async def request() -> str:
+        model = get_model()
+        siliconflow_glm = (
+            model == "zai-org/GLM-5.3-Flash"
+            and get_env_or_dotenv("LLM_PROVIDER").strip().lower() == "siliconflow"
+        )
+        messages = [{"role": "system", "content": _skill_prompt()},
+                    {"role": "user", "content": f"攻略原文：\n{text}"}]
+        for output, reason in history:
+            if output is not None:
+                messages.append({"role": "assistant", "content": output})
+            messages.append({"role": "user", "content": f"上次输出校验失败：{reason}\n请修正后重新输出完整 JSON。"})
+        if feedback and not history:
+            messages.append({"role": "user", "content": f"上次输出校验失败：{feedback}\n请修正后重新输出完整 JSON。"})
         response = await asyncio.wait_for(create_model_client().chat(
-            model=get_model(),
-            messages=[{"role": "system", "content": _skill_prompt()},
-                      {"role": "user", "content": f"攻略原文：\n{text}" + (f"\n上次输出校验失败：{feedback}\n请修正后重新输出完整 JSON。" if feedback else "")}],
-            tools=[], stream=False, format=GUIDE_SCHEMA,
+            model=model,
+            messages=messages,
+            tools=[], stream=False, format="json" if siliconflow_glm else GUIDE_SCHEMA,
         ), timeout=180)
         from jsonschema import ValidationError, validate
-        if response.message.tool_calls:
-            raise GuideOutputError("不得调用工具")
         content = response.message.content or ""
+        if response.message.tool_calls:
+            raise GuideOutputError("不得调用工具", content)
+        if siliconflow_glm and not content and getattr(response, "finish_reason", None) == "stop":
+            # This endpoint can put the completed JSON in the reasoning field.
+            reasoning = getattr(response.message, "reasoning_content", None)
+            if isinstance(reasoning, dict):
+                content = json.dumps(reasoning, ensure_ascii=False)
+            elif isinstance(reasoning, str):
+                content = reasoning
         try:
             validate(json.loads(content), GUIDE_SCHEMA)
         except (json.JSONDecodeError, ValidationError) as exc:
-            raise GuideOutputError(f"JSON 或 Schema 无效：{exc}") from exc
+            raise GuideOutputError(f"JSON 或 Schema 无效：{exc}", content) from exc
         return content
 
     return asyncio.run(request())
@@ -99,13 +121,16 @@ def analyze_guide(text: str) -> dict[str, Any]:
     if not text.strip():
         return {"text": text, "places": []}
     feedback = ""
+    # 每次攻略提取独立保留回复和校验反馈，后续请求按原顺序回放。
+    history = []
     for attempt in range(1, 4):
         try:
-            raw = _extract_with_model(text, feedback)
+            raw = _extract_with_model(text, feedback, history=tuple(history))
         except GuideOutputError as exc:
             from service.utils.request_log import log_error
             log_error(exc, stage="guide_extraction", attempt=attempt)
             feedback = str(exc)[:1000]
+            history.append((exc.output, feedback))
             logging.getLogger("travel.generation").warning("guide_extraction_invalid attempt=%s reason=%s", attempt, feedback)
             continue
         except (TimeoutError, asyncio.TimeoutError) as exc:
@@ -118,6 +143,7 @@ def analyze_guide(text: str) -> dict[str, Any]:
             from service.utils.request_log import log_error
             log_error(exc, stage="guide_extraction", attempt=attempt)
             feedback = str(exc)[:1000]
+            history.append((raw, feedback))
             logging.getLogger("travel.generation").warning("guide_extraction_invalid attempt=%s reason=%s", attempt, feedback)
     raise GuideNeedsInput(f"攻略地点提取连续 3 次校验失败：{feedback}。请手动添加或修正地点后继续规划。")
 
@@ -153,13 +179,10 @@ def _parse_guide_data(data: Any, text: str) -> dict[str, Any]:
         day = item.get("day")
         if day is not None and (isinstance(day, bool) or not isinstance(day, int) or not 1 <= day <= 365):
             raise ValueError("Guide extraction model returned invalid day")
-        address = item.get("address") or ""
-        if not isinstance(address, str) or len(address) > 300:
-            raise ValueError(f"地点 {name} 的地址无效，必须为不超过 300 字的文字")
         places.append({"id": "guide-" + sha256(name.casefold().encode("utf-8")).hexdigest()[:12],
                        "name": name, "note": note.strip()[:500], "source": "guide_text",
                        "category": category, "day": day,
-                       "location_hint": address.strip(),
+                       "location_hint": "",
                        "duration_minutes": duration, "ticket_required": ticket,
                        "visit_tips": note.strip()[:500]})
     for match in re.finditer(r'(?:优先住|建议住|推荐住|也可以选|也可选)\s*[「“"]([^」”"\n]{2,50})[」”"]', text):

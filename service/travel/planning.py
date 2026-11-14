@@ -561,7 +561,7 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
     planning["unscheduled_items"] = pending
     planning["generation_issues"] = [{"type": "generation_omission", "severity": "high",
         "message": f"{x['name']}未进入生成结果，请重新生成或调整要求。", "target": x["id"]}
-        for x in unscheduled if x.get("place")]
+        for x in unscheduled]
     if proposal is not None:
         planning["generation"] = deepcopy(proposal)
         planning["generation"].pop("unscheduled", None)

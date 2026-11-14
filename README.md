@@ -46,7 +46,7 @@ LLM_BASE_URL=https://ollama.com
 LLM_API_KEY=your-ollama-api-key
 ```
 
-`LLM_PROVIDER` 支持 `ollama`、`openai`、`deepseek`、`qwen`、`openai-compatible`。后三种服务及 OpenAI 使用 Chat Completions 兼容协议；不是每个模型都支持工具调用、JSON 模式或 temperature 参数，请选择支持这些能力的模型。
+`LLM_PROVIDER` 支持 `ollama`、`openai`、`deepseek`、`qwen`、`openai-compatible`、`siliconflow`。除 Ollama 外均使用 Chat Completions 兼容协议。行程规划请选支持工具调用和 JSON Schema 结构化输出的模型。
 
 | 服务 | LLM_PROVIDER | LLM_BASE_URL |
 | --- | --- | --- |
@@ -54,6 +54,7 @@ LLM_API_KEY=your-ollama-api-key
 | OpenAI | `openai` | `https://api.openai.com/v1` |
 | DeepSeek | `deepseek` | `https://api.deepseek.com` |
 | 通义千问 | `qwen` | 从百炼控制台复制对应地域的 OpenAI 兼容地址，末尾通常为 `/compatible-mode/v1` |
+| 硅基流动 | `siliconflow` | 默认 `https://api.siliconflow.cn/v1`，可用 `SILICONFLOW_BASE_URL` 覆盖 |
 | 其他兼容服务 | `openai-compatible` | 服务商提供的 API 基础地址 |
 
 例如切换 DeepSeek，修改 `.env`：
@@ -65,9 +66,20 @@ LLM_BASE_URL=https://api.deepseek.com
 LLM_API_KEY=your-deepseek-api-key
 ```
 
-地址填写基础路径，不要追加 `/chat/completions`。所有服务均须显式填写地址，没有默认服务商、地址或模型。通义的密钥和地址须属于同一地域。协议与地址参考 [DeepSeek 文档](https://api-docs.deepseek.com/) 和 [通义文档](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope)。
+切换到 [硅基流动](https://docs.siliconflow.cn/docs/api/chat-completions-post) 时，保留原来的 `LLM_MODEL`、`LLM_BASE_URL`、`LLM_API_KEY`，并配置：
 
-相同变量名的系统环境变量优先于 `.env`。CLI 和 HTTP 入口均只从环境配置读取模型参数，不再接受 `--model`；`AGENT_MODEL`、`OLLAMA_HOST` 和 `OLLAMA_API_KEY` 已移除。`LLM_PROVIDER`、`LLM_MODEL`、`LLM_BASE_URL` 必填，缺失时报错，不会回退到 Ollama 或其他服务。OpenAI 兼容服务还必须填写 `LLM_API_KEY`；本地 Ollama 无需认证时可以留空。修改后重启后端。`.env` 已被 Git 忽略，请勿提交真实密钥。
+```dotenv
+LLM_PROVIDER=siliconflow
+SILICONFLOW_MODEL=deepseek-ai/DeepSeek-V4-Flash
+SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+SILICONFLOW_API_KEY=your-siliconflow-api-key
+```
+
+在硅基流动内换模型只需修改 `SILICONFLOW_MODEL`。切回原厂商只需改回 `LLM_PROVIDER`，即可恢复原先的 `LLM_*` 配置。
+
+地址填写基础路径，不要追加 `/chat/completions`。通义的密钥和地址须属于同一地域。协议与地址参考 [DeepSeek 文档](https://api-docs.deepseek.com/) 和 [通义文档](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope)。
+
+相同变量名的系统环境变量优先于 `.env`。CLI 和 HTTP 入口均从环境配置读取模型参数，不接受 `--model`。`LLM_PROVIDER` 必填。硅基流动必须填写 `SILICONFLOW_MODEL` 和 `SILICONFLOW_API_KEY`；其他厂商必须填写 `LLM_MODEL` 和 `LLM_BASE_URL`，兼容 OpenAI 的厂商还需要 `LLM_API_KEY`。修改后重启后端。`.env` 已被 Git 忽略，请勿提交真实密钥。
 
 地图功能使用高德 Web 服务 API：POI 搜索、地理编码、静态地图和路径规划。项目根目录 `.env` 已预留 `AMAP_API_KEY=`，填入高德开放平台申请的 **Web 服务类型 Key** 后重启服务；环境变量优先于 `.env`。`AMAP_TIMEOUT_SECONDS=10` 可在 `.env` 中调整请求超时。服务端密钥不应配置到前端。
 
@@ -268,15 +280,17 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/chat" -Method Post -ContentTyp
 | `errors.log` | HTTP/网络错误、取消、生成阶段异常和模型输出校验失败；异常含类型、消息和堆栈 |
 | `generation.log` | 生成任务进度、检查点及恢复信息 |
 
-请求与响应使用相同 `call_id`；可用 `request_id`、`job_id`、`plan_id`、`stage` 或对话 `run_id` 关联上游任务。密钥、认证头和 Cookie 脱敏，消息与响应内容不截短；二进制响应使用 Base64。HTTP 请求体只观察应用实际读取的内容，提前拒绝或未读取的请求会标记 `body_complete=false`。流式模型响应在结束或中断后写入，保留已收到内容。这些新日志每个文件 20 MB 轮转、保留 5 份备份；进程强制退出可能来不及写入尚未结束的响应。完整日志含旅行信息，请妥善保管；磁盘写入失败会在标准错误日志报告。
+请求与响应使用相同 `call_id`；可用 `request_id`、`job_id`、`plan_id`、`stage` 或对话 `run_id` 关联上游任务。密钥、认证头和 Cookie 脱敏。入站 HTTP 和 WebSocket 默认记录正文大小等元数据。设置 `TRAVEL_LOG_HTTP_BODY=1` 可额外记录不超过 16 KiB 的正文。HTTP 请求体只观察应用实际读取的内容，提前拒绝或未读取的请求会标记 `body_complete=false`。模型和地图调用仍记录诊断正文，流式模型响应在结束或中断后写入。这些日志每个文件 20 MB 轮转、保留 5 份备份。日志含旅行信息，请妥善保管。
 
 行程排序会将同一份 JSON Schema 同时发送到系统消息和结构化输出参数，仍严格检查每个地点恰好安排一次。用户重新启动失败任务时，保留已完成步骤、反馈及审核修订状态，但为行程格式校验重新提供最多 3 次模型调用。
 
-前端侧栏的“运行日志”（`/logs`）可按会话 ID、运行状态和 UTC 日期筛选。对话页可查看当前会话的日志，新消息下的“查看本次运行日志”可直接定位某次回答。选择运行后，时间线展示实际模型请求上下文与工具定义、模型响应、重试错误、工具参数与结果、意图分析和最终状态；展开事件可查看完整 JSON，顶部汇总耗时和模型 Token。点击“刷新”读取最新进度；无结束事件的运行会显示“运行中 / 未收尾”。
+前端侧栏的“运行日志”（`/logs`）可按会话 ID、生成任务编号、运行状态和 UTC 日期筛选。对话页可查看当前会话的日志，新消息下的“查看本次运行日志”可直接定位某次回答；攻略生成页的“查看本次生成日志”可定位当前任务。选择运行后，时间线展示实际模型请求上下文与工具定义、模型响应、重试错误、工具参数与结果、意图分析和最终状态；展开事件可查看完整 JSON，顶部汇总耗时和模型 Token。行程生成任务按 `job_id` 聚合项目 `logs/` 中的阶段进度、模型请求与响应、地图/API 请求与响应及异常堆栈，兼容已有历史文件；仅使用顶层任务编号归属，避免混入其他任务或页面查询。点击“刷新”读取最新进度；无结束事件的运行会显示“运行中 / 未收尾”。
 
 每次 HTTP 或 CLI Agent 任务生成独立 `run_id`，HTTP 响应和持久化消息的 metadata 同时保存该 ID。连接失败、执行异常和取消会记录结束状态及异常堆栈。日志继续保存为现有项目目录下的 JSONL，API 遥测也会同步到运行时间线；未含运行 ID 的旧日志按会话合并展示，不能补回旧请求的上下文。
 
-只读接口：`GET /api/logs/runs?conversation_id=...&status=...&since=YYYY-MM-DD&until=YYYY-MM-DD`、`GET /api/logs/runs/{run_id}?conversation_id=...`。接口仅允许本机客户端和本机页面访问，只读取当前工作目录对应项目的日志；查询非法 ID 返回 400，缺失运行返回 404。诊断读取限最近 100 个会话、每会话末尾 5000 行，列表最多返回 200 次运行，截断时页面会提示；按会话查询可读取该会话。未额外安装日志服务或数据库。
+展开地图/API 日志可分别查看“请求参数”和“响应内容”；展开模型日志可分别查看“Prompt（模型输入）”“模型请求参数”和“模型输出”（含工具调用）。响应条目通过 `call_id` 或 `requestId` 关联对应请求，方便直接对照；缺失请求时会明确提示无法还原。完整元数据保留在“原始日志 JSON”中。
+
+只读接口：`GET /api/logs/runs?conversation_id=...&job_id=...&status=...&since=YYYY-MM-DD&until=YYYY-MM-DD`、`GET /api/logs/runs/{run_id}?conversation_id=...`。生成任务直接以任务编号作为 `run_id`，例如 `/logs?job_id=<任务编号>&run_id=<任务编号>`。会话 ID 只筛选对话日志，任务编号只筛选生成日志；同时填写时无匹配记录。接口仅允许本机客户端和本机页面访问，只读取当前工作目录对应项目的日志；查询非法 ID 返回 400，缺失运行返回 404。对话日志读取限最近 100 个会话、每会话末尾 5000 行；生成日志每组读取当前文件及 5 个轮转备份的最新 8 MiB，忽略损坏或未写完的记录及符号链接。列表最多返回 200 次运行，截断时页面会提示，已被轮转清理或超出读取范围的历史无法补回。未额外安装日志服务或数据库。
 
 日志会保存模型可见的对话、记忆和工具结果。写入及读取时会脱敏常见凭据字段、Bearer/Basic 认证值和文本中的密钥赋值，但不替代个人信息清理；请保护本地日志文件。完整请求上下文会增加磁盘占用，目前不自动轮转或删除。
 

@@ -18,7 +18,7 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
     def test_cli_and_http_use_only_environment_model(self):
         from service import cli
         from service.api import server
-        with patch.dict(os.environ, {"LLM_MODEL": "configured"}):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "ollama", "LLM_MODEL": "configured"}):
             for entry in (cli, server):
                 with patch("sys.argv", ["program"]):
                     self.assertEqual(entry.parse_args().model, "configured")
@@ -70,6 +70,28 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
             client = model_client.create_model_client()
             self.assertNotIn("authorization", client._client.headers)
             self.assertEqual(str(client._client.base_url), "http://localhost:11434")
+
+    async def test_siliconflow_uses_its_own_settings(self):
+        def handler(request):
+            self.assertEqual(str(request.url), "https://api.siliconflow.cn/v1/chat/completions")
+            self.assertEqual(request.headers["authorization"], "Bearer siliconflow-test-key")
+            self.assertEqual(json.loads(request.content)["model"], "org/siliconflow-model")
+            return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+        values = {"LLM_PROVIDER": "siliconflow", "SILICONFLOW_MODEL": "org/siliconflow-model",
+                  "SILICONFLOW_API_KEY": "siliconflow-test-key", "SILICONFLOW_BASE_URL": "",
+                  "LLM_MODEL": "ollama-model", "LLM_BASE_URL": "https://ollama.example", "LLM_API_KEY": "ollama-key"}
+        with patch.dict(os.environ, values):
+            client = model_client.create_model_client()
+            client.transport = httpx.MockTransport(handler)
+            result = await client.chat(model=model_client.get_model(), messages=[], tools=[])
+            self.assertEqual(result.message.content, "ok")
+            with patch.dict(os.environ, {"SILICONFLOW_API_KEY": ""}):
+                with self.assertRaisesRegex(ValueError, "SILICONFLOW_API_KEY"):
+                    model_client.create_model_client()
+            with patch.dict(os.environ, {"SILICONFLOW_MODEL": ""}):
+                with self.assertRaisesRegex(ValueError, "SILICONFLOW_MODEL"):
+                    model_client.get_model()
 
     async def test_tool_history_json_usage_and_retry(self):
         requests = []

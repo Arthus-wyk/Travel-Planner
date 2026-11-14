@@ -155,7 +155,13 @@ def _validate_proposal(data: Any, ordered: list[dict], days: int) -> dict:
     return {"days": normalized, "assumptions": [], "constraint_results": []}
 
 
-def generate_itinerary_proposal(plan: dict, feedback: list | None = None) -> dict:
+class ItineraryOutputError(ValueError):
+    def __init__(self, reason: str, output: str):
+        super().__init__(reason)
+        self.output = output
+
+
+def generate_itinerary_proposal(plan: dict, feedback: list | None = None, *, history=()) -> dict:
     """Return a validated proposal; callers own routing, auditing, retries and saving."""
     from service.utils.model_client import create_model_client, get_model
 
@@ -170,11 +176,15 @@ def generate_itinerary_proposal(plan: dict, feedback: list | None = None) -> dic
                                                                                                                 1,
                                                                                                                 len(ordered)))
 
-    async def request() -> str:
+    async def request():
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT + "\nJSON Schema:\n" + json.dumps(schema, ensure_ascii=False)},
             {"role": "user", "content": json.dumps(snapshot, ensure_ascii=False)},
         ]
+        for output, reason in history:
+            if output is not None:
+                messages.append({"role": "assistant", "content": output})
+            messages.append({"role": "user", "content": f"上次行程校验失败：{reason}\n请修正后重新输出完整 JSON。"})
         response = await asyncio.wait_for(
             create_model_client().chat(
                 model=get_model(),
@@ -186,15 +196,19 @@ def generate_itinerary_proposal(plan: dict, feedback: list | None = None) -> dic
             ), timeout=MODEL_TIMEOUT_SECONDS,
         )
 
-        if response.message.tool_calls:
-            raise ValueError("行程模型不应调用工具")
-        return json.loads(response.message.content)
+        return response.message
 
     try:
-        data = asyncio.run(request())
+        message = asyncio.run(request())
     except (TimeoutError, asyncio.TimeoutError) as exc:
         raise ValueError("行程规划模型调用超时 (timed out)，请重试") from exc
     except Exception as exc:
         logger.exception("行程规划模型调用失败：%s", exc)
         raise ValueError("行程规划模型调用失败，请重试或检查模型配置") from exc
-    return _validate_proposal(data, ordered, days)
+    output = message.content or ""
+    try:
+        if message.tool_calls:
+            raise ValueError("行程模型不应调用工具")
+        return _validate_proposal(json.loads(output), ordered, days)
+    except ValueError as exc:
+        raise ItineraryOutputError(str(exc), output) from exc

@@ -59,6 +59,7 @@ def _ensure_map_cache() -> None:
             )
 
 
+@lru_cache(maxsize=1)
 def ensure_schema() -> None:
     charset = _validated_charset()
     database_name = _quote_identifier(DB_NAME)
@@ -267,7 +268,7 @@ def save_plan(plan: dict[str, Any]) -> None:
                     "created_at": plan["created_at"],
                     "updated_at": plan["updated_at"],
                     "itinerary": _json_dumps(plan["itinerary"]),
-                    "routes": _json_dumps(plan.get("routes", [])),
+                    "routes": _json_dumps(compact_routes(plan.get("routes") or [])),
                     "recommendations": _json_dumps(plan["recommendations"]),
                     "budget_items": _json_dumps(plan["budget_items"]),
                     "planning": _json_dumps(plan.get("planning", {})),
@@ -393,6 +394,26 @@ def connect(database: str | None = DB_NAME):
     )
 
 
+def compact_routes(routes):
+    from service.travel.map_planning import route_polylines
+
+    def geometry(item):
+        return {**item, "legs": [{"polyline": line} for line in route_polylines(item["legs"])]} if "legs" in item else item
+
+    compact = []
+    for route in routes:
+        item = geometry(route)
+        if isinstance(route.get("route_options"), dict):
+            options = {}
+            for mode, option in route["route_options"].items():
+                options[mode] = geometry({key: value for key, value in option.items() if key in {
+                    "success", "duration", "duration_minutes", "fare", "distance_meters", "message", "source", "legs"
+                }}) if isinstance(option, dict) else option
+            item = {**item, "route_options": options}
+        compact.append(item)
+    return compact
+
+
 def row_to_plan(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "plan_id": row["plan_id"],
@@ -412,7 +433,7 @@ def row_to_plan(row: dict[str, Any]) -> dict[str, Any]:
         "created_at": normalize_scalar(row["created_at"]),
         "updated_at": normalize_scalar(row["updated_at"]),
         "itinerary": _json_loads(row["itinerary"], []),
-        "routes": _json_loads(row.get("routes"), []),
+        "routes": compact_routes(_json_loads(row.get("routes"), []) or []),
         "recommendations": _json_loads(row["recommendations"], []),
         "budget_items": _json_loads(row["budget_items"], []),
         "planning": _json_loads(row.get("planning"), {}),

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import "./guided-planner.css";
 import GuideGeneration from "./GuideGeneration";
 import { refreshAfterCommit } from "./api";
@@ -64,6 +64,9 @@ function CandidateCard({ item, name, selected, onSelect, currency }) {
 export function PlanningPage({ api, refreshPlans }) {
   const { planId } = useParams();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const viewingActivities = searchParams.get("step") === "activities";
+  const generationJobId = useLocation().state?.generationJobId;
   const [plan, setPlan] = useState(null);
   const [selection, setSelection] = useState({ outbound: "", return: "" });
   const [kinds, setKinds] = useState({ outbound: "train", return: "train" });
@@ -75,6 +78,8 @@ export function PlanningPage({ api, refreshPlans }) {
   const [selectedHotel, setSelectedHotel] = useState("");
   const [guideText, setGuideText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [hasGuideImage, setHasGuideImage] = useState(false);
   const [error, setError] = useState("");
   const requestBusy = useRef(false);
   const [dirty, setDirty] = useState(false);
@@ -84,7 +89,8 @@ export function PlanningPage({ api, refreshPlans }) {
   const [revision, setRevision] = useState(0);
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-  const allowNavigation = useUnsavedChanges(dirty || busy);
+  const savedGuideText = plan?.planning?.draft_text ?? plan?.planning?.guide_text ?? "";
+  const allowNavigation = useUnsavedChanges(dirty || guideText !== savedGuideText || hasGuideImage || busy || generating);
   function hydrate(nextPlan) {
     const state = nextPlan.planning || {};
     setPlan(nextPlan); setGuideText(state.draft_text ?? state.guide_text ?? "");
@@ -107,6 +113,12 @@ export function PlanningPage({ api, refreshPlans }) {
     }).catch((cause) => { if (active) setError(cause.message); });
     return () => { active = false; };
   }, [api, planId, revision]);
+  useEffect(() => {
+    // A saved review opens directly unless the URL explicitly requests activity editing.
+    if (!viewingActivities && plan?.planning?.stage === "review") {
+      navigate(`/plans/${encode(planId)}/review`, { replace: true });
+    }
+  }, [plan, planId, navigate, viewingActivities]);
   async function action(name, payload = {}, file = null) {
     if (requestBusy.current || uncertain) return null;
     if (name === "candidates" && plan.planning?.stage === "candidates" && dirty && !window.confirm("重新查询会重置尚未确认的交通选择，是否继续？")) return null;
@@ -114,7 +126,7 @@ export function PlanningPage({ api, refreshPlans }) {
     const labels = { guide: "正在识别攻略图片", activities: "正在识别地点与要求", draft: "正在生成并检查路线", candidates: "正在查询交通候选", resolve_place: "正在确认地点", choose_activities: "正在保存地点选择", choose_candidates: "正在保存交通并查询住宿", add_activity: "正在添加地点" };
     setTask(labels[name] || "正在保存");
     try {
-      if (plan.planning?.stage === 'activities') payload = { ...activitySnapshot(), text: guideText, ...payload };
+      if (plan.planning?.stage === 'activities' || (viewingActivities && guideText !== savedGuideText)) payload = { ...activitySnapshot(), text: guideText, ...payload };
       if (file) {
         const dataUrl = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error("图片读取失败，请重试。")); reader.readAsDataURL(file); });
         payload = { ...payload, image_base64: String(dataUrl).split(",")[1] };
@@ -137,6 +149,18 @@ export function PlanningPage({ api, refreshPlans }) {
       allowNavigation(); navigate(`/plans/${encode(planId)}/review`);
     }
   }
+  async function reloadGeneratedPlaces() {
+    // Keep inputs locked while loading the partial result so hydration cannot overwrite a new edit.
+    setBusy(true);
+    try {
+      const { plan } = await api(`/api/plans/${encode(planId)}`);
+      if (mounted.current) hydrate(plan);
+    } catch (cause) {
+      if (mounted.current) setError(cause.message);
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }
   function changeKind(direction, kind) {
     const nextKinds = kind === "drive" ? { outbound: "drive", return: "drive" } : kinds[direction] === "drive" ? { outbound: kind, return: kind } : { ...kinds, [direction]: kind };
     setKinds(nextKinds);
@@ -151,24 +175,29 @@ export function PlanningPage({ api, refreshPlans }) {
   const transports = state.transport_candidates || [];
   const activities = state.activities || [];
   const stage = state.stage || "requirements";
+  const canReview = ["review", "confirmed"].includes(stage);
+  const displayStage = viewingActivities && canReview ? "activities" : stage;
   const driving = kinds.outbound === "drive";
   const transportProblems = transportIssues(selection, driving, vehicles, driveDepartures);
   const problems = activityIssues(plan, edits);
   const blockers = problems.filter(x => x.blocking);
   const detailProblems = blockers.filter(x => x.code === 'duration' || x.code === 'tips' || x.code === 'guide_length');
   const validDetails = !detailProblems.length;
-  return <div className="guided-page" aria-busy={busy}><header className="guided-header"><Link to={`/plans/${encode(planId)}`}>← 行程详情</Link><h1>{plan.destination} · 规划向导</h1><p>{plan.start_date} 至 {plan.end_date} · {plan.travelers} 人 · 预算 {plan.budget} {plan.currency}</p></header>
+  if (stage === "review" && !viewingActivities) return <p role="status">正在打开路线审核…</p>;
+  return <div className="guided-page" aria-busy={busy || generating}><header className="guided-header"><Link to={`/plans/${encode(planId)}`}>← 行程详情</Link><h1>{plan.destination} · 规划向导</h1><p>{plan.start_date} 至 {plan.end_date} · {plan.travelers} 人 · 预算 {plan.budget} {plan.currency}</p></header>
     <nav className="guided-steps" aria-label="规划步骤">{[['candidates', '1 选交通'], ['activities', '2 选活动与攻略'], ['review', '3 审核路线'], ['confirmed', '4 行程单']].map(([step, label], index) => {
-      const current = ['requirements', 'candidates'].includes(stage) ? 0 : ['activities', 'review', 'confirmed'].indexOf(stage) + 1;
-      const enabled = index === 0 || (index === 1 && Boolean(state.selected_transport?.outbound)) || (index === 2 && ['review', 'confirmed'].includes(stage)) || (index === 3 && stage === 'confirmed');
-      return <button key={step} type="button" className={index === current ? 'active' : index < current ? 'complete' : ''} aria-current={index === current ? 'step' : undefined} disabled={!enabled || busy || uncertain} onClick={async () => {
-        if (step === stage) return;
-        if (step === 'candidates') { if (!validDetails && stage === 'activities') { setError('请先修正地点详情再保存并返回交通选择。'); return; } await action('candidates'); }
+      const current = ['requirements', 'candidates'].includes(displayStage) ? 0 : ['activities', 'review', 'confirmed'].indexOf(displayStage) + 1;
+      const enabled = index === 0 || (index === 1 && Boolean(state.selected_transport?.outbound)) || (index === 2 && canReview) || (index === 3 && stage === 'confirmed');
+      return <button key={step} type="button" className={index === current ? 'active' : index < current ? 'complete' : ''} aria-current={index === current ? 'step' : undefined} disabled={!enabled || busy || generating || uncertain} onClick={async () => {
+        if (step === displayStage) return;
+        if (step === 'candidates') { if (!validDetails && displayStage === 'activities') { setError('请先修正地点详情再保存并返回交通选择。'); return; } await action('candidates'); }
         else if (step === 'activities') {
           if (stage === 'candidates' && dirty) { setError('交通选择尚未确认，请先点击“确认交通，继续”。'); return; }
-          await action('edit_places');
+          // Browsing activities must leave the existing review available.
+          if (canReview) setSearchParams({ step: "activities" });
+          else await action('edit_places');
         }
-        else { allowNavigation(); navigate(`/plans/${encode(planId)}/${step === 'review' ? 'review' : 'sheet'}`); }
+        else navigate(`/plans/${encode(planId)}/${step === 'review' ? 'review' : 'sheet'}`);
       }}>{index < current ? '✓ ' : ''}{label}</button>;
     })}</nav>
     {error && <p className="guided-error" role="alert">{error}</p>}
@@ -184,10 +213,9 @@ export function PlanningPage({ api, refreshPlans }) {
       <div className="guided-actions"><button className="primary-button" disabled={transportProblems.length > 0} onClick={() => action("choose_candidates", { ...selection, ...(driving ? { drive_departures: driveDepartures, vehicles: Number(vehicles) } : {}) })}>确认交通，继续</button><button onClick={() => action("candidates")}>重新查询交通候选</button></div>
       </fieldset>
     </section>}
-    {["activities", "review", "confirmed"].includes(stage) && <GuideGeneration api={api} planId={planId} text={guideText} onText={value => { setGuideText(value); setDirty(true); }} snapshot={activitySnapshot()} disabled={busy || uncertain} manualAvailable={activities.some(item => item.category !== "hotel" && choices[item.id] !== "exclude")} onManual={generateFromSavedPlaces} onComplete={() => { allowNavigation(); navigate(`/plans/${encode(planId)}/review`); }} />}
+    {displayStage === "activities" && <GuideGeneration api={api} planId={planId} initialJobId={generationJobId} text={guideText} onText={setGuideText} onAttachmentChange={setHasGuideImage} getSnapshot={activitySnapshot} disabled={busy || uncertain} onRunning={setGenerating} onNeedsInput={reloadGeneratedPlaces} manualAvailable={activities.some(item => item.category !== "hotel" && choices[item.id] !== "exclude")} onManual={generateFromSavedPlaces} onComplete={() => { allowNavigation(); navigate(`/plans/${encode(planId)}/review`, { replace: true }); }} />}
 
-    {stage === "review" && <section className="guided-card"><h2>地点选择已完成</h2><p>路线地图、每日行程和预算检查在独立审核页中查看。</p><div className="guided-actions"><Link className="primary-button" to={`/plans/${encode(planId)}/review`}>打开路线与预算审核</Link><button disabled={busy} onClick={() => action("edit_places")}>修改地点选择</button></div></section>}
-    {stage === "confirmed" && <section className="guided-card"><h2>已确认行程</h2><p>行程单可查看、打印，并登记交通、酒店与门票购买价格。</p><Link className="primary-button" to={`/plans/${encode(planId)}/sheet`}>查看行程单</Link></section>}
+    {displayStage === "confirmed" && <section className="guided-card"><h2>已确认行程</h2><p>行程单可查看、打印，并登记交通、酒店与门票购买价格。</p><Link className="primary-button" to={`/plans/${encode(planId)}/sheet`}>查看行程单</Link></section>}
   </div>;
 }
 
@@ -210,7 +238,7 @@ export function AuditView({ audit, plan, onIssue, busy = false }) {
   </div>;
 }
 
-export function ActivityDetailsEditor({ item, onEdit, busy }) {
+export function ActivityDetailsEditor({ item, onEdit, busy, live = false }) {
   function submit(event) {
     event.preventDefault();
     const values = new FormData(event.currentTarget);
@@ -219,13 +247,13 @@ export function ActivityDetailsEditor({ item, onEdit, busy }) {
       ticket_required: ticket === "unknown" ? null : ticket === "yes",
       estimated_cost: Number(values.get("estimated_cost")), visit_tips: String(values.get("visit_tips") || "") });
   }
-  return <details className="guided-item-editor"><summary>调整停留信息</summary><form onSubmit={submit}>
+  return <details className="guided-item-editor"><summary>调整停留信息</summary><form onSubmit={submit} onChange={live ? event => { const form = event.currentTarget; if (form.checkValidity()) submit({ preventDefault() {}, currentTarget: form }); } : undefined}>
     <label>开始时间<input name="time_of_day" type="time" defaultValue={item.time_of_day} required /></label>
     <label>停留时长（分钟）<input name="duration_minutes" type="number" min="30" max="600" step="1" defaultValue={item.duration_minutes || 90} required /></label>
     {item.category === "attraction" && <label>是否需要门票<select name="ticket_required" defaultValue={item.ticket_required == null ? "unknown" : item.ticket_required ? "yes" : "no"}><option value="unknown">待确认</option><option value="yes">需要</option><option value="no">不需要</option></select></label>}
     <label>预计总费用（元）<input name="estimated_cost" type="number" min="0" step="0.01" defaultValue={item.estimated_cost || 0} required /></label>
     <label className="wide">停留注意事项<textarea name="visit_tips" maxLength="500" rows="2" defaultValue={item.visit_tips || ""} placeholder="例如预约、开放时间或交通提醒" /></label>
-    <button disabled={busy}>保存并重新审核</button>
+    {!live && <button disabled={busy}>保存并重新审核</button>}
   </form></details>;
 }
 

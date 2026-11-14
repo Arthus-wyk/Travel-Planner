@@ -1,34 +1,48 @@
 import React, { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { ArrowUp, Paperclip, X, Compass, Check, ChevronDown, RotateCcw, CircleAlert } from "lucide-react";
 import { watchGenerationSocket } from "./generationSocket";
 
 const steps = ["检查旅行需求", "识别攻略地点", "查找真实地点并匹配候选", "整理住宿与地点", "准备每日安排", "安排每日行程", "计算路线", "检查时间和预算"];
 const stages = { queued: "等待生成", starting: "准备生成", coordinator: steps[0], generate_guide: steps[1], activity_agent: steps[1], search_places: steps[2], place_match_agent: steps[2], default_choices: steps[3], prepare_draft: steps[4], itinerary_agent: steps[5], route_agent: steps[6], schedule_agent: steps[6], audit_agent: steps[7] };
+const isRunning = job => ["queued", "running"].includes(job?.status);
 
-export default function GuideGeneration({ api, planId, text, onText, snapshot, onComplete, onManual, manualAvailable, disabled, onRunning }) {
+export default function GuideGeneration({ api, planId, initialJobId, text, onText, onAttachmentChange, getSnapshot, onComplete, onNeedsInput, onManual, manualAvailable, disabled, onRunning }) {
   const [connection, setConnection] = useState("connecting");
   const [elapsed, setElapsed] = useState(0);
   const [file, setFile] = useState(null);
-  const [job, setJob] = useState(null);
+  const [job, setJob] = useState(() => initialJobId ? { job_id: initialJobId, status: "queued", stage: "queued" } : null);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [retry, setRetry] = useState(0);
   const submittingRef = useRef(false);
+  const watchedJobId = useRef(initialJobId);
+  const submissionError = useRef("");
   const fileInput = useRef(null);
-  const callbacks = useRef({ onComplete, onRunning });
-  callbacks.current = { onComplete, onRunning };
-  const active = submitting || ["queued", "running"].includes(job?.status);
+  const callbacks = useRef({ onComplete, onRunning, onNeedsInput });
+  callbacks.current = { onComplete, onRunning, onNeedsInput };
+  const active = submitting || isRunning(job);
   useEffect(() => { callbacks.current.onRunning?.(active); }, [active]);
   useEffect(() => {
+    onAttachmentChange(Boolean(file));
+    return () => onAttachmentChange(false);
+  }, [file, onAttachmentChange]);
+  useEffect(() => {
     return watchGenerationSocket(planId, next => {
+        // Keep the queued indicator until the socket reports a job.
+        if (submittingRef.current || (!next && watchedJobId.current)) return;
+        if (isRunning(next)) watchedJobId.current = next.job_id;
         setJob(next);
-        if (next?.status === "completed" && localStorage.getItem(`generation-seen-${planId}`) !== next.job_id) {
-          localStorage.setItem(`generation-seen-${planId}`, next.job_id);
-          // Only navigate for a task started here or still relevant to this draft.
+        if (next?.status === "needs_input" && watchedJobId.current === next.job_id) {
+          watchedJobId.current = null;
+          callbacks.current.onNeedsInput?.();
+        }
+        if (next?.status === "completed" && watchedJobId.current === next.job_id) {
+          watchedJobId.current = null;
           callbacks.current.onComplete();
           return;
         }
-        setError(["failed", "needs_input"].includes(next?.status) ? next.error : "");
+        setError(isRunning(next) ? "" : submissionError.current || (["failed", "needs_input"].includes(next?.status) ? next.error : ""));
     }, setConnection);
   }, [api, planId, retry]);
   useEffect(() => {
@@ -39,23 +53,33 @@ export default function GuideGeneration({ api, planId, text, onText, snapshot, o
   }, [active]);
   async function generate() {
     if (submittingRef.current || active) return;
-    submittingRef.current = true; setSubmitting(true); setError("");
+    submittingRef.current = true;
+    submissionError.current = "";
+    setSubmitting(true); setError("");
     try {
-      const payload = { text, ...snapshot };
+      // Give the browser a paint before building the snapshot or serializing a large image.
+      await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+      const payload = { text, ...getSnapshot() };
       if (file) {
         const data = await new Promise((resolve, reject) => {
           const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error("图片读取失败")); reader.readAsDataURL(file);
         });
         payload.image_base64 = String(data).split(",")[1];
       }
-      await api(`/api/plans/${encodeURIComponent(planId)}/generation`, { method: "POST", body: JSON.stringify(payload) });
+      const { job_id } = await api(`/api/plans/${encodeURIComponent(planId)}/generation`, { method: "POST", body: JSON.stringify(payload) });
+      watchedJobId.current = job_id;
+      setJob({ job_id, status: "queued", stage: "queued" });
       setRetry(x => x + 1);
-    } catch (cause) { setError(cause.message); setRetry(x => x + 1); }
+    } catch (cause) {
+      submissionError.current = cause.message;
+      setError(cause.message);
+      setRetry(x => x + 1);
+    }
     finally { submittingRef.current = false; setSubmitting(false); }
   }
   const failed = job?.status === "failed";
   const needsInput = job?.status === "needs_input";
-  const current = steps.indexOf(stages[job?.stage]);
+  const current = submitting ? -1 : steps.indexOf(stages[job?.stage]);
   const canGenerate = !active && !disabled && (file || text.trim()) && text.length <= 20000;
   return <section className="guide-studio" aria-labelledby="guide-generation-title">
     <header className="guide-studio-heading"><span className="guide-emblem"><Compass size={26} strokeWidth={1.5} /></span>
@@ -77,13 +101,14 @@ export default function GuideGeneration({ api, planId, text, onText, snapshot, o
       </div>
     </div>
     <p className="guide-composer-hint">支持文字或图片（最大 10 MB） · 自动匹配地点、安排路线与核对预算</p>
+    {job?.job_id && <Link className="back-link" to={`/logs?job_id=${encodeURIComponent(job.job_id)}&run_id=${encodeURIComponent(job.job_id)}`}>查看本次生成日志</Link>}
     {text.length > 20000 && <p role="alert" className="guided-note">攻略文字超过 20,000 字，请精简后再生成。</p>}
     {disabled && !active && <p className="guided-note">请先处理地点问题或等待当前修改完成。</p>}
     {(active || error) && <div className={`guide-response ${error && !active ? "has-error" : ""}`}>
       <span className="guide-response-avatar">{error && !active ? <CircleAlert size={19} /> : <Compass size={20} />}</span>
       <div className="guide-response-body">
         {active && <><div className="guide-status" role="status" aria-live="polite"><strong className="guide-thinking">{submitting ? "正在提交攻略" : stages[job?.stage] || "正在处理攻略"}</strong><span className="guide-pulse" aria-hidden="true" /></div>
-          <p className="guide-status-meta">已用时 {elapsed} 秒{connection !== "connected" && " · 正在恢复连接，后台继续执行"}</p>
+          <p className="guide-status-meta">已用时 {elapsed} 秒{!submitting && connection !== "connected" && " · 正在连接进度服务"}</p>
           <details className="guide-process"><summary>查看执行过程<ChevronDown size={14} /></summary>
             <ol>{steps.map((label, index) => <li key={label} className={index < current ? "done" : index === current ? "current" : ""} aria-current={index === current ? "step" : undefined}><span className="guide-step-marker">{index < current ? <Check size={12} /> : index + 1}</span>{label}{index === current && <span className="guide-step-state">处理中</span>}</li>)}</ol>
           </details><p className="guide-response-note">可以刷新页面，回来后继续查看进度。</p></>}
@@ -93,6 +118,5 @@ export default function GuideGeneration({ api, planId, text, onText, snapshot, o
         </div>}
       </div>
     </div>}
-    {job?.status === "completed" && !active && <button className="guide-complete" onClick={() => callbacks.current.onComplete()}><Check size={16} />行程已生成，打开每日行程</button>}
   </section>;
 }

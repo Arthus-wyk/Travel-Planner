@@ -1,3 +1,4 @@
+import { applyReviewEdit } from './reviewDraft';
 import RouteMap from "./RouteMap";
 import React, { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -9,7 +10,7 @@ import { categoryLabels, isMovableStop, transportLabels } from "./planningLabels
 import { refreshAfterCommit } from "./api";
 import { auditDestination } from "./auditActions";
 import { validMoney, focusIssue } from "./planningValidation";
-import { BusyStatus, LoadError } from "./planningUi";
+import { BusyStatus, LoadError, useUnsavedChanges } from "./planningUi";
 
 const encode = encodeURIComponent;
 const modes = { WALK: "步行", TRANSIT: "公交", DRIVE: "驾车" };
@@ -17,8 +18,20 @@ const modes = { WALK: "步行", TRANSIT: "公交", DRIVE: "驾车" };
 export default function ReviewPage({ api, refreshPlans }) {
   const { planId } = useParams();
   const navigate = useNavigate();
+  const activitiesUrl = `/plans/${encode(planId)}/planning?step=activities`;
   const [plan, setPlan] = useState(null);
   const [audit, setAudit] = useState(null);
+  const [edits, setEdits] = useState([]);
+  const savedVersion = useRef(null);
+  const root = useRef(null);
+  const [invalidDraft, setInvalidDraft] = useState(false);
+  const [editorVersion, setEditorVersion] = useState(0);
+  const latestSave = useRef(null);
+  useUnsavedChanges(edits.length > 0 || invalidDraft);
+  useEffect(() => {
+    const timer = setInterval(() => latestSave.current?.(true), 5 * 60 * 1000);
+    return () => clearInterval(timer);
+  }, [planId]);
   const [day, setDay] = useState(1);
   const [map, setMap] = useState(null);
   const [mapError, setMapError] = useState("");
@@ -43,33 +56,60 @@ export default function ReviewPage({ api, refreshPlans }) {
     Promise.all([api(`/api/plans/${encode(planId)}`), api(`/api/plans/${encode(planId)}/planning/audit`)]).then(([data, check]) => {
       if (!active) return;
       if (!["review", "confirmed"].includes(data.plan.planning?.stage)) { navigate(`/plans/${encode(planId)}/planning`, { replace: true }); return; }
+      savedVersion.current = data.plan_version; setEdits([]); setInvalidDraft(false); setEditorVersion(value => value + 1);
       setPlan(data.plan); setBudget(data.plan.budget); setAudit(check.audit);
     }).catch((cause) => { if (active) setError(cause.message); });
     return () => { active = false; };
   }, [api, planId, navigate, revision]);
   useEffect(() => {
-    if (!plan) return;
+    if (!plan || edits.length) return;
     let active = true;
     setMap(null); setMapError(""); setMapBusy(true);
     api(`/api/plans/${encode(planId)}/planning/map?day=${day}`).then((data) => { if (active) setMap(data); })
       .catch((cause) => { if (active) setMapError(cause.message); })
       .finally(() => { if (active) setMapBusy(false); });
     return () => { active = false; };
-  }, [api, planId, plan, day, mapRevision]);
+  }, [api, planId, plan, day, mapRevision, edits.length]);
   async function action(name, payload = {}) {
     if (requestBusy.current || uncertain) return null;
+    if (["move_activity", "update_activity", "route_mode", "transport_stops", "update_budget", "acknowledge_purchase"].includes(name)) {
+      try {
+        setPlan(applyReviewEdit(plan, name, payload));
+        setEdits(current => [...current, { action: name, payload }]);
+        setNotice("有未保存的修改"); setError("");
+        return { success: true };
+      } catch (cause) { setError(cause.message); return null; }
+    }
+    if (edits.length && name !== "review_changes") { setError("请先保存所有修改"); return null; }
     requestBusy.current = true;
     setBusy(true); setError("");
     try {
-      const data = await api(`/api/plans/${encode(planId)}/planning/${name}`, { method: "POST", body: JSON.stringify(payload) });
+      const data = await api(`/api/plans/${encode(planId)}/planning/${name}?include_version=true`, { method: "POST", body: JSON.stringify(payload) });
       if (!mounted.current) return data;
       setPlan(data.plan); setBudget(data.plan.budget); setAudit(data.audit || null);
+      savedVersion.current = data.plan_version; setEdits([]); setInvalidDraft(false); setEditorVersion(value => value + 1);
       setNotice('修改已保存');
       void refreshAfterCommit(refreshPlans, setNotice);
       return data;
     } catch (cause) { if (mounted.current) { setError(cause.message); setUncertain(Boolean(cause.uncertain)); } return null; }
     finally { requestBusy.current = false; if (mounted.current) setBusy(false); }
   }
+  async function saveChanges(silent = false) {
+    if (!edits.length || requestBusy.current || uncertain) return;
+    const invalid = [...(root.current?.querySelectorAll('form[data-edited]') || [])].find(form => !form.checkValidity());
+    if (invalid) { if (!silent) { invalid.reportValidity(); setError("请先修正尚未填写完整的调整项"); } return; }
+    if (silent) {
+      requestBusy.current = true; setBusy(true);
+      try {
+        const data = await api(`/api/plans/${encode(planId)}/planning/review_changes`, { method: "POST", body: JSON.stringify({ operations: edits, plan_version: savedVersion.current }) });
+        if (!mounted.current) return;
+        savedVersion.current = data.plan_version; setPlan(data.plan); setBudget(data.plan.budget); setAudit(data.audit); setEdits([]); setInvalidDraft(false); setEditorVersion(value => value + 1);
+        setNotice("已自动保存");
+      } catch (cause) { if (mounted.current) { setError(`自动保存失败，修改仍保留：${cause.message}`); setUncertain(Boolean(cause.uncertain)); } }
+      finally { requestBusy.current = false; if (mounted.current) setBusy(false); }
+    } else await action("review_changes", { operations: edits, plan_version: savedVersion.current });
+  }
+  latestSave.current = saveChanges;
   async function move(id, targetDay, before = null) {
     setDragged(null); setTarget(null);
     if (!busy) await action("move_activity", { item_id: id, target_day: targetDay, before_item_id: before });
@@ -86,12 +126,20 @@ export default function ReviewPage({ api, refreshPlans }) {
   const state = plan.planning || {};
   const editable = state.stage === "review";
   const days = Math.round((new Date(`${plan.end_date}T00:00:00Z`) - new Date(`${plan.start_date}T00:00:00Z`)) / 86400000) + 1;
-  const items = (plan.itinerary || []).filter((item) => item.day === day).sort((a, b) => (a.day_offset || 0) - (b.day_offset || 0) || a.time_of_day.localeCompare(b.time_of_day));
+  const items = (plan.itinerary || []).filter((item) => item.day === day);
   const pending = (state.unscheduled_items || []).filter(item => item.manual_pending);
   const legacy = state.generation?.contract_version !== 3;
   const costs = audit?.budget;
-  const routeFrom = (id) => (plan.routes || []).find((route) => route.origin_item_id === id);
-  async function editPlaces() { if (await action('edit_places')) navigate(`/plans/${encode(planId)}/planning`); }
+  const routeFrom = id => {
+    const index = items.findIndex(item => item.item_id === id);
+    return (plan.routes || []).find(route => route.origin_item_id === id && route.destination_item_id === items[index + 1]?.item_id);
+  };
+  function selectRoute(route, mode) {
+    action("route_mode", { origin_item_id: route.origin_item_id, destination_item_id: route.destination_item_id, travel_mode: mode });
+  }
+
+  // Opening the editor is navigation. Saving a new draft is what replaces the route.
+  function editPlaces() { navigate(activitiesUrl); }
   function handleIssue(issue) {
     if (!editable) { focusIssue('confirmed-repair'); return; }
     const destination = auditDestination(issue, plan);
@@ -110,7 +158,7 @@ export default function ReviewPage({ api, refreshPlans }) {
   function card(item, isPending = false) {
     const movable = editable && isMovableStop(item);
     const reason = item.reason || state.generation?.stops?.find((stop) => stop.activity_id === item.reference_id)?.reason;
-    const index = map?.points?.findIndex((p) => p.item_id === item.item_id) ?? -1;
+    const index = edits.length ? -1 : map?.points?.findIndex((p) => p.item_id === item.item_id) ?? -1;
     return <article key={item.item_id} id={`review-${item.item_id}`} tabIndex={-1} className={`review-stop ${movable ? "movable" : "fixed"} ${dragged === item.item_id ? "dragging" : ""}`} draggable={movable && !busy && !uncertain}
       onDragStart={(event) => { if (!movable || event.target.closest("input,button,select,textarea,summary,form")) { event.preventDefault(); return; } event.dataTransfer.setData("text/plain", item.item_id); event.dataTransfer.effectAllowed = "move"; setDragged(item.item_id); }}
       onDragEnd={() => { setDragged(null); setTarget(null); }}>
@@ -120,19 +168,27 @@ export default function ReviewPage({ api, refreshPlans }) {
       {item.visit_tips && <p className="review-visit-note">攻略备注：{item.visit_tips}</p>}
       {item.category === "attraction" && <p className="guided-note">{item.ticket_required === false ? "原文标注免票" : item.estimated_cost > 0 ? `门票参考费用 ${item.estimated_cost} 元` : "门票费用未知，未计入合计"}</p>}
       {item.category === "food" && <p className="guided-note">{item.place?.cost_per_person ? `高德人均 ${item.place.cost_per_person} 元` : "人均消费未知，未计入合计"}</p>}
-      {item.category === "intercity_transport" && <><p className="guided-note">{transportLabels[(state.transport_candidates || []).find((candidate) => candidate.id === item.reference_id)?.kind] || "城际交通"} · 出发：{item.location} → 到达：{item.arrival_location || "待确认"}{!item.station_confirmed && " · 请确认实际车站 / 机场"}</p>{editable && <details className="guided-item-editor"><summary>设置车站 / 机场接驳地点</summary><form onSubmit={(event) => { event.preventDefault(); const values = new FormData(event.currentTarget); action("transport_stops", { item_id: item.item_id, departure_location: values.get("departure_location"), arrival_location: values.get("arrival_location") }); }}><label>出发站 / 机场<input name="departure_location" defaultValue={item.station_confirmed ? item.location : ""} required maxLength={200} placeholder="例如：上海虹桥站" /></label><label>到达站 / 机场<input name="arrival_location" defaultValue={item.station_confirmed ? item.arrival_location : ""} required maxLength={200} placeholder="例如：杭州东站" /></label><button disabled={busy || uncertain}>保存并计算接驳</button></form></details>}</>}
+      {item.category === "intercity_transport" && <><p className="guided-note">{transportLabels[(state.transport_candidates || []).find((candidate) => candidate.id === item.reference_id)?.kind] || "城际交通"} · 出发：{item.location} → 到达：{item.arrival_location || "待确认"}{!item.station_confirmed && " · 请确认实际车站 / 机场"}</p>{editable && <details className="guided-item-editor"><summary>设置车站 / 机场接驳地点</summary><form onChange={event => { const form = event.currentTarget; if (form.checkValidity()) { const values = new FormData(form); action("transport_stops", { item_id: item.item_id, departure_location: values.get("departure_location"), arrival_location: values.get("arrival_location") }); } }} onSubmit={(event) => { event.preventDefault(); const values = new FormData(event.currentTarget); action("transport_stops", { item_id: item.item_id, departure_location: values.get("departure_location"), arrival_location: values.get("arrival_location") }); }}><label>出发站 / 机场<input name="departure_location" defaultValue={item.station_confirmed ? item.location : ""} required maxLength={200} placeholder="例如：上海虹桥站" /></label><label>到达站 / 机场<input name="arrival_location" defaultValue={item.station_confirmed ? item.arrival_location : ""} required maxLength={200} placeholder="例如：杭州东站" /></label><button disabled={busy || uncertain}>应用接驳地点</button></form></details>}</>}
       {item.place?.image_cache_key && <details className="review-place-map"><summary>查看地点地图</summary><img src={apiUrl(`/api/maps/images/${item.place.image_cache_key}`)} alt={`${item.title}的位置地图`} loading="lazy" /></details>}
       {movable && <div className="review-card-controls">{isPending ? <button disabled={busy || uncertain} onClick={() => move(item.item_id, day)}>加入第 {day} 天</button> : <>
         <button disabled={busy || uncertain} onClick={() => move(item.item_id, null)}>移至暂存区</button>
         <select aria-label={`移动${item.title}至其他日期`} value="" disabled={busy || uncertain} onChange={(e) => { if (e.target.value) move(item.item_id, Number(e.target.value)); }}><option value="">移动到其他天…</option>{Array.from({ length: days }, (_, n) => n + 1).filter((n) => n !== day).map((n) => <option key={n} value={n}>第 {n} 天</option>)}</select>
         {items.filter((x) => isMovableStop(x)).findIndex((x) => x.item_id === item.item_id) > 0 && <button disabled={busy || uncertain} onClick={() => { const visits = items.filter((x) => isMovableStop(x)); move(item.item_id, day, visits[visits.findIndex((x) => x.item_id === item.item_id) - 1].item_id); }}>上移</button>}
       </>}</div>}
-      {movable && !isPending && <ActivityDetailsEditor key={`${item.item_id}-${item.time_of_day}-${item.duration_minutes}-${item.estimated_cost}-${item.ticket_required}-${item.visit_tips}`} item={item} busy={busy} onEdit={(id, details) => action("update_activity", { activity_id: id, ...details })} />}
+      {movable && !isPending && <ActivityDetailsEditor key={`${item.item_id}-${editorVersion}`} item={item} busy={busy || uncertain} live onEdit={(id, details) => action("update_activity", { activity_id: id, ...details })} />}
     </article>;
   }
-  return <div className="guided-page review-page" aria-busy={busy}>
-    <header className="guided-header"><Link to={`/plans/${encode(planId)}/planning`}>← 规划向导</Link><h1>{plan.destination} · 路线与预算审核</h1><p>{plan.start_date} 至 {plan.end_date} · {plan.travelers} 人</p></header>
+  return <div ref={root} className="guided-page review-page" aria-busy={busy} onChangeCapture={event => {
+    const form = event.target.closest('form');
+    if (form) { form.dataset.edited = 'true'; setInvalidDraft([...root.current.querySelectorAll('form[data-edited]')].some(item => !item.checkValidity())); }
+  }}><fieldset disabled={busy} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+    <header className="guided-header"><Link to={`/plans/${encode(planId)}`}>← 行程详情</Link><h1>{plan.destination} · 路线与预算审核</h1><p>{plan.start_date} 至 {plan.end_date} · {plan.travelers} 人</p></header>
+    <nav className="guided-steps" aria-label="规划步骤">
+      <button type="button" className="complete" disabled={busy || uncertain || !state.selected_transport?.outbound} onClick={editPlaces}>✓ 2 选活动与攻略</button>
+      <button type="button" className="active" aria-current="step">3 审核路线</button>
+    </nav>
     <p role="status" className="guided-note">{highIssues.length ? `当前为待调整草稿，有 ${highIssues.length} 项问题需要处理；详见下方注意事项。` : "每日路线已生成，可调整地点顺序并核对费用。"}</p>
+    {editable && <div className="guided-actions" role="status"><button className="primary-button" disabled={busy || uncertain || !edits.length} onClick={() => saveChanges()}>保存所有修改</button><span>{edits.length || invalidDraft ? "有未保存修改；每 5 分钟自动保存。时刻、路线地图及审核预算将在保存后更新。" : "所有修改已保存"}</span></div>}
     {error && <p className="guided-error" role="alert">{error}</p>}
     {notice && <p role="status">{notice}{notice.includes('列表') && <button onClick={() => refreshAfterCommit(refreshPlans, setNotice)}>刷新列表</button>}</p>}
     <BusyStatus task={busy ? '正在保存、计算路线与更新审核' : ''} />
@@ -142,7 +198,7 @@ export default function ReviewPage({ api, refreshPlans }) {
     <div className="review-day-overview"><strong>第 {day} 天</strong><span>{items.filter(isMovableStop).length} 个停留地点</span><span>活动 {items.filter(isMovableStop).reduce((sum, x) => sum + (x.duration_minutes || 0), 0)} 分钟</span><span>交通 {(plan.routes || []).filter(r => items.some(x => x.item_id === r.origin_item_id)).reduce((sum, r) => sum + (r.duration_minutes || 0), 0)} 分钟</span></div>
     <section className="review-map-panel" aria-label={`第${day}天的路线地图`}>
       <div className="review-map-caption"><strong>第 {day} 天 · 行程路线图</strong><span>高德地图 · 地点编号对应下方卡片</span></div>
-      {mapBusy ? <div className="review-map-placeholder" role="status">正在读取当天路线地图…</div> : map && !mapError ? <RouteMap data={map} /> : <div className="review-map-placeholder" role="status">{mapError || "确认地点后显示路线地图"}</div>}
+      {edits.length ? <div className="review-map-placeholder" role="status">保存修改后更新路线地图</div> : mapBusy ? <div className="review-map-placeholder" role="status">正在读取当天路线地图…</div> : map && !mapError ? <RouteMap data={map} /> : <div className="review-map-placeholder" role="status">{mapError || "确认地点后显示路线地图"}</div>}
       {mapError && <button disabled={mapBusy} onClick={() => setMapRevision(x => x + 1)}>重试当天地图</button>}
       {map?.warnings?.map((warning) => <p key={warning} className="guided-note">{warning}</p>)}
     </section>
@@ -154,7 +210,7 @@ export default function ReviewPage({ api, refreshPlans }) {
           {items.map((item) => { const route = routeFrom(item.item_id); return <React.Fragment key={item.item_id}>
             {isMovableStop(item) && slot(item.item_id)}
             {card(item)}
-            {route && <div className="review-route-leg"><span>↓ {route.station_transfer ? "车站 / 机场接驳" : "前往下一站"}</span><select aria-label={`${item.title}至下一站的交通方式`} value={route.travel_mode || "TRANSIT"} disabled={busy || uncertain || !editable} onChange={(e) => action("route_mode", { origin_item_id: route.origin_item_id, destination_item_id: route.destination_item_id, travel_mode: e.target.value })}>{Object.entries(modes).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>{route.duration_minutes} 分钟{route.distance_meters != null && ` · ${(route.distance_meters / 1000).toFixed(1)} 公里`}{route.fare != null && route.source === "高德地图" && ` · 参考费用 ${route.fare} 元`}{route.source === "provisional_estimate" && " · 临时估算"}</small>{route.error && <p role="status">{route.error}</p>}</div>}
+            {route && <div className="review-route-leg"><span>↓ {route.station_transfer ? "车站 / 机场接驳" : "前往下一站"}</span><select aria-label={`${item.title}至下一站的交通方式`} value={route.travel_mode || "TRANSIT"} disabled={busy || uncertain || !editable} onChange={(e) => selectRoute(route, e.target.value)}>{Object.entries(modes).map(([value, label]) => <option key={value} value={value} disabled={!route.route_options?.[value]?.success}>{label}{route.route_options?.[value]?.success ? ` · ${route.route_options[value].duration_minutes ?? Math.ceil(parseFloat(route.route_options[value].duration) / 60)} 分钟 · ${route.route_options[value].fare == null ? "费用未知" : `${route.route_options[value].fare} 元`}` : " · 暂无路线"}</option>)}</select><small>{route.duration_minutes} 分钟{route.distance_meters != null && ` · ${(route.distance_meters / 1000).toFixed(1)} 公里`}{route.fare != null && route.source === "高德地图" && ` · 参考费用 ${route.fare} 元`}{route.source === "provisional_estimate" && " · 临时估算"}</small>{route.error && <p role="status">{route.error}</p>}</div>}
           </React.Fragment>; })}
           {slot()}
         </div>
@@ -165,13 +221,13 @@ export default function ReviewPage({ api, refreshPlans }) {
     <section className="guided-card"><h2>注意事项</h2><AuditView audit={audit} plan={plan} onIssue={handleIssue} busy={busy || uncertain} />
       {!editable && <div id="confirmed-repair"><button disabled={busy} onClick={editPlaces}>返回编辑行程</button></div>}
       {editable && <>
-        <form id="review-budget" className="review-budget-form" onSubmit={event => { event.preventDefault(); if (validMoney(budget)) action('update_budget', { budget: Number(budget) }); }}><label>调整总预算（元）<input type="number" min="0" step="0.01" required value={budget} onChange={event => setBudget(event.target.value)} /></label><button disabled={busy || uncertain || !validMoney(budget)}>保存预算并重新审核</button></form>
+        <form id="review-budget" className="review-budget-form" onSubmit={event => { event.preventDefault(); if (validMoney(budget)) action('update_budget', { budget: Number(budget) }); }}><label>调整总预算（元）<input type="number" min="0" step="0.01" required value={budget} onChange={event => { setBudget(event.target.value); if (validMoney(event.target.value)) action("update_budget", { budget: Number(event.target.value) }); }} /></label><button disabled={busy || uncertain || !validMoney(budget)}>应用预算调整</button></form>
         <div id="review-route-tools" className="guided-actions"><button disabled={busy || uncertain} onClick={() => action('recalculate_routes')}>重新计算路线与审核</button><span>保留当前地点和日期；缺失的起终点请重新生成行程。</span></div>
-        <div id="review-replan-tools" className="guided-actions"><button disabled={busy || uncertain} onClick={async () => { setBusy(true); try { await api(`/api/plans/${encode(planId)}/generation`, { method: "POST", body: JSON.stringify({ text: state.guide_text || "" }) }); navigate(`/plans/${encode(planId)}/planning`); } catch (cause) { setError(cause.message); } finally { setBusy(false); } }}>按攻略重新匹配并生成</button><button disabled={busy || uncertain} onClick={editPlaces}>修改地点、要求或重新生成</button><button disabled={busy || uncertain} onClick={async () => { if (await action('candidates')) navigate(`/plans/${encode(planId)}/planning`); }}>重新比较交通</button></div>
+        <div id="review-replan-tools" className="guided-actions"><button disabled={busy || uncertain || invalidDraft || edits.length > 0} onClick={async () => { setBusy(true); try { const { job_id } = await api(`/api/plans/${encode(planId)}/generation`, { method: "POST", body: JSON.stringify({ text: state.guide_text || "" }) }); navigate(activitiesUrl, { state: { generationJobId: job_id } }); } catch (cause) { setError(cause.message); } finally { setBusy(false); } }}>按攻略重新匹配并生成</button><button disabled={busy || uncertain} onClick={async () => { if (await action('candidates')) navigate(`/plans/${encode(planId)}/planning`); }}>重新比较交通</button></div>
         {(state.purchases || []).filter(record => highIssues.some(issue => issue.type === 'purchased_item_changed' && issue.target === record.reference_id)).map(record => <div key={record.reference_id} id={`purchase-${record.reference_id}`} tabIndex={-1} className="guided-issues"><p>{record.label} 已支付 {record.actual_total} 元，当前已不在行程中。确认保留该笔支出后仍计入预算；此操作不办理退票或退款。</p><button disabled={busy || uncertain} onClick={() => action('acknowledge_purchase', { reference_id: record.reference_id })}>确认变更并保留支出</button><button disabled={busy || uncertain} onClick={editPlaces}>返回重新选择</button></div>)}
       </>}
       <p className="guided-note">停留开始时间可在卡片内调整；拖动后按路线耗时重新排时。家、酒店起终点和已选城际交通固定。已知费用来自地图或实际记录，未知费用不计入合计。</p>
-      <div className="guided-actions guided-primary-actions">{editable ? <><button disabled={busy || uncertain} onClick={async () => { if (await action("edit_places")) navigate(`/plans/${encode(planId)}/planning`); }}>返回地点选择</button><button className="primary-button" disabled={busy || uncertain || !audit || (audit.issues || []).some((x) => x.severity === "high")} onClick={async () => { if (await action("confirm")) navigate(`/plans/${encode(planId)}/sheet`); }}>确认并生成行程单</button></> : <Link className="primary-button" to={`/plans/${encode(planId)}/sheet`}>查看行程单</Link>}</div>
+      <div className="guided-actions guided-primary-actions">{editable ? <button className="primary-button" disabled={busy || uncertain || invalidDraft || edits.length > 0 || !audit || (audit.issues || []).some((x) => x.severity === "high")} onClick={async () => { if (await action("confirm")) navigate(`/plans/${encode(planId)}/sheet`); }}>确认并生成行程单</button> : <Link className="primary-button" to={`/plans/${encode(planId)}/sheet`}>查看行程单</Link>}</div>
     </section>
-  </div>;
+  </fieldset></div>;
 }

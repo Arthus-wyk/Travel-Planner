@@ -10,7 +10,9 @@ export function createApi(fetcher = (...args) => fetch(...args)) {
     const timer = setTimeout(() => controller.abort(new DOMException('Timeout', 'TimeoutError')), timeoutMs);
     const writing = request.method && request.method !== 'GET';
     try {
-      const response = await fetcher(apiUrl(path), { ...request, signal: controller.signal, headers: { 'Content-Type': 'application/json', ...request.headers } });
+      const headers = new Headers(request.headers);
+      if (request.body != null && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+      const response = await fetcher(apiUrl(path), { ...request, signal: controller.signal, headers });
       const raw = await response.text();
       let data;
       try { data = JSON.parse(raw); } catch { throw Object.assign(new Error(writing ? `服务返回异常（HTTP ${response.status}），操作结果待核实，请重新读取当前状态。` : `服务返回异常（HTTP ${response.status}），请稍后重试`), { status: response.status, uncertain: Boolean(writing) }); }
