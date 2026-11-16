@@ -10,6 +10,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from service.config import get_env_or_dotenv
 
 
@@ -27,6 +29,7 @@ _DURATION = {"type": "integer", "minimum": 30, "maximum": 600}
 _PLACE_PROPERTIES = {
     "name": {"type": "string", "minLength": 1, "maxLength": 80},
     "category": {"type": "string", "enum": ["attraction", "food", "hotel", "lodging_area", "other"]},
+    "meal_type": {"enum": ["main", "dessert", None]},
     "day": {"anyOf": [_DAY, {"type": "null"}]},
     "duration_minutes": {"anyOf": [_DURATION, {"type": "null"}]},
     "ticket_required": {"type": ["boolean", "null"]},
@@ -53,15 +56,50 @@ class GuideNeedsInput(ValueError):
     pass
 
 
+def split_guide_days(text: str) -> tuple[list[dict], str]:
+    """Keep OCR/pasted lines verbatim and separate explicitly dated sections."""
+    sections = {}
+    day = None
+    digits = "零一二三四五六七八九"
+    for line in text.splitlines():
+        heading = line.lstrip(" \t#>*-")
+        match = re.match(r"(?:第\s*([\d零一二两三四五六七八九十]{1,3})\s*[天日]|(?:day\s*|d)(\d{1,3})(?![\da-z]))", heading, re.I)
+        if match:
+            number = (match[1] or match[2]).replace("两", "二")
+            if number.isdecimal():
+                day = int(number)
+            elif "十" in number:
+                tens, _, ones = number.partition("十")
+                day = None
+                if (tens or "一") in digits[1:] and (ones or "零") in digits and len(tens) <= 1 and len(ones) <= 1:
+                    day = 10 * digits.index(tens or "一") + digits.index(ones or "零")
+            else:
+                day = digits.index(number) if len(number) == 1 and number in digits else None
+            if day is not None and not 1 <= day <= 365:
+                day = None
+        elif re.match(r"(?:备选|备用(?:信息)?|住宿(?:建议|推荐)|通用(?:提示|信息)|行前准备)(?:\s*[:：]|\s*$)", heading):
+            day = None
+        sections.setdefault(day, []).append(line)
+    days = [{"day": day, "text": "\n".join(lines).strip()} for day, lines in sorted(
+        (day, lines) for day, lines in sections.items() if day is not None
+    )]
+    return days, "\n".join(sections.get(None, [])).strip()
+
+
 def recognize_guide(image_bytes: bytes) -> str:
     if not image_bytes or len(image_bytes) > 10 * 1024 * 1024:
         raise ValueError("Guide image must be between 1 byte and 10 MB")
-    try:
-        from rapidocr_onnxruntime import RapidOCR
+    from rapidocr_onnxruntime import RapidOCR
 
-        result, _ = RapidOCR()(image_bytes)
-    except Exception as exc:
-        raise ValueError("Unable to recognize text in this image") from exc
+    for attempt in range(1, 4):
+        try:
+            result, _ = RapidOCR()(image_bytes)
+            break
+        except Exception as exc:
+            if attempt == 3:
+                raise ValueError("Unable to recognize text in this image") from exc
+            from service.utils.request_log import log_error
+            log_error(exc, stage="guide_ocr", attempt=attempt)
     lines = [str(item[1]).strip() for item in result or [] if len(item) >= 2 and str(item[1]).strip()]
     if not lines:
         raise ValueError("No readable text found in this image")
@@ -70,7 +108,11 @@ def recognize_guide(image_bytes: bytes) -> str:
 
 def _skill_prompt() -> str:
     content = SKILL_PATH.read_text(encoding="utf-8")
-    return content.split("---", 2)[-1].strip()
+    return content.split("---", 2)[-1].strip() + (
+        "\n每个地点输出 meal_type。仅 food 根据本次到店上下文分类：午餐、晚餐、简餐等"
+        "用 main，饭后甜品、蛋糕、冰淇淋等加餐用 dessert。咖啡馆如用于吃简餐仍用 main。"
+        "把判断依据保留在 note。语境不足或不是 food 时用 null。"
+    )
 
 
 def _extract_with_model(text: str, feedback: str = "", *, history=()) -> str:
@@ -133,9 +175,16 @@ def analyze_guide(text: str) -> dict[str, Any]:
             history.append((exc.output, feedback))
             logging.getLogger("travel.generation").warning("guide_extraction_invalid attempt=%s reason=%s", attempt, feedback)
             continue
-        except (TimeoutError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException) as exc:
+            if attempt < 3:
+                logging.getLogger("travel.generation").warning("guide_extraction_timeout attempt=%s", attempt)
+                continue
             raise ValueError("攻略提取模型响应超时（180 秒），请检查模型服务状态后重试") from exc
         except Exception as exc:
+            if attempt < 3:
+                from service.utils.request_log import log_error
+                log_error(exc, stage="guide_extraction", attempt=attempt)
+                continue
             raise ValueError("Guide extraction model failed; please retry or check model configuration") from exc
         try:
             return _parse_guide_data(json.loads(raw), text)
@@ -145,7 +194,7 @@ def analyze_guide(text: str) -> dict[str, Any]:
             feedback = str(exc)[:1000]
             history.append((raw, feedback))
             logging.getLogger("travel.generation").warning("guide_extraction_invalid attempt=%s reason=%s", attempt, feedback)
-    raise GuideNeedsInput(f"攻略地点提取连续 3 次校验失败：{feedback}。请手动添加或修正地点后继续规划。")
+    raise GuideNeedsInput(f"攻略地点提取连续 3 次校验失败：{feedback}")
 
 
 def _parse_guide_data(data: Any, text: str) -> dict[str, Any]:
@@ -173,6 +222,9 @@ def _parse_guide_data(data: Any, text: str) -> dict[str, Any]:
         category = item.get("category", "attraction")
         if category not in {"attraction", "food", "hotel", "lodging_area", "other"}:
             raise ValueError("Guide extraction model returned invalid category")
+        meal_type = item.get("meal_type")
+        if meal_type not in ("main", "dessert", None) or (meal_type is not None and category != "food"):
+            raise ValueError("Guide extraction model returned invalid meal type")
         if category == "lodging_area":
             lodging_areas.append({"name": name, "note": note.strip()[:500]})
             continue
@@ -185,6 +237,8 @@ def _parse_guide_data(data: Any, text: str) -> dict[str, Any]:
                        "location_hint": "",
                        "duration_minutes": duration, "ticket_required": ticket,
                        "visit_tips": note.strip()[:500]})
+        if category == "food":
+            places[-1]["meal_type"] = meal_type
     for match in re.finditer(r'(?:优先住|建议住|推荐住|也可以选|也可选)\s*[「“"]([^」”"\n]{2,50})[」”"]', text):
         name = match.group(1).strip()
         if name not in {x["name"] for x in lodging_areas}:

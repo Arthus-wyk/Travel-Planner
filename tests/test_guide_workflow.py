@@ -127,7 +127,7 @@ class GuideWorkflowTests(unittest.TestCase):
 
         client = OpenAICompatibleClient("https://api.siliconflow.cn/v1", "test",
                                         transport=httpx.MockTransport(handler))
-        with patch.dict("os.environ", {"LLM_PROVIDER": "siliconflow", "SILICONFLOW_MODEL": "zai-org/GLM-5.3-Flash"}), patch(
+        with patch.dict("os.environ", {"LLM_PROVIDER": "siliconflow"}), patch("service.utils.model_client.get_model", return_value="zai-org/GLM-5.3-Flash"), patch(
             "service.utils.model_client.create_model_client", return_value=client,
         ):
             self.assertEqual(guide.analyze_guide("攻略")["places"], [])
@@ -153,7 +153,7 @@ class GuideWorkflowTests(unittest.TestCase):
                 }}]}
                 client = OpenAICompatibleClient("https://api.siliconflow.cn/v1", "test",
                                                 transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)))
-                with patch.dict("os.environ", {"LLM_PROVIDER": "siliconflow", "SILICONFLOW_MODEL": "zai-org/GLM-5.3-Flash"}), patch(
+                with patch.dict("os.environ", {"LLM_PROVIDER": "siliconflow"}), patch("service.utils.model_client.get_model", return_value="zai-org/GLM-5.3-Flash"), patch(
                     "service.utils.model_client.create_model_client", return_value=client,
                 ):
                     if accepted:
@@ -240,7 +240,7 @@ class GuideWorkflowTests(unittest.TestCase):
         self.assertEqual(len([x for x in billed if x["reference_id"] == hotel["id"]]), 1)
         self.assertEqual(next(x for x in billed if x["reference_id"] == hotel["id"])["category"], "hotel")
 
-    def test_locating_parsed_places_reuses_confirmed_coordinates_and_handles_ambiguity(self):
+    def test_locating_parsed_places_reuses_confirmed_coordinates_or_first_candidate(self):
         plan = planning.add_manual_activity(prepared(), "西湖")
         item = plan["planning"]["activities"][-1]
         item.update(place=deepcopy(POINT), place_status="manual_confirmed")
@@ -249,10 +249,10 @@ class GuideWorkflowTests(unittest.TestCase):
         search.assert_not_called()
         self.assertEqual(result["planning"]["activities"][-1]["place"], POINT)
         item.pop("place")
-        with patch("service.travel.map_planning.amap_search_places", return_value={"success": True, "places": [POINT, {**POINT, "place_id": "B2"}]}), patch("service.travel.place_matching._chat", return_value=type("Message", (), {"content": '{"candidate_position":2,"reason":"符合线索"}', "tool_calls": []})()):
+        with patch("service.travel.map_planning.amap_search_places", return_value={"success": True, "places": [POINT, {**POINT, "place_id": "B2"}]}):
             result = map_planning.locate_activities(plan)
-        self.assertEqual(result["planning"]["activities"][-1]["place_status"], "model_matched")
-        self.assertEqual(result["planning"]["activities"][-1]["place"]["place_id"], "B2")
+        self.assertEqual(result["planning"]["activities"][-1]["place_status"], "auto_confirmed")
+        self.assertEqual(result["planning"]["activities"][-1]["place"]["place_id"], POINT["place_id"])
 
     def test_auto_location_keeps_coordinates_when_map_image_fails(self):
         plan = planning.add_manual_activity(prepared(), "西湖")

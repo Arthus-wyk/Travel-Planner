@@ -36,7 +36,9 @@ SYSTEM_PROMPT = """你是每日地点排序 Agent，仅按给定 JSON Schema 输
 selected_hotel 只提供住宿锚点参考，每日出发和返回酒店由程序插入，不能把酒店排作活动。
 必去 must 优先。每天的行程以用户攻略原文为首要依据，明确指定的第几天、上午/晚上、
 先后顺序、停留时长和用餐要求优先于距离聚类；未指定的部分再结合已有坐标和 pace 安排。
-food 类安排在适当午晚餐时段，other 类按原文用途安排。
+food 类中 meal_type 为 dessert 的按原文用途和路线安排。其余 food 按正餐安排，
+在不违反攻略明确要求的前提下，每天最多安排两顿正餐，分别使用午餐和晚餐时段。
+other 类按原文用途安排。
 时间或原文要求冲突时仍必须返回覆盖全部输入地点的顺序草稿；由程序审核并显示风险。
 不能因为时间不足输出空 visits 或省略地点。你只输出顺序，不需要保证最终时间完全可行，也不输出解释。
 优先安排必去地点；考虑每日可用时间分配到其他允许的日期，不能通过遗漏地点掩盖容量冲突。
@@ -90,7 +92,7 @@ def _input_snapshot(plan: dict, feedback: list | None) -> tuple[dict, list[dict]
             raise ValueError("行程模型输入 activity_id 缺失或重复")
         ordered.append(item)
         activity = {key: deepcopy(item[key]) for key in (
-            "name", "location", "category", "choice", "duration_minutes", "note", "visit_tips", "day",
+            "name", "location", "category", "choice", "duration_minutes", "note", "visit_tips", "day", "meal_type",
         ) if key in item}
         place = item.get("place") or {}
         activity["position"] = len(ordered)

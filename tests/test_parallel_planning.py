@@ -1,11 +1,9 @@
-import json
 from copy import deepcopy
 from threading import Barrier, Event, Lock
-from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
-from agent.planning_graph import route_agent
+from agent.planning.planning_graph import route_agent
 from service.travel.parallel import ordered_parallel
 from service.travel.place_matching import search_and_match
 from service.utils.request_log import context
@@ -55,8 +53,8 @@ class ParallelPlanningTests(TestCase):
 
         token = context.set({"job_id": "route-job"})
         try:
-            with patch("agent.planning_graph.AMAP_API_KEY", "test"), patch(
-                "agent.planning_graph.amap_compute_route", side_effect=compute
+            with patch("agent.planning.planning_graph.AMAP_API_KEY", "test"), patch(
+                "agent.planning.planning_graph.amap_compute_route", side_effect=compute
             ):
                 routes = route_agent({"plan": plan, "action": "draft", "trace": []})["plan"]["routes"]
         finally:
@@ -64,24 +62,19 @@ class ParallelPlanningTests(TestCase):
         self.assertEqual([(r["origin_item_id"], r["duration_minutes"]) for r in routes], [("A", 30), ("B", 2)])
         self.assertEqual(routes[0]["source"], "provisional_estimate")
         self.assertEqual(routes[1]["travel_mode"], "DRIVE")
-        self.assertCountEqual(calls, [("A", "route-job", "A")] * 3 + [("B", "route-job", "B")] * 3)
+        self.assertCountEqual(calls, [("A", "route-job", "A")] * 6 + [("B", "route-job", "B")] * 3)
 
     def test_place_tasks_overlap_and_merge_aliases_in_activity_order(self):
         second_finished = Event()
         lodging_searched = Event()
         point = {"place_id": "poi", "name": "西湖", "address": "杭州西湖区", "longitude": 120, "latitude": 30}
         plan = {"destination": "杭州", "start_date": "2026-11-06", "end_date": "2026-11-08", "planning": {
-            "activities": [{"id": "a", "name": "西湖", "note": "第一"},
-                           {"id": "b", "name": "西湖", "note": "第二", "choice": "must"}],
+            "activities": [{"id": "a", "name": "西湖", "note": "第一", "day": 2},
+                           {"id": "b", "name": "西湖", "note": "第二", "choice": "must", "day": 1}],
             "guide_constraints": [{"activity_ids": ["b", "a"]}],
             "unscheduled_items": [{"reference_id": "b"}],
             "lodging_areas": [{"name": "湖滨"}],
         }}
-
-        def chat(messages, **kwargs):
-            position = json.loads(messages[1]["content"])["place_position"]
-            return SimpleNamespace(tool_calls=[{"function": {
-                "name": "search_map_places", "arguments": {"place_position": position, "query": "西湖"}}}])
 
         observed = []
 
@@ -97,7 +90,7 @@ class ParallelPlanningTests(TestCase):
             return {"success": True, "places": [point]}
 
         original = deepcopy(plan)
-        with patch("service.travel.place_matching._chat", side_effect=chat), patch(
+        with patch(
             "service.travel.place_matching._search", side_effect=search
         ):
             result = search_and_match(plan)["planning"]
@@ -107,4 +100,14 @@ class ParallelPlanningTests(TestCase):
                          [("a", "第一；第二", "must")])
         self.assertEqual(result["guide_constraints"][0]["activity_ids"], ["a"])
         self.assertEqual(result["unscheduled_items"][0]["reference_id"], "a")
-        self.assertEqual([event["position"] for event in result["place_events"]], [1, 1, 2, 2])
+        self.assertEqual([event["position"] for event in result["place_events"]], [1, 2])
+
+    def test_guide_sections_keep_verbatim_day_text_and_reserve(self):
+        from service.travel.guide import split_guide_days
+
+        text = "住宿推荐：湖滨\n第一天：西湖\n记得预约\n## Day 2 — 灵隐寺\n\n备选：\n下雨去博物馆"
+        self.assertEqual(split_guide_days(text), (
+            [{"day": 1, "text": "第一天：西湖\n记得预约"},
+             {"day": 2, "text": "## Day 2 — 灵隐寺"}],
+            "住宿推荐：湖滨\n备选：\n下雨去博物馆",
+        ))

@@ -16,7 +16,7 @@ export default function PlacePicker({ item, planId, api, busy, onResolve }) {
   async function search(event) {
     event.preventDefault();
     if (busy || searching) return;
-    setSearching(true); setError("");
+    setSearching(true); setError(""); setResults(null);
     try {
       const data = await api(`/api/plans/${encodeURIComponent(planId)}/planning/places/search`, { method: "POST", body: JSON.stringify({ query }) });
       setResults(data.places || []);
@@ -35,7 +35,7 @@ export default function PlacePicker({ item, planId, api, busy, onResolve }) {
       {imageFailed && <button type="button" disabled={busy} onClick={() => { setImageFailed(false); setImageRetry((count) => count + 1); }}>重试地图图片</button>}
       {!item.place.image_cache_key && item.place.place_id && <button type="button" disabled={busy} onClick={() => onResolve(item.place.place_id)}>重新获取地图</button>}</div></div>}
     {item.place_error && <p className="guided-note">{item.place_error}</p>}
-    {status === "ambiguous" && results === null && candidateList(candidates)}
+    {!item.place && results === null && candidates.length > 0 && candidateList(candidates)}
     <details open={!item.place || status === "ambiguous" || status === "failed"}><summary>{item.place ? "手动重新定位" : "搜索 POI，确定具体位置"}</summary>
       <form className="poi-search" onSubmit={search}><input aria-label={`搜索${item.name}的具体位置`} value={query} onChange={(e) => setQuery(e.target.value)} maxLength={100} required disabled={busy || searching} /><button disabled={busy || searching}>{searching ? "搜索中…" : "搜索地点"}</button></form>
       {error && <p className="guided-error" role="alert">{error}</p>}

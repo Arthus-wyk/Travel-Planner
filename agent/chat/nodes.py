@@ -3,15 +3,15 @@
 import json
 from langgraph.runtime import Runtime
 
-from agent import memory
-from agent.compress import compress_messages
-from agent.context import AgentContext
-from agent.executor import ToolExecutor
-from agent.intent import understand
-from agent.prompts import is_empty_execution_promise, public_answer
-from agent.router import select_tools
-from agent.state import AgentState
-from agent.tool_calls import embedded_calls, message_calls, model_tools, normalize_calls
+from agent.chat import memory
+from agent.chat.compress import compress_messages
+from agent.chat.context import AgentContext
+from agent.chat.executor import ToolExecutor
+from agent.chat.intent import understand
+from agent.chat.prompts import is_empty_execution_promise, public_answer
+from agent.chat.router import select_tools
+from agent.chat.state import AgentState
+from agent.chat.tool_calls import embedded_calls, message_calls, model_tools, normalize_calls
 from infrastructure import llm
 from service.travel.tool_verification import verify_tool_result
 from tooling.results import ToolResult

@@ -41,5 +41,5 @@ export default function RouteMap({ data }) {
     }).catch(cause => { if (active) setError(cause.message); });
     return () => { active = false; instance.current = null; map?.destroy(); };
   }, [data, revision]);
-  return <><div ref={container} style={{ height: 440, width: '100%' }} aria-label="可拖动和缩放的路线地图" />{error ? <p role="alert">{error} <button onClick={() => setRevision(value => value + 1)}>重试地图</button></p> : <button type="button" onClick={() => instance.current?.setFitView(null, false, [50, 50, 50, 50], 17)}>显示全程</button>}</>;
+  return <><div ref={container} className="route-map" aria-label="可拖动和缩放的路线地图" /><div className="route-map-actions">{error ? <p role="alert">{error} <button onClick={() => setRevision(value => value + 1)}>重试地图</button></p> : <button type="button" onClick={() => instance.current?.setFitView(null, false, [50, 50, 50, 50], 17)}>显示全程</button>}</div></>;
 }

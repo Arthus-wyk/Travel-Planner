@@ -12,7 +12,7 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-from agent.planning_graph import after_audit, generation_job_id, run_planning_action
+from agent.planning.planning_graph import after_audit, after_itinerary, generation_job_id, run_planning_action
 from service.travel.guide import GuideNeedsInput
 from service.storage import planning_jobs as store
 from service.storage.travel_db import compact_routes
@@ -24,15 +24,13 @@ def next_stage(stage, state):
               "place_match_agent": "default_choices", "default_choices": "prepare_draft",
               "prepare_draft": "itinerary_agent", "route_agent": "schedule_agent", "schedule_agent": "audit_agent"}
     if stage == "itinerary_agent":
-        if state.get("revision_failed"):
-            return "audit_agent"
-        return "itinerary_agent" if state.get("proposal_error") else "route_agent"
+        return after_itinerary(state)
     if stage == "audit_agent":
         return after_audit(state)
     return stages.get(stage, "done")
 
 
-def execute_job(plan_id, job_id, plan, payload):
+def execute_job(plan_id, job_id, plan, payload, *, retry=False):
     logger.info("started plan_id=%s job_id=%s", plan_id, job_id)
     digest = store.fingerprint({"plan": plan, "payload": payload})
     def progress(stage, state):
@@ -45,11 +43,19 @@ def execute_job(plan_id, job_id, plan, payload):
                                                 "schema_version": CHECKPOINT_SCHEMA_VERSION})
         store.update_job(plan_id, job_id, "running", stage)
     try:
+        resume = store.read_checkpoint(plan_id, digest) if retry else None
+        if resume and resume.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+            resume = None
+        if resume:
+            resume["payload"] = payload
+            if resume.get("resume_stage") == "itinerary_agent":
+                resume["format_attempts"] = 0
+            logger.info("resuming plan_id=%s job_id=%s next=%s", plan_id, job_id, resume["resume_stage"])
         store.update_job(plan_id, job_id, "running", "starting")
         token = generation_job_id.set(job_id)
         try:
             outcome = run_planning_action(plan, "generate_from_guide", payload,
-                progress=progress, resume=None)
+                progress=progress, resume=resume)
         finally:
             generation_job_id.reset(token)
         store.commit_result(plan_id, job_id, plan, outcome["plan"])

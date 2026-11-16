@@ -7,7 +7,7 @@ from jsonschema import Draft202012Validator, ValidationError
 from mcp.server.fastmcp import FastMCP
 from tools.catalog import register_all, tool_metadata
 from tooling.mcp import build_registry
-from agent.tool_calls import model_tools
+from agent.chat.tool_calls import model_tools
 from service.validation import VALID_PROFILE_FIELDS
 from service.mcp.server import update_travel_profile
 from unittest.mock import patch

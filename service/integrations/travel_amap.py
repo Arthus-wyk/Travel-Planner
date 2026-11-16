@@ -8,9 +8,13 @@ import math
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 from hashlib import sha256
 from typing import Any
-from time import perf_counter
+from datetime import datetime, timedelta, timezone
+from random import uniform
+from threading import Lock
+from time import monotonic, perf_counter, sleep
 from uuid import uuid4
 from service.utils.request_log import write_event, log_error, body_value
 
@@ -24,18 +28,114 @@ def cache_key(path: str, params: dict) -> str:
     return sha256(json.dumps([path, params], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+QPS_CODES = {"10014", "10015", "10019", "10020", "10021"}
+DAILY_CODES = {"10003", "10044", "10045"}
+# shortcut: cooldown is process-local, share state if multiple workers use the account.
+_cooldowns = {}
+_cooldown_lock = Lock()
+
+
+class AmapRequestError(RuntimeError):
+    def __init__(self, code, info):
+        self.code = str(code)
+        self.info = str(info)
+        reason = "接口请求过于频繁，请稍后重试" if self.code in QPS_CODES | {"10004"} else (
+            "日调用额度已用尽" if self.code in DAILY_CODES else "请求失败")
+        super().__init__(f"高德{reason}（{self.code} {self.info}）")
+
+
+class AmapHttpError(RuntimeError):
+    def __init__(self, status, retry_after):
+        self.status = status
+        self.retry_after = None
+        if status == 429 and retry_after:
+            try:
+                self.retry_after = max(0, int(retry_after))
+            except ValueError:
+                try:
+                    self.retry_after = max(0, (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        super().__init__(f"高德请求失败（HTTP {status}）")
+
+
 def amap_error(exc: Exception) -> dict[str, Any]:
     message = str(exc).replace(AMAP_API_KEY, "[redacted]") if AMAP_API_KEY else str(exc)
+    if isinstance(exc, AmapHttpError):
+        return {"success": False, "message": message, "http_status": exc.status, "retry_after": exc.retry_after}
+    if isinstance(exc, AmapRequestError):
+        return {"success": False, "message": message, "infocode": exc.code}
     return {"success": False, "message": f"Amap API error: {type(exc).__name__}: {message}"}
 
 
-def request_amap(path: str, params: dict, image: bool = False):
+def retry_amap_call(call, *args, **kwargs):
+    for attempt in range(3):
+        retry_after = None
+        try:
+            result = call(*args, **kwargs)
+        except (TimeoutError, ConnectionError):
+            if attempt == 1:
+                raise
+        else:
+            code = result.get("infocode")
+            message = str(result.get("message", "")).lower()
+            status = result.get("http_status")
+            retry_after = result.get("retry_after")
+            transient = status in {429, 500, 502, 503, 504} or code in QPS_CODES | {"10016"} or (not code and any(marker in message for marker in (
+                "timeout", "timed out", "network request failed", "http 429",
+                "http 500", "http 502", "http 503", "http 504",
+            )))
+            last_attempt = 2 if code in QPS_CODES | {"10016"} or status == 429 else 1
+            if result.get("success") or not transient or attempt >= last_attempt or (retry_after or 0) > 2:
+                return result
+        sleep(max(retry_after or 0, (0.5, 1.5)[attempt] + uniform(0, 0.2)))
+
+
+def _wait_for_amap(path):
+    deadline = monotonic() + 2
+    while True:
+        with _cooldown_lock:
+            cooldown = _cooldowns.get(path)
+            if cooldown is None:
+                return
+            until, pace_until, error = cooldown
+            now = monotonic()
+            if now >= pace_until:
+                _cooldowns.pop(path)
+                return
+            if until <= now:
+                _cooldowns[path] = (now + 0.2, pace_until, error)
+                return
+            if until > deadline:
+                raise AmapRequestError(error.code, error.info)
+        sleep(max(0, until - now))
+
+
+def _record_amap_limit(path, error):
+    if error.code in QPS_CODES:
+        delay, pacing = 0.5, 5
+    elif error.code in DAILY_CODES | {"10004"}:
+        now = datetime.now(timezone(timedelta(hours=8)))
+        reset = (now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+                 if error.code == "10004" else
+                 now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+        delay, pacing = (reset - now).total_seconds(), 0
+    else:
+        return
+    with _cooldown_lock:
+        now = monotonic()
+        if now + delay >= _cooldowns.get(path, (0,))[0]:
+            _cooldowns[path] = (now + delay, now + delay + pacing, error)
+
+
+def request_amap(path: str, params: dict, image: bool = False, *, keep_cached: bool = False, refresh: bool = False):
     key = cache_key(path, params)
-    cached = read_map_cache(key)
+    cached = None if refresh else read_map_cache(key, allow_expired=True) if keep_cached else read_map_cache(key)
     if cached is not None:
         return cached
     if not AMAP_API_KEY:
         raise RuntimeError("Set AMAP_API_KEY in .env before using Amap tools.")
+    _wait_for_amap(path)
     url = "https://restapi.amap.com" + path + "?" + urllib.parse.urlencode({**params, "key": AMAP_API_KEY})
     details = {"call_id": uuid4().hex, "method": "GET", "url": "https://restapi.amap.com" + path,
                "direction": "outbound", "params": params}
@@ -53,7 +153,7 @@ def request_amap(path: str, params: dict, image: bool = False):
                   "duration_ms": round((perf_counter() - started) * 1000, 2)}
         write_event("api.responses", result)
         log_error(exc, **result)
-        raise RuntimeError(f"Amap HTTP {exc.code}") from None
+        raise AmapHttpError(exc.code, exc.headers.get("Retry-After") if exc.headers else None) from None
     except Exception as exc:
         log_error(exc, **details)
         if isinstance(exc, urllib.error.URLError):
@@ -72,7 +172,8 @@ def request_amap(path: str, params: dict, image: bool = False):
         if path == "/v3/staticmap":
             logger.error("Amap static map failed: infocode=%s info=%s params=%s url_length=%d",
                          data.get("infocode"), data.get("info"), params, len(url))
-        error = RuntimeError(f"{data.get('infocode')}: {data.get('info', 'Request failed')}")
+        error = AmapRequestError(data.get("infocode"), data.get("info", "Request failed"))
+        _record_amap_limit(path, error)
         log_error(error, **details, body=data)
         raise error
     if image:
@@ -80,9 +181,25 @@ def request_amap(path: str, params: dict, image: bool = False):
     # Empty results may be transient; never persist failures or empty searches.
     route = data.get("route")
     nonempty = route.get("paths", route.get("transits")) if isinstance(route, dict) else data.get("pois", data.get("geocodes", [True]))
-    if nonempty:
+    if nonempty or keep_cached:
         write_map_cache(key, data, 86400 if "/direction/" in path else 30 * 86400)
     return data
+
+
+_photo_locks = tuple(Lock() for _ in range(32))
+
+
+def place_photo_url(poi_id: str) -> str | None:
+    with _photo_locks[hash(poi_id) % len(_photo_locks)]:
+        data = request_amap("/v5/place/detail", {"id": poi_id, "show_fields": "photos"}, keep_cached=True)
+    for poi in data.get("pois") or []:
+        if poi.get("id") != poi_id:
+            continue
+        for photo in poi.get("photos") or []:
+            url = photo.get("url")
+            if isinstance(url, str) and url.startswith("https://"):
+                return url
+    return None
 
 
 def coordinates(value: str) -> str:
@@ -128,6 +245,10 @@ def build_places_payload(query, max_results, language_code, region_code,
         payload = {"keywords": query.strip(), "offset": min(max_results, 20), "extensions": "all"}
         if region_code:
             payload["city"] = region_code
+            city = str(region_code).strip()
+            city_name = city.removesuffix("市") or city
+            if city_name and not city.isdecimal() and not payload["keywords"].startswith(city_name):
+                payload["keywords"] = f"{city} {payload['keywords']}"
         if location_bias_latitude is not None or location_bias_longitude is not None:
             if location_bias_latitude is None or location_bias_longitude is None:
                 raise ValueError("latitude and longitude must be provided together")
@@ -202,7 +323,8 @@ def compute_route(payload: dict) -> list[dict]:
             if not point.get("citycode"):
                 raise ValueError("Could not determine citycode for transit route")
             params[city_key] = point["citycode"]
-    data = request_amap("/v5/direction/" + endpoint, params).get("route") or {}
+    refresh = {"refresh": True} if payload.get("refresh") else {}
+    data = request_amap("/v5/direction/" + endpoint, params, **refresh).get("route") or {}
     paths = data.get("transits" if mode == "TRANSIT" else "paths") or []
     result = []
     for path in paths:

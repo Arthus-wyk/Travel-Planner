@@ -2,7 +2,7 @@ import unittest
 from copy import deepcopy
 from unittest.mock import patch
 
-from agent.itinerary import _validate_proposal
+from agent.planning.itinerary import _validate_proposal
 from service.travel import planning
 from service.travel.itinerary_audit import audit_plan
 from test_guide_workflow import prepared, POINT
@@ -79,10 +79,10 @@ class ReviewAlignmentTests(unittest.TestCase):
         self.assertEqual(result['planning']['guide_constraints'][0]['activity_ids'], ['a'])
 
     def test_invalid_revision_keeps_complete_draft_and_reports_risk(self):
-        from agent.planning_graph import itinerary_agent, after_audit
+        from agent.planning.planning_graph import itinerary_agent, after_audit
         plan = self.visit_plan()
         plan['planning']['generation'] = {'contract_version': 3}
-        with patch('agent.planning_graph.generate_itinerary_proposal', side_effect=ValueError('遗漏地点')):
+        with patch('agent.planning.planning_graph.generate_itinerary_proposal', side_effect=ValueError('遗漏地点')):
             result = itinerary_agent({'plan': plan, 'trace': [], 'format_attempts': 2, 'revision_attempts': 1})
         self.assertTrue(result['revision_failed'])
         self.assertEqual(result['plan']['planning']['generation_issues'][0]['type'], 'revision_failed')
@@ -125,7 +125,7 @@ class ReviewAlignmentTests(unittest.TestCase):
         self.assertEqual(result['lodging_areas'][0]['name'], '龙翔桥/湖滨')
 
     def test_unlocated_constraint_does_not_retry_ordering(self):
-        from agent.planning_graph import after_audit
+        from agent.planning.planning_graph import after_audit
         plan = self.visit_plan()
         plan['planning']['activities'][0].pop('place')
         self.assertEqual(after_audit({'plan': plan, 'action': 'draft', 'revision_attempts': 1,
@@ -150,16 +150,14 @@ class ReviewAlignmentTests(unittest.TestCase):
         pending = planning.move_activity(paid, 'guided-2-a', None)
         self.assertEqual(planning.budget_summary(pending)['estimated_total'], 100)
 
-    def test_map_query_discards_model_timing_prose(self):
-        from types import SimpleNamespace
+    def test_map_query_uses_place_name_without_visit_note(self):
         from service.travel.place_matching import search_and_match
         plan = self.visit_plan()
         item = plan['planning']['activities'][0]
         item.pop('place')
         item['name'] = '西湖'
-        response = SimpleNamespace(content='', tool_calls=[{'function': {'name': 'search_map_places',
-            'arguments': {'place_position': 1, 'query': '傍晚去西湖看日落'}}}])
-        with patch('service.travel.place_matching._chat', return_value=response), patch(
+        item['note'] = '傍晚去西湖看日落'
+        with patch(
             'service.travel.place_matching.amap_search_places', return_value={'success': True, 'places': [POINT]}) as search:
             search_and_match(plan)
         search.assert_called_once_with('西湖', region_code='杭州', max_results=5)

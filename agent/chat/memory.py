@@ -2,8 +2,8 @@
 
 import json
 from typing import Any
-from agent.compress import compress_messages
-from agent.context import AgentContext
+from agent.chat.compress import compress_messages
+from agent.chat.context import AgentContext
 from infrastructure import llm
 from service.storage import memory_store
 

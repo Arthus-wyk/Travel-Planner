@@ -3,11 +3,11 @@
 import asyncio
 from copy import deepcopy
 from service.utils.runtime_log import trace_run
-from agent import memory
-from agent.context import AgentContext
-from agent.graph import build_graph
-from agent.prompts import build_system_prompt
-from agent.state import (
+from agent.chat import memory
+from agent.chat.context import AgentContext
+from agent.chat.graph import build_graph
+from agent.chat.prompts import build_system_prompt
+from agent.chat.state import (
     AgentCancelledError,
     AgentRequest,
     AgentResult,

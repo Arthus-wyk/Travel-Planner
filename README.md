@@ -2,11 +2,11 @@
 
 基于 **LangGraph + 多模型服务 + MCP + MySQL + React** 的旅行规划项目。用户通过自然语言创建或调整旅行，Agent 调用工具保存需求、安排每日活动、搜索地点与酒店、计算交通路线、维护候选推荐和预算，并检查行程是否合理。
 
-提供三种使用入口：命令行对话、React 网页、供 MCP 客户端连接的 stdio 工具服务。
+提供 React 网页和供 MCP 客户端连接的 stdio 工具服务。
 
 ## Agent 执行方式
 
-HTTP 与 CLI 的对话流程均调用 `agent.runner.run_turn(AgentRequest, AgentContext)`，共用一张对话 LangGraph 和一条工具执行链。表单规划由另一张 LangGraph 的主 Agent 协调专业节点。旧 `service/agent/` 及双执行器已移出运行路径，不再使用临时切换环境变量。
+HTTP 对话调用 `agent.chat.runner.run_turn(AgentRequest, AgentContext)`，共用一张对话 LangGraph 和一条工具执行链。表单规划由另一张 LangGraph 的主 Agent 协调专业节点。旧 `service/agent/` 及双执行器已移出运行路径，不再使用临时切换环境变量。
 
 节点顺序：准备记忆 → 理解请求 → 筛选工具 → 模型 → 单个工具 → 结果校验 → 模型 → 公开回复。历史、模型工作上下文和本轮新消息分别管理，压缩不会导致回复漏存。
 
@@ -37,63 +37,21 @@ $env:AMAP_API_KEY = "your-amap-web-service-key"
 
 数据库主机、端口、用户、库名的默认值如上；密码请显式设置为自己的 MySQL 密码。MCP 服务启动时自动创建数据库及 `travel_plans`、`conversations`、`messages` 表，数据库账户需要相应建库、建表权限。
 
-模型配置写在项目根目录 `.env`，CLI 与 HTTP 共用，修改后重启后端。已有 `.env` 请保留原内容；新安装可复制 `.env.example`。
+在网页的攻略生成和行程对话界面，通过“模型”下拉框选择本次使用的模型。默认使用 `deepseek-ai/DeepSeek-V4.1-Flash`，也可选择 `Qwen/Qwen3.5-122B-A10B` 或原有的 `zai-org/GLM-5.3-Flash`。
 
-```dotenv
-LLM_PROVIDER=ollama
-LLM_MODEL=gpt-oss:120b-cloud
-LLM_BASE_URL=https://ollama.com
-LLM_API_KEY=your-ollama-api-key
-```
-
-`LLM_PROVIDER` 支持 `ollama`、`openai`、`deepseek`、`qwen`、`openai-compatible`、`siliconflow`。除 Ollama 外均使用 Chat Completions 兼容协议。行程规划请选支持工具调用和 JSON Schema 结构化输出的模型。
-
-| 服务 | LLM_PROVIDER | LLM_BASE_URL |
-| --- | --- | --- |
-| Ollama Cloud / 本地 | `ollama` | `https://ollama.com` / `http://localhost:11434` |
-| OpenAI | `openai` | `https://api.openai.com/v1` |
-| DeepSeek | `deepseek` | `https://api.deepseek.com` |
-| 通义千问 | `qwen` | 从百炼控制台复制对应地域的 OpenAI 兼容地址，末尾通常为 `/compatible-mode/v1` |
-| 硅基流动 | `siliconflow` | 默认 `https://api.siliconflow.cn/v1`，可用 `SILICONFLOW_BASE_URL` 覆盖 |
-| 其他兼容服务 | `openai-compatible` | 服务商提供的 API 基础地址 |
-
-例如切换 DeepSeek，修改 `.env`：
-
-```dotenv
-LLM_PROVIDER=deepseek
-LLM_MODEL=deepseek-flash
-LLM_BASE_URL=https://api.deepseek.com
-LLM_API_KEY=your-deepseek-api-key
-```
-
-切换到 [硅基流动](https://docs.siliconflow.cn/docs/api/chat-completions-post) 时，保留原来的 `LLM_MODEL`、`LLM_BASE_URL`、`LLM_API_KEY`，并配置：
+在项目根目录的 `.env` 中配置服务地址和密钥。新安装可复制 `.env.example`。
 
 ```dotenv
 LLM_PROVIDER=siliconflow
-SILICONFLOW_MODEL=deepseek-ai/DeepSeek-V4-Flash
 SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
 SILICONFLOW_API_KEY=your-siliconflow-api-key
 ```
 
-在硅基流动内换模型只需修改 `SILICONFLOW_MODEL`。切回原厂商只需改回 `LLM_PROVIDER`，即可恢复原先的 `LLM_*` 配置。
-
-地址填写基础路径，不要追加 `/chat/completions`。通义的密钥和地址须属于同一地域。协议与地址参考 [DeepSeek 文档](https://api-docs.deepseek.com/) 和 [通义文档](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope)。
-
-相同变量名的系统环境变量优先于 `.env`。CLI 和 HTTP 入口均从环境配置读取模型参数，不接受 `--model`。`LLM_PROVIDER` 必填。硅基流动必须填写 `SILICONFLOW_MODEL` 和 `SILICONFLOW_API_KEY`；其他厂商必须填写 `LLM_MODEL` 和 `LLM_BASE_URL`，兼容 OpenAI 的厂商还需要 `LLM_API_KEY`。修改后重启后端。`.env` 已被 Git 忽略，请勿提交真实密钥。
+部署时请确认所配置的服务支持所选模型 ID、工具调用和结构化输出。其他已支持的服务可继续使用原来的 `LLM_PROVIDER`、`LLM_BASE_URL` 和 `LLM_API_KEY`。已有的 `LLM_MODEL` 和 `SILICONFLOW_MODEL` 可从 `.env` 删除。
 
 地图功能使用高德 Web 服务 API：POI 搜索、地理编码、静态地图和路径规划。项目根目录 `.env` 已预留 `AMAP_API_KEY=`，填入高德开放平台申请的 **Web 服务类型 Key** 后重启服务；环境变量优先于 `.env`。`AMAP_TIMEOUT_SECONDS=10` 可在 `.env` 中调整请求超时。服务端密钥不应配置到前端。
 
 ### 3. 选择入口
-
-**命令行对话**：
-
-```powershell
-uv run python client.py
-# 指定日志会话标识（模型在 .env 中配置）
-uv run python client.py --session-id demo-trip
-```
-
-输入 `exit` / `quit` 退出，输入 `/usage` 查看本地日志统计。`--session-id` 用于复用日志标识，不会自动恢复此前的命令行聊天上下文。
 
 **网页端**：在已配置环境变量的窗口启动 HTTP API，另开窗口启动前端。
 
@@ -109,9 +67,9 @@ npm ci
 npm run dev
 ```
 
-后端默认地址为 `http://127.0.0.1:8787`；打开 Vite 输出的网页地址（通常为 `http://127.0.0.1:5173`），点击“新建行程”填写目的地、出发地、出发日期、旅行天数、人数和预算，返回日期会自动计算。随后选择飞机／火车与酒店候选，上传攻略图片识别文字或手动添加地点，选择活动后生成逐日路线并查看审核。审核页可拖动景点调整当天顺序或移至其他天，并修改游玩时长、门票信息与注意事项；保存后重新计算路线和预算，家／酒店及交通锚点保持固定。审核通过后可打开行程单、打印或保存为 PDF，并记录机酒和门票的已购买状态与实际总价。已有行程仍可在详情页创建关联对话继续修改；聊天框支持 Ctrl+Enter / Cmd+Enter 发送。
+后端默认地址为 `http://127.0.0.1:8787`；打开 Vite 输出的网页地址（通常为 `http://127.0.0.1:5173`），点击“新建行程”填写目的地、出发地、出发日期、旅行天数、人数和预算，返回日期会自动计算。随后选择往返交通，上传攻略图片或粘贴文字，由 Agent 识别地点、匹配地图位置、安排住宿并生成逐日路线。审核页可拖动景点调整当天顺序或移至其他天，并修改游玩时长、门票信息与注意事项；审核修改保留在页面内，切换日期时仍可继续编辑。可调整每日出发时间并预览到达时刻，点击“保存所有修改”后更新路线和预算。车次及航班按固定时刻保留。审核通过后可打开行程单、打印或保存为 PDF，并记录机酒和门票的已购买状态与实际总价。已有行程仍可在详情页创建关联对话继续修改；聊天框支持 Ctrl+Enter / Cmd+Enter 发送。
 
-飞机、火车和大巴候选班次时间仅用于规划，价格未知，不计入已知费用。酒店每晚房价与景点门票没有可靠报价时也保持未知。新向导统一使用人民币；高德 POI 返回的饭店人均消费、选中路线的公交或打车费用，以及用户记录的实际支出会计入已知费用，未知项在审核页提示。酒店和活动地点优先使用高德 POI 候选；没有地图密钥或查询失败时，酒店显示待定位方案，活动提供默认不选的主题建议。攻略图片先通过本机 RapidOCR 识别文字，再由已配置的模型按 [攻略识别 skill](.agents/skills/guide-recognition/SKILL.md) 提取地点和提示；原图不保存，文字与地点会显示供用户核对。模型不可用时提取操作会明确失败。地点间路线在地图服务可用时比较步行、公交和驾车的预计时长，否则按临时通勤估算并在审核中提示。高严重程度问题会阻止确认行程。
+飞机、火车和大巴候选班次时间仅用于规划，价格未知，不计入已知费用。酒店每晚房价与景点门票没有可靠报价时也保持未知。新向导统一使用人民币；高德 POI 返回的饭店人均消费、选中路线的公交或打车费用，以及用户记录的实际支出会计入已知费用，未知项在审核页提示。酒店和活动地点优先使用高德 POI 候选；没有地图密钥或查询失败时，酒店显示待定位方案，活动提供默认不选的主题建议。攻略图片先通过本机 RapidOCR 识别文字，再由已配置的模型按 [攻略识别 skill](.agents/skills/guide-recognition/SKILL.md) 提取地点和提示；原图不保存，文字与地点会显示供用户核对。模型不可用时提取操作会明确失败。地点间路线在地图服务可用时比较步行、公交和驾车的预计时长，否则按临时通勤估算并在审核中提示。路线审核提示会随日期或行程节点显示，预算等全程提示显示在审核页顶部。可带着审核提示确认并生成行程单。
 
 后端地址改变时，在启动前端前设置 `VITE_API_BASE`：
 
@@ -141,7 +99,7 @@ uv run python server.py
 }
 ```
 
-项目还声明了 `travel-agent`、`travel-mcp`、`travel-api` 三个脚本入口；上面的 Python 文件命令可直接用于当前仓库。
+项目还声明了 `travel-mcp` 和 `travel-api` 两个脚本入口；上面的 Python 文件命令可直接用于当前仓库。
 
 ## 重点模块：做什么、亮点与使用方式
 
@@ -155,7 +113,7 @@ uv run python server.py
 
 代码：[agent/intent.py](agent/intent.py)、[agent/prompts.py](agent/prompts.py)、[agent/router.py](agent/router.py)。
 
-当前计划由调用方明确提供，不从系统提示反向猜测；规则提取目标、领域和槽位，模糊指代交给拥有完整历史的模型。意图不生成第二套执行流程。HTTP 和 CLI 使用相同路由，专业 Agent 可通过 `allowed_tools` 限制能力。
+当前计划由调用方明确提供，不从系统提示反向猜测；规则提取目标、领域和槽位，模糊指代交给拥有完整历史的模型。意图不生成第二套执行流程。专业 Agent 可通过 `allowed_tools` 限制能力。
 
 ### 3. 旅行计划与需求管理
 
@@ -241,21 +199,16 @@ uv run python server.py
 
 | HTTP 接口 | 用途 |
 | --- | --- |
-| `GET /api/health` | 查看服务状态与模型配置 |
+| `GET /api/health` | 查看服务状态与默认模型 |
+| `GET /api/models` | 获取可选模型和默认模型 |
 | `GET /api/plans`、`GET /api/plans/{plan_id}` | 查看计划列表、详情 |
 | `GET /api/conversations`、`GET /api/plans/{plan_id}/conversations` | 查看全部或某个计划的对话 |
 | `GET /api/conversations/{conversation_id}` | 查看对话信息 |
 | `GET /api/conversations/{conversation_id}/messages` | 查看对话消息 |
 | `POST /api/conversations` | 创建对话，可传入 `plan_id` |
 | `POST /api/conversations/{conversation_id}/messages` | 发送消息并运行 Agent |
-| `POST /api/chat` | 通用聊天入口 |
 
-例如在 PowerShell 中发送首次请求，后续传入返回的 `conversation_id` 继续对话：
-
-```powershell
-$body = @{ message = "创建杭州三日游，2026-11-06 到 2026-11-08，两人预算3000元" } | ConvertTo-Json
-Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/chat" -Method Post -ContentType "application/json; charset=utf-8" -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
-```
+先创建会话并取得 `conversation_id`，再通过对应的消息接口发送内容。
 
 ### 11. 请求重试、上下文压缩与结果验证
 
@@ -282,11 +235,11 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/chat" -Method Post -ContentTyp
 
 请求与响应使用相同 `call_id`；可用 `request_id`、`job_id`、`plan_id`、`stage` 或对话 `run_id` 关联上游任务。密钥、认证头和 Cookie 脱敏。入站 HTTP 和 WebSocket 默认记录正文大小等元数据。设置 `TRAVEL_LOG_HTTP_BODY=1` 可额外记录不超过 16 KiB 的正文。HTTP 请求体只观察应用实际读取的内容，提前拒绝或未读取的请求会标记 `body_complete=false`。模型和地图调用仍记录诊断正文，流式模型响应在结束或中断后写入。这些日志每个文件 20 MB 轮转、保留 5 份备份。日志含旅行信息，请妥善保管。
 
-行程排序会将同一份 JSON Schema 同时发送到系统消息和结构化输出参数，仍严格检查每个地点恰好安排一次。用户重新启动失败任务时，保留已完成步骤、反馈及审核修订状态，但为行程格式校验重新提供最多 3 次模型调用。
+行程排序会将同一份 JSON Schema 同时发送到系统消息和结构化输出参数，仍严格检查每个地点恰好安排一次。点击“重试生成”时，若行程、输入和检查点版本匹配，则恢复已完成步骤、反馈及审核修订状态，并为行程格式校验重新提供最多 3 次模型调用。点击“重新生成”会从头开始。
 
 前端侧栏的“运行日志”（`/logs`）可按会话 ID、生成任务编号、运行状态和 UTC 日期筛选。对话页可查看当前会话的日志，新消息下的“查看本次运行日志”可直接定位某次回答；攻略生成页的“查看本次生成日志”可定位当前任务。选择运行后，时间线展示实际模型请求上下文与工具定义、模型响应、重试错误、工具参数与结果、意图分析和最终状态；展开事件可查看完整 JSON，顶部汇总耗时和模型 Token。行程生成任务按 `job_id` 聚合项目 `logs/` 中的阶段进度、模型请求与响应、地图/API 请求与响应及异常堆栈，兼容已有历史文件；仅使用顶层任务编号归属，避免混入其他任务或页面查询。点击“刷新”读取最新进度；无结束事件的运行会显示“运行中 / 未收尾”。
 
-每次 HTTP 或 CLI Agent 任务生成独立 `run_id`，HTTP 响应和持久化消息的 metadata 同时保存该 ID。连接失败、执行异常和取消会记录结束状态及异常堆栈。日志继续保存为现有项目目录下的 JSONL，API 遥测也会同步到运行时间线；未含运行 ID 的旧日志按会话合并展示，不能补回旧请求的上下文。
+每次 HTTP 聊天任务生成独立 `run_id`，HTTP 响应和持久化消息的 metadata 同时保存该 ID。连接失败、执行异常和取消会记录结束状态及异常堆栈。日志继续保存为现有项目目录下的 JSONL，API 遥测也会同步到运行时间线；未含运行 ID 的旧日志按会话合并展示，不能补回旧请求的上下文。
 
 展开地图/API 日志可分别查看“请求参数”和“响应内容”；展开模型日志可分别查看“Prompt（模型输入）”“模型请求参数”和“模型输出”（含工具调用）。响应条目通过 `call_id` 或 `requestId` 关联对应请求，方便直接对照；缺失请求时会明确提示无法还原。完整元数据保留在“原始日志 JSON”中。
 
@@ -294,11 +247,9 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/chat" -Method Post -ContentTyp
 
 日志会保存模型可见的对话、记忆和工具结果。写入及读取时会脱敏常见凭据字段、Bearer/Basic 认证值和文本中的密钥赋值，但不替代个人信息清理；请保护本地日志文件。完整请求上下文会增加磁盘占用，目前不自动轮转或删除。
 
-代码：[service/utils/transcript_log.py](service/utils/transcript_log.py)、[service/utils/api_telemetry.py](service/utils/api_telemetry.py)、[service/utils/usage_stats.py](service/utils/usage_stats.py)、[service/utils/log_paths.py](service/utils/log_paths.py)。
+代码：[service/utils/transcript_log.py](service/utils/transcript_log.py)、[service/utils/api_telemetry.py](service/utils/api_telemetry.py)、[service/utils/log_paths.py](service/utils/log_paths.py)。
 
 - **做什么**：记录对话、意图、工具调用与结果，另行记录模型请求耗时、重试、错误及可用的 token 用量。
-- **亮点**：对话过程和 API 诊断分开记录；`/usage` 扫描会话日志并使用缓存生成统计，便于排查调用问题。
-- **怎么用**：运行命令行时查看打印的 `Transcript` 路径；输入 `/usage` 查看统计。日志默认根目录为用户目录的 `.claude`，设置 `TASK_PROGRESS_LOG_HOME` 可调整位置。统计反映本地记录，不等同于云端账单。
 
 ## MCP 工具一览
 
@@ -326,7 +277,7 @@ agent/                         # 唯一执行核心
   memory.py / compress.py      # 记忆策略 / 压缩规则
   tool_calls.py                # 模型工具调用和重试关联解析
 service/
-  chat.py / cli.py             # HTTP 聊天用例 / 命令行交互
+  chat.py                      # HTTP 聊天用例
   api/                         # HTTP 路由、JSON、状态码
   travel/                      # 行程审计、推荐排序、领域校验
   storage/                     # MySQL、Markdown、JSONL 存储
@@ -352,7 +303,7 @@ uv run python -m unittest discover -s tests -v
 测试覆盖时间排序与冲突、删除/移动后的路线处理、协调与审计、空洞执行承诺护栏、工具注册及策略检查。它们不能代替 MySQL、Ollama 和 高德地图 的真实服务联调。
 # 攻略直接生成每日行程
 
-选择往返交通后，在规划页上传攻略图片或粘贴文字，点击“生成每日行程”。系统通过模型的真实地图工具调用查找地点；多候选由模型结合地图类别和攻略语境选择，ID 和坐标由服务端绑定。生成完成后直接打开每日行程草稿，未定位地点可在结果页修正或移除，再重新生成。
+选择往返交通后，在规划页上传攻略图片或粘贴文字，点击“生成每日行程”。系统将攻略分为每日原文和备用信息，然后按天并行查找景点，同时查找住宿。未指定日期的地点在备用组中查找，供排序时使用。地点匹配按高德返回顺序选用首个城市、类别与坐标均有效的候选。生成后直接打开每日行程草稿，切换日期可查看当天的攻略原文。没有可靠匹配时，可在攻略里补充地名或区县后重新生成。
 
 生成接口为 `POST /api/plans/{plan_id}/generation`，状态查询为同路径 GET。任务保存在 MySQL `planning_jobs` 表，重复提交进行中的相同输入不会启动第二个任务；提交结果时校验原计划，编辑过的计划不会被旧生成结果覆盖。
 

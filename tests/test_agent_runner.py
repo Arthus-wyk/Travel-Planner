@@ -5,9 +5,9 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from agent.context import AgentContext
-from agent.runner import run_turn
-from agent.state import AgentCancelledError, AgentRequest
+from agent.chat.context import AgentContext
+from agent.chat.runner import run_turn
+from agent.chat.state import AgentCancelledError, AgentRequest
 from tooling.registry import ToolRegistry
 from tooling.spec import ToolSpec
 
@@ -393,7 +393,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_forget_policy_does_not_read_or_write_memory(self):
         with (
             patch("service.storage.memory_store.read_preference_profile") as read,
-            patch("agent.memory.extract_and_store", new_callable=AsyncMock) as write,
+            patch("agent.chat.memory.extract_and_store", new_callable=AsyncMock) as write,
         ):
             client = SimpleNamespace(
                 chat=AsyncMock(

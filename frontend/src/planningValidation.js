@@ -15,7 +15,7 @@ export function activityIssues(plan, edits) {
   const items = plan.planning?.activities || [];
   const issues = [];
   const hotel = items.find(x => x.id === snapshot.selected_hotel && (snapshot.categories[x.id] ?? x.category) === 'hotel');
-  if (plan.end_date !== plan.start_date && !hotel) issues.push({ code: 'hotel_required', message: '请选择一家住宿酒店', targetId: 'category-hotel', blocking: true });
+  if (plan.end_date !== plan.start_date && !hotel && !plan.planning?.guide_auto) issues.push({ code: 'hotel_required', message: '请选择一家住宿酒店', targetId: 'category-hotel', blocking: true });
   for (const item of items) {
     const category = snapshot.categories[item.id] ?? item.category;
     const choice = snapshot.choices[item.id] ?? item.choice ?? 'optional';
@@ -43,11 +43,12 @@ export function transportIssues(selection, driving, vehicles, departures) {
 export function focusIssue(targetId, field) {
   const target = document.getElementById(targetId);
   if (!target) return;
-  for (let node = target; node; node = node.parentElement) {
+  const input = (field && [...target.querySelectorAll('input,select,textarea')].find(
+    element => element.name === field || element.dataset.field === field
+  )) || target.querySelector('input,select,textarea,button') || target;
+  for (let node = input; node; node = node.parentElement) {
     if (node.tagName === 'DETAILS') node.open = true;
   }
-  target.querySelectorAll('details').forEach(node => { node.open = true; });
-  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  const input = (field && target.querySelector(`[data-field="${field}"]`)) || target.querySelector('input,select,textarea,button') || target;
+  input.scrollIntoView({ behavior: 'smooth', block: 'center' });
   input.focus({ preventScroll: true });
 }

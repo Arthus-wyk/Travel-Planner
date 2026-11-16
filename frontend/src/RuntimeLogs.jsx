@@ -163,7 +163,7 @@ export default function RuntimeLogs({ api }) {
   });
 
   return <div className="logs-page">
-    <header className="page-header"><Activity size={24} /><h1>运行日志</h1><button className="log-refresh" onClick={() => setRevision((value) => value + 1)} disabled={loading || detailLoading}><RefreshCw size={16} />刷新</button></header>
+    <header className="page-header"><h1>运行日志</h1><button className="secondary-button" onClick={() => setRevision((value) => value + 1)} disabled={loading || detailLoading}><RefreshCw size={16} aria-hidden="true" />刷新</button></header>
     <p className="logs-intro">查看对话与行程生成的阶段进度、模型上下文、地图调用和异常堆栈。日志包含旅行及对话内容，仅供本机诊断。</p>
     {conversationId && <Link className="back-link" to={`/conversations/${encodeURIComponent(conversationId)}`}><ArrowLeft size={15} /> 返回对话</Link>}
     <form key={query} className="log-filters" onSubmit={applyFilters}>
@@ -179,9 +179,9 @@ export default function RuntimeLogs({ api }) {
     <div className="logs-layout">
       <section className="log-run-list" aria-label="运行列表"><div className="log-list-heading"><strong>运行记录</strong><span>{pagination.total} 次</span></div>
         {!error && pagination.page_count > 1 && <nav className="log-pagination" aria-label="运行记录分页">
-          <button type="button" className="log-refresh" disabled={loading || pagination.page <= 1} onClick={() => changePage(pagination.page - 1)}>上一页</button>
+          <button type="button" className="secondary-button" disabled={loading || pagination.page <= 1} onClick={() => changePage(pagination.page - 1)}>上一页</button>
           <span aria-live="polite">{pagination.page} / {pagination.page_count}</span>
-          <button type="button" className="log-refresh" disabled={loading || pagination.page >= pagination.page_count} onClick={() => changePage(pagination.page + 1)}>下一页</button>
+          <button type="button" className="secondary-button" disabled={loading || pagination.page >= pagination.page_count} onClick={() => changePage(pagination.page + 1)}>下一页</button>
         </nav>}
         {loading ? <p className="empty-state">正在加载…</p> : !runs.length ? <p className="empty-state">暂无匹配的运行日志。生成行程或发送消息后刷新。</p> : runs.map((run) => <button key={run.runId} className={`log-run ${selectedId === run.runId ? "selected" : ""}`} onClick={() => selectRun(run.runId)}>
           <span className="log-run-top"><span className={`log-status ${run.status}`}>{statuses[run.status] || run.status}</span><time>{dateTime(run.startedAt)}</time></span>

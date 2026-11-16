@@ -1,9 +1,9 @@
 import unittest
-from agent.intent import understand
-from agent.prompts import is_empty_execution_promise
-from agent.tool_calls import embedded_calls
+from agent.chat.intent import understand
+from agent.chat.prompts import is_empty_execution_promise
+from agent.chat.tool_calls import embedded_calls
 from service.chat import public_message_items
-from agent.router import select_tools
+from agent.chat.router import select_tools
 from tooling.registry import ToolRegistry
 from tooling.spec import ToolSpec
 

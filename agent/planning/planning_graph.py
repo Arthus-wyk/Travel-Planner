@@ -16,20 +16,27 @@ import logging
 from math import isfinite
 from typing import Any, TypedDict
 
+from jsonschema import ValidationError
 from langgraph.graph import END, START, StateGraph
-from agent.itinerary import ItineraryInputError, ItineraryOutputError, generate_itinerary_proposal
+from langgraph.types import RetryPolicy, default_retry_on
+from agent.planning.itinerary import ItineraryInputError, ItineraryOutputError, generate_itinerary_proposal
+from agent.planning.planning_contracts import NODE_OUTPUT_VALIDATORS
 
 from service.config import AMAP_API_KEY
+from service.utils.model_client import get_model, selected_model, validate_model
+from service.integrations.travel_amap import retry_amap_call
 from service.mcp.server import amap_compute_route, amap_search_hotels, amap_search_places
 from service.travel.guide import GuideNeedsInput, recognize_guide
 from service.travel.place_matching import search_and_match
 from service.travel.parallel import ordered_parallel
-from service.travel.itinerary_audit import audit_plan
+from service.travel.itinerary_audit import audit_plan, is_main_meal, meal_types
+from service.travel.reorder import optimize_itinerary
 from service.travel.planning import (
     add_manual_activity, build_activities, build_candidates, draft_itinerary,
     move_activity, record_purchase, select_activities, select_candidates,
     update_activity_details,
     update_route_mode, apply_route_times, schedule_itinerary, update_transport_stops,
+    schedule_review, update_day_departure, edit_review_place, complete_review_lodging, MOVABLE_CATEGORIES,
     build_hotel_activities, _selected, _positive_money,
 )
 from service.travel.map_planning import resolve_activity_place, locate_activities, has_coordinates
@@ -54,12 +61,14 @@ class PlanningState(TypedDict, total=False):
     itinerary_retry_history: list[tuple[str | None, str]]
     input_hash: str
     forced_unscheduled: list
+    optimization_message: str
+    optimization_applied: bool
 
 
 def _hotel_places(plan: dict[str, Any]) -> list[dict]:
     if not AMAP_API_KEY:
         return []
-    result = amap_search_hotels(plan["destination"], max_results=3)
+    result = retry_amap_call(amap_search_hotels, plan["destination"], max_results=3)
     return result.get("places", []) if result.get("success") else []
 
 
@@ -67,7 +76,7 @@ def _activity_places(plan: dict[str, Any]) -> list[dict]:
     places = []
     if AMAP_API_KEY:
         for interest in (plan.get("interests") or ["景点"])[:3]:
-            result = amap_search_places(f"{plan['destination']} {interest}", max_results=3)
+            result = retry_amap_call(amap_search_places, f"{plan['destination']} {interest}", max_results=3)
             if result.get("success"):
                 places.extend(result.get("places", []))
     if not places:
@@ -81,28 +90,53 @@ def _activity_places(plan: dict[str, Any]) -> list[dict]:
 def coordinator(state: PlanningState) -> dict:
     """入口节点：校验用户操作并更新计划基础数据，交由路由函数选择后续节点。"""
     action, payload, plan = state["action"], state.get("payload") or {}, state["plan"]
-    if action in {"add_activity", "resolve_place", "candidates"} and "choices" in payload:
+    planning = plan.get("planning") or {}
+    defaults = {"stage": "requirements", "activities": [], "hotel_candidates": [],
+                "transport_candidates": [], "selected_transport": {}}
+    if not defaults.keys() <= planning.keys():
+        plan = {**plan, "planning": {**defaults, **planning}}
+    if (action in {"add_activity", "resolve_place", "candidates"} and "choices" in payload
+            or action == "candidates" and "text" in payload):
         plan = _save_choices(plan, payload)
     if action == 'review_changes':
         operations = payload.get('operations')
         if plan.get('planning', {}).get('stage') != 'review' or not isinstance(operations, list) or not 1 <= len(operations) <= 1000:
             raise ValueError('行程修改格式无效，请在审核阶段保存')
+        if "day_departures" not in plan["planning"]:
+            departures = {}
+            for item in plan["itinerary"]:
+                if item.get("anchor_role") == "start" or item["category"] in MOVABLE_CATEGORIES:
+                    departures.setdefault(str(item["day"]), item["time_of_day"])
+            plan = {**plan, "planning": {**plan["planning"], "day_departures": departures}}
         original_items = {x['item_id']: x for x in plan.get('itinerary', []) + plan.get('planning', {}).get('unscheduled_items', [])}
         def current_id(item_id):
-            original = original_items.get(item_id)
-            if not original:
+            if not isinstance(item_id, str):
                 raise ValueError('修改引用了无效地点')
-            return next((x['item_id'] for x in plan['itinerary'] + plan['planning'].get('unscheduled_items', [])
-                         if x.get('reference_id') == original.get('reference_id') and x.get('anchor_role') == original.get('anchor_role')
-                         and x.get('category') == original.get('category')), item_id)
+            items = plan['itinerary'] + plan['planning'].get('unscheduled_items', [])
+            if any(x['item_id'] == item_id for x in items):
+                return item_id
+            original = original_items.get(item_id)
+            if not original or original["category"] not in MOVABLE_CATEGORIES:
+                raise ValueError('修改引用了无效地点')
+            return next((x['item_id'] for x in items if x.get('reference_id') == original['reference_id']
+                         and x['category'] == original['category']), item_id)
         for operation in operations:
-            if not isinstance(operation, dict) or operation.get('action') not in {'move_activity', 'update_activity', 'route_mode', 'transport_stops', 'update_budget', 'acknowledge_purchase'} or not isinstance(operation.get('payload'), dict):
+            if not isinstance(operation, dict) or operation.get('action') not in {'move_activity', 'update_activity', 'route_mode', 'transport_stops', 'update_budget', 'acknowledge_purchase', 'day_departure', 'review_place', 'complete_lodging'} or not isinstance(operation.get('payload'), dict):
                 raise ValueError('不支持的行程修改')
             values = deepcopy(operation['payload'])
             for key in ('item_id', 'before_item_id', 'origin_item_id', 'destination_item_id'):
                 if values.get(key):
                     values[key] = current_id(values[key])
-            plan = coordinator({'plan': plan, 'action': operation['action'], 'payload': values})['plan']
+            name = operation['action']
+            if name == 'review_place':
+                plan = edit_review_place(plan, values)
+            elif name == 'complete_lodging':
+                plan = complete_review_lodging(plan, values.get('activity_id'))
+            else:
+                plan = coordinator({'plan': plan, 'action': name, 'payload': values})['plan']
+            if name == 'review_place' and not values.get('replace'):
+                original_items.update((x['item_id'], x) for x in plan['itinerary']
+                                      if x.get('reference_id') == values['activity_id'])
     elif action == "choose_candidates":
         plan = select_candidates(plan, payload)
     elif action == "choose_activities":
@@ -125,6 +159,8 @@ def coordinator(state: PlanningState) -> dict:
         plan = update_route_mode(plan, payload.get("origin_item_id"), payload.get("destination_item_id"), payload.get("travel_mode"))
     elif action == "transport_stops":
         plan = update_transport_stops(plan, payload.get("item_id"), payload.get("departure_location"), payload.get("arrival_location"))
+    elif action == "day_departure":
+        plan = update_day_departure(plan, payload.get("day"), payload.get("time"))
     elif action == "resolve_place":
         if plan.get("planning", {}).get("stage") not in {"activities", "review"}:
             raise ValueError("Return to place selection before changing a POI")
@@ -156,6 +192,9 @@ def coordinator(state: PlanningState) -> dict:
         if record is None:
             raise ValueError("未找到购买记录")
         record["change_acknowledged"] = True
+    elif action == "optimize_routes":
+        if plan["planning"]["stage"] != "review":
+            raise ValueError("请在路线审核时重排行程")
     elif action == "recalculate_routes":
         if plan.get("planning", {}).get("stage") != "review":
             raise ValueError("请在路线审核时重新计算路线")
@@ -166,7 +205,8 @@ def coordinator(state: PlanningState) -> dict:
             by_day.setdefault(item["day"], []).append(item)
         routes = []
         for items in by_day.values():
-            items.sort(key=lambda x: x["time_of_day"])
+            if "day_departures" not in plan["planning"]:
+                items.sort(key=lambda x: x["time_of_day"])
             for origin, destination in zip(items, items[1:]):
                 pair = (origin["item_id"], destination["item_id"])
                 routes.append({**old.get(pair, {}), "origin_item_id": pair[0], "destination_item_id": pair[1],
@@ -175,12 +215,16 @@ def coordinator(state: PlanningState) -> dict:
                                "travel_mode": old.get(pair, {}).get("travel_mode", "TRANSIT"),
                                "source": "provisional_estimate", "legs": []})
                 routes[-1].pop("fare", None)
-                routes[-1].pop("mode_locked", None)
         plan["routes"] = routes
     elif action not in {"candidates", "guide", "activities", "draft", "generate_from_guide", "confirm"}:
         raise ValueError("Unknown planning action")
-    if action in {"guide", "activities", "draft", "generate_from_guide", "confirm"} and not (plan.get("planning") or {}).get("selected_transport"):
-        raise ValueError("请先选择往返交通")
+    if action in {"guide", "activities", "draft", "generate_from_guide", "confirm"}:
+        planning = plan.get("planning") or {}
+        transport = planning.get("selected_transport") or {}
+        candidates = {(item.get("direction"), item.get("id")) for item in planning.get("transport_candidates", [])}
+        if any(not transport.get(direction) or (direction, transport[direction]) not in candidates
+               for direction in ("outbound", "return")):
+            raise ValueError("请先选择往返交通")
     if action in {"guide", "activities", "draft", "generate_from_guide"}:
         plan = _save_choices(plan, payload)
     return {"plan": plan, "trace": ["coordinator"]}
@@ -198,6 +242,10 @@ def _save_choices(plan: dict, payload: dict) -> dict:
 
 
 def after_coordinator(state: PlanningState) -> str:
+    if (state["action"] == "review_changes" and state["plan"]["planning"].get("optimized_timetable")
+            and all(operation["action"] in {"update_budget", "acknowledge_purchase"}
+                    for operation in state["payload"]["operations"])):
+        return "audit_agent"
     return {
         "candidates": "transport_agent", "guide": "guide_agent",
         "activities": "activity_agent", "choose_candidates": "hotel_agent",
@@ -206,7 +254,9 @@ def after_coordinator(state: PlanningState) -> str:
         "resolve_place": "audit_agent" if state["plan"]["planning"]["stage"] == "review" else "done",
         "confirm": "audit_agent", "purchase": "audit_agent",
         "move_activity": "route_agent", "update_activity": "route_agent", "route_mode": "route_agent", "route_modes": "route_agent", "transport_stops": "route_agent",
-        "update_budget": "audit_agent", "acknowledge_purchase": "audit_agent", "recalculate_routes": "route_agent", 'review_changes': 'route_agent',
+        "update_budget": "audit_agent", "acknowledge_purchase": "audit_agent", "recalculate_routes": "route_agent",
+        "optimize_routes": "route_agent", 'review_changes': 'route_agent',
+        "day_departure": "schedule_agent",
     }.get(state["action"], "done")
 
 
@@ -269,14 +319,15 @@ def prepare_draft(state: PlanningState) -> dict:
         if item.get("choice") == "exclude" or item.get("category") == "hotel":
             continue
         if item["id"] in pending_ids or not has_coordinates(item.get("place")):
-            forced.append({"activity_id": item["id"], "reason": "位置尚未确认，暂不安排"})
+            forced.append({"activity_id": item["id"], "reason": item.get("place_error") or "位置尚未确认，暂不安排"})
     snapshot = {key: plan.get(key) for key in ("destination", "departure_city", "start_date", "end_date", "travelers", "budget", "pace", "interests", "constraints")}
     snapshot["planning"] = {key: value for key, value in plan["planning"].items() if key not in {"generation", "stage", "unscheduled_items", "unplaced_activities", "needs_replan"}}
     digest = sha256(json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     eligible = [x for x in plan['planning'].get('activities', [])
                 if x.get('choice') != 'exclude' and x.get('category') != 'hotel']
     if not any(has_coordinates(x.get('place')) and x['id'] not in pending_ids for x in eligible):
-        exc = GuideNeedsInput('没有已确认位置的游玩地点，请确认地点位置后继续生成')
+        reasons = '；'.join(dict.fromkeys(entry['reason'] for entry in forced))
+        exc = GuideNeedsInput(f'地图未能可靠匹配攻略中的游玩地点：{reasons}' if reasons else '地图未能可靠匹配攻略中的游玩地点')
         exc.plan = plan
         raise exc
     return {"plan": plan, "attempts": 0, "format_attempts": 0, "revision_attempts": 0, "revision_failed": False,
@@ -325,7 +376,7 @@ def itinerary_agent(state: PlanningState) -> dict:
                     day = index * days // len(places) + 1
                 entries[day - 1]['visits'].append({'activity_id': item['id']})
             plan = draft_itinerary(state['plan'], {'days': entries, 'assumptions': [], 'constraint_results': []})
-            plan['planning']['generation'].update(input_hash=state['input_hash'], revisions=attempts - 1)
+            plan['planning']['generation'].update(input_hash=state['input_hash'], revisions=attempts - 1, model=get_model())
             plan['planning'].setdefault('generation_issues', []).append({
                 'type': 'ordering_fallback', 'severity': 'high', 'target': None,
                 'message': '排序模型连续三次失败，已按指定日期和原文顺序生成规则草稿，请核对每日安排。'})
@@ -333,10 +384,10 @@ def itinerary_agent(state: PlanningState) -> dict:
                     'proposal_error': '', 'itinerary_retry_history': [], 'trace': state['trace'] + ['itinerary_agent']}
         output = exc.output if isinstance(exc, ItineraryOutputError) else None
         return {"attempts": attempts, "format_attempts": format_attempts, "proposal_error": str(exc),
-                "itinerary_retry_history": [*history, (output, str(exc)[:1000])],
+                "itinerary_retry_history": [*history, [output, str(exc)[:1000]]],
                 "trace": state["trace"] + ["itinerary_agent"]}
     plan = draft_itinerary(state["plan"], proposal)
-    plan["planning"]["generation"].update(input_hash=state["input_hash"], revisions=attempts - 1)
+    plan["planning"]["generation"].update(input_hash=state["input_hash"], revisions=attempts - 1, model=get_model())
     return {"plan": plan, "attempts": attempts, "format_attempts": 0,
             "proposal_error": "", "itinerary_retry_history": [], "trace": state["trace"] + ["itinerary_agent"]}
 
@@ -358,6 +409,11 @@ def _resolve_route(route, origin, destination, action):
     route["origin"] = origin.get("arrival_location", origin["location"])
     route["destination"] = destination["location"]
     route.setdefault("travel_mode", "TRANSIT")
+    if origin.get("lodging_pending") or destination.get("lodging_pending"):
+        return {**route, "duration_minutes": 0, "source": "lodging_pending"}
+    origin_poi = (origin.get("place") or {}).get("place_id")
+    if origin_poi and origin_poi == (destination.get("place") or {}).get("place_id") and route["origin"] == route["destination"]:
+        return {**route, "duration_minutes": 0, "source": "same_place", "legs": []}
     if not AMAP_API_KEY:
         return route
 
@@ -369,11 +425,20 @@ def _resolve_route(route, origin, destination, action):
     choices = []
     errors = []
     points = [waypoint(origin, arriving=True), waypoint(destination)]
-    options = route.get("route_options") if action != "recalculate_routes" and route.get("route_options_key") == points else None
-    if options is None:
+    options = dict(route.get("route_options") or {}) if route.get("route_options_key") == points else {}
+    refresh = {"refresh": True} if action == "optimize_routes" else {}
+    if refresh:
         options = {}
+    if action == "recalculate_routes":
+        options = {mode: result for mode, result in options.items() if result.get("success")}
+    if len(options) < 3:
         for mode in ("WALK", "TRANSIT", "DRIVE"):
-            options[mode] = amap_compute_route(*points, travel_mode=mode)
+            if mode in options:
+                continue
+            try:
+                options[mode] = retry_amap_call(amap_compute_route, *points, travel_mode=mode, **refresh)
+            except (TimeoutError, ConnectionError) as exc:
+                options[mode] = {"success": False, "message": str(exc)}
             result = options[mode]
             result.pop("raw_routes", None)
             try:
@@ -424,6 +489,31 @@ def _resolve_route(route, origin, destination, action):
 def route_agent(state: PlanningState) -> dict:
     """并行查询相邻路段，汇总后更新行程时间。"""
     plan = state["plan"]
+    action = state["action"]
+    types = meal_types(plan)
+    explicit = action == "optimize_routes"
+    if explicit or (AMAP_API_KEY and action == "generate_from_guide"
+                    and any(is_main_meal(item, types) for item in plan["itinerary"])):
+        old = {(r["origin_item_id"], r["destination_item_id"]): r for r in plan["routes"]}
+
+        def candidate(origin, destination):
+            pair = origin["item_id"], destination["item_id"]
+            route = {"origin_item_id": pair[0], "destination_item_id": pair[1], "source": "provisional_estimate"}
+            previous = old.get(pair, {})
+            if previous.get("mode_locked"):
+                route.update(mode_locked=True, travel_mode=previous["travel_mode"])
+            return _resolve_route(route, origin, destination, "optimize_routes" if explicit else action)
+
+        if AMAP_API_KEY:
+            optimized, message = optimize_itinerary(plan, candidate)
+        else:
+            optimized, message = None, "未配置高德地图，无法验证候选路线，已保留原行程。"
+        if optimized is not None or explicit:
+            return {"plan": optimized if optimized is not None else plan,
+                    "optimization_applied": optimized is not None, "optimization_message": message,
+                    "trace": state["trace"] + ["route_agent"]}
+    if action == "generate_from_guide":
+        plan["planning"].pop("optimized_timetable", None)
     by_id = {item["item_id"]: item for item in plan["itinerary"]}
     # 每个任务只更新自己的路段，同一路段内按原顺序查询交通方式。
     routes = ordered_parallel(
@@ -432,14 +522,31 @@ def route_agent(state: PlanningState) -> dict:
         for route in plan["routes"]
     )
     plan = {**plan, "routes": routes}
-    if state["action"] == "generate_from_guide" or state["action"] == "draft":
-        return {"plan": plan, "trace": state["trace"] + ["route_agent"]}
-    return {"plan": apply_route_times(plan), "trace": state["trace"] + ["route_agent"]}
+    if (action not in {"generate_from_guide", "draft"} and "day_departures" not in plan["planning"]
+            and not plan["planning"].get("optimized_timetable")):
+        plan = apply_route_times(plan)
+    return {"plan": plan, "trace": state["trace"] + ["route_agent"]}
 
 
 def schedule_agent(state: PlanningState) -> dict:
     """根据已查询路线顺排行程时间；固定车次保持原时刻。"""
-    return {"plan": schedule_itinerary(state["plan"]), "trace": state["trace"] + ["schedule_agent"]}
+    plan = state["plan"]
+    action = state["action"]
+    optimized = plan["planning"].get("optimized_timetable")
+    if action == "optimize_routes" or (optimized and action == "generate_from_guide"
+                                        and state.get("optimization_applied")):
+        return {"plan": plan, "trace": state["trace"] + ["schedule_agent"]}
+    if optimized and (action in {"recalculate_routes", "route_mode", "route_modes", "update_activity"} or
+                      (action == "review_changes" and all(
+                          operation["action"] in {"route_mode", "update_activity", "update_budget", "acknowledge_purchase"}
+                          for operation in state["payload"]["operations"]))):
+        routes = {(route["origin_item_id"], route["destination_item_id"]): route for route in plan["routes"]}
+        updated, _ = optimize_itinerary(plan, lambda origin, destination: routes.get(
+            (origin["item_id"], destination["item_id"]), {}), preserve_order=True)
+        return {"plan": updated if updated is not None else plan, "trace": state["trace"] + ["schedule_agent"]}
+    plan["planning"].pop("optimized_timetable", None)
+    schedule = schedule_review if "day_departures" in plan["planning"] else schedule_itinerary
+    return {"plan": schedule(plan), "trace": state["trace"] + ["schedule_agent"]}
 
 
 def audit_agent(state: PlanningState) -> dict:
@@ -447,12 +554,16 @@ def audit_agent(state: PlanningState) -> dict:
     plan = state["plan"]
     if state["action"] == "confirm" and not plan.get("itinerary"):
         raise ValueError("Generate an itinerary before confirmation")
+    if state["action"] == "confirm" and plan.get("planning", {}).get("needs_replan"):
+        raise ValueError("旅行基础信息已变化，请重新查询候选并生成行程。")
     audit = audit_plan(plan)
-    if plan.get("planning", {}).get("generation") is not None:
+    if (plan.get("planning", {}).get("generation") is not None
+            and (state["action"] != "optimize_routes" or state.get("optimization_applied"))):
         plan["planning"]["generation"]["constraint_results"] = audit.get("guide_constraints", [])
     if state["action"] == "confirm":
-        if any(item["severity"] == "high" for item in audit["issues"]):
-            raise ValueError("Resolve high-severity itinerary issues before confirmation")
+        meal_issue = next((item for item in audit["issues"] if item["type"] in {"meal_window", "meal_spacing"}), None)
+        if meal_issue:
+            raise ValueError(meal_issue["message"])
         plan = {**plan, "planning": {**plan["planning"], "stage": "confirmed"}}
     ordering_feedback = [x for x in audit["issues"] if x["type"] in {
         "time_conflict", "transport_buffer", "schedule_overflow", "guide_constraint", "pace_risk"}]
@@ -486,7 +597,7 @@ def generate_guide(state: PlanningState) -> dict:
                 item.pop(key, None)
     plan = build_activities(fresh, text)
     if not plan["planning"].get("guide_places"):
-        raise GuideNeedsInput("攻略中没有可识别的地点，请补充具体地点名称，或手动添加地点后继续规划")
+        raise GuideNeedsInput("攻略中没有可识别的地点")
     plan["planning"]["guide_auto"] = True
     plan["planning"]["draft_text"] = text
     return {"plan": plan, "trace": state["trace"] + ["guide_agent", "activity_agent"]}
@@ -514,12 +625,24 @@ def default_choices(state: PlanningState) -> dict:
 
 
 def _logged_node(name, node):
+    validator = NODE_OUTPUT_VALIDATORS[name]
+
     def run(state):
         from service.utils.request_log import context, log_error
         token = context.set({**context.get(), "stage": name, "job_id": generation_job_id.get(),
                              "plan_id": state.get("plan", {}).get("plan_id")})
         try:
-            return node(state)
+            update = node(deepcopy(state))
+            error = next(validator.iter_errors(update), None)
+            if error is not None:
+                field = ".".join(map(str, error.absolute_path)) or "$"
+                raise ValidationError(f"{name} 输出不符合 JSON Schema：{field} ({error.validator})")
+            # Reject Python values that cannot be safely saved in a JSON checkpoint.
+            try:
+                json.dumps(update, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("节点返回值无法序列化为 JSON") from exc
+            return update
         except Exception as exc:
             log_error(exc)
             raise
@@ -531,6 +654,8 @@ def _logged_node(name, node):
 
 def build_planning_graph():
     graph = StateGraph(PlanningState)
+    retry = RetryPolicy(max_attempts=3, retry_on=lambda exc: isinstance(
+        exc, (ValidationError, TimeoutError, RuntimeError)) or default_retry_on(exc))
     for name, node in {
         "generate_guide": generate_guide, "search_places": search_places, "default_choices": default_choices,
         "coordinator": coordinator, "transport_agent": transport_agent,
@@ -539,13 +664,14 @@ def build_planning_graph():
         "audit_agent": audit_agent,
         "place_agent": place_agent, "prepare_draft": prepare_draft, "itinerary_agent": itinerary_agent,
     }.items():
-        graph.add_node(name, _logged_node(name, node))
+        graph.add_node(name, _logged_node(name, node), retry_policy=retry)
     graph.add_conditional_edges(START, lambda state: state.get("resume_stage", "coordinator"),
         {name: name for name in ("coordinator", "generate_guide", "search_places", "default_choices", "prepare_draft", "itinerary_agent", "route_agent", "schedule_agent", "audit_agent")})
     graph.add_conditional_edges("coordinator", after_coordinator, {
         "transport_agent": "transport_agent", "guide_agent": "guide_agent",
         "activity_agent": "activity_agent", "route_agent": "route_agent",
         "audit_agent": "audit_agent", "done": END,
+        "schedule_agent": "schedule_agent",
         "generate_guide": "generate_guide", "hotel_agent": "hotel_agent", "prepare_draft": "prepare_draft", "place_agent": "place_agent",
     })
     graph.add_edge("generate_guide", "search_places")
@@ -571,10 +697,15 @@ def run_planning_action(plan: dict[str, Any], action: str, payload: dict[str, An
     initial = deepcopy(resume) if resume else {"plan": deepcopy(plan), "action": action, "payload": payload, "trace": []}
     if initial.get("resume_stage") == "done":
         return initial
-    if progress is None:
-        return GRAPH.invoke(initial)
-    outcome = initial
-    for outcome in GRAPH.stream(initial, stream_mode="values"):
-        if outcome.get("trace") and (not resume or outcome["trace"] != resume.get("trace")):
-            progress(outcome["trace"][-1], outcome)
-    return outcome
+    model = validate_model(payload["model"]) if "model" in payload else get_model()
+    token = selected_model.set(model)
+    try:
+        if progress is None:
+            return GRAPH.invoke(initial)
+        outcome = initial
+        for outcome in GRAPH.stream(initial, stream_mode="values"):
+            if outcome.get("trace") and (not resume or outcome["trace"] != resume.get("trace")):
+                progress(outcome["trace"][-1], outcome)
+        return outcome
+    finally:
+        selected_model.reset(token)

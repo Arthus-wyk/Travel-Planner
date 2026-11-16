@@ -19,3 +19,4 @@ frontend/dist/
 frontend/.idea/
 data
 /logs/
+tests

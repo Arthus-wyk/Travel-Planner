@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from agent.itinerary import generate_itinerary_proposal
+from agent.planning.itinerary import generate_itinerary_proposal
 from test_itinerary_agent import sample_plan
 
 

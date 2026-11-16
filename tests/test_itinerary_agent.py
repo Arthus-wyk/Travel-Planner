@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from agent import itinerary
+from agent.planning import itinerary
 
 
 def sample_plan():
@@ -32,7 +32,7 @@ class ItineraryAgentTests(unittest.TestCase):
         return itinerary.generate_itinerary_proposal(sample_plan(), feedback)
 
     def test_retry_uses_its_own_previous_request_and_result(self):
-        from agent.planning_graph import itinerary_agent
+        from agent.planning.planning_graph import itinerary_agent
 
         plan = sample_plan()
         plan["planning"]["activities"][1]["choice"] = "exclude"

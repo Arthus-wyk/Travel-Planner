@@ -1,0 +1,37 @@
+[
+ {
+  "mode": "redesign",
+  "depth": "full",
+  "scope": "app",
+  "theme": "furrow",
+  "shape": "workspace and ruled trip book",
+  "axes": [
+   "warm manila",
+   "tangerine",
+   "survey contours",
+   "ruled paper"
+  ],
+  "hero": "workspace cover",
+  "nav": "existing trip sidebar",
+  "footer": "none",
+  "imagery": "procedural contour drawing",
+  "photos": [],
+  "entry": "frontend/src/styles.css",
+  "fingerprint": "furrow-travel-studio",
+  "sections": [
+   "workspace",
+   "new trip",
+   "plan",
+   "review",
+   "sheet",
+   "conversation",
+   "logs"
+  ],
+  "signature": "survey contour cover with dashed route",
+  "waived": [
+   "24b"
+  ],
+  "prompt": "Redesign the Travel Studio UI using Hallmark Furrow.",
+  "date": "2026-11-16"
+ }
+]

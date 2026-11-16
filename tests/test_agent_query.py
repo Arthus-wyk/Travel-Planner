@@ -6,9 +6,9 @@ from ollama import ResponseError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from agent.context import AgentContext, DEFAULT_MAX_ROUNDS
-from agent.runner import run_turn
-from agent.state import AgentRequest, AgentRunError
+from agent.chat.context import AgentContext, DEFAULT_MAX_ROUNDS
+from agent.chat.runner import run_turn
+from agent.chat.state import AgentRequest, AgentRunError
 from tooling.registry import ToolRegistry
 from tooling.mcp import build_registry
 from tools.catalog import tool_metadata

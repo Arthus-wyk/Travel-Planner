@@ -178,6 +178,7 @@ def write_map_cache(cache_key: str, payload: Any, ttl_seconds: int) -> None:
 
 
 def save_plan(plan: dict[str, Any]) -> None:
+    from service.travel.planning import itinerary_for_storage
     ensure_schema()
     with connect() as conn:
         with conn.cursor() as cursor:
@@ -267,7 +268,7 @@ def save_plan(plan: dict[str, Any]) -> None:
                     "notes": plan["notes"],
                     "created_at": plan["created_at"],
                     "updated_at": plan["updated_at"],
-                    "itinerary": _json_dumps(plan["itinerary"]),
+                    "itinerary": _json_dumps(itinerary_for_storage(plan)),
                     "routes": _json_dumps(compact_routes(plan.get("routes") or [])),
                     "recommendations": _json_dumps(plan["recommendations"]),
                     "budget_items": _json_dumps(plan["budget_items"]),
@@ -415,7 +416,7 @@ def compact_routes(routes):
 
 
 def row_to_plan(row: dict[str, Any]) -> dict[str, Any]:
-    return {
+    plan = {
         "plan_id": row["plan_id"],
         "title": row.get("title") or f"{row['destination']} 行程",
         "destination": row["destination"],
@@ -438,6 +439,10 @@ def row_to_plan(row: dict[str, Any]) -> dict[str, Any]:
         "budget_items": _json_loads(row["budget_items"], []),
         "planning": _json_loads(row.get("planning"), {}),
     }
+    if "day_departures" in plan["planning"] and not plan["planning"].get("optimized_timetable"):
+        from service.travel.planning import schedule_review
+        return schedule_review(plan)
+    return plan
 
 
 def save_conversation(conversation: dict[str, Any]) -> None:

@@ -14,7 +14,7 @@ class AmapTests(unittest.TestCase):
     def setUp(self):
         self.cache = {}
         for item in (
-            patch.object(amap, "read_map_cache", side_effect=self.cache.get),
+            patch.object(amap, "read_map_cache", side_effect=lambda key, **kwargs: self.cache.get(key)),
             patch.object(amap, "write_map_cache", side_effect=lambda key, value, ttl: self.cache.update({key: value})),
         ):
             item.start()
@@ -26,12 +26,61 @@ class AmapTests(unittest.TestCase):
         response.headers["Content-Type"] = mime
         return response
 
+    def test_place_photos_cache_both_links_and_empty_results(self):
+        for poi_id, photos, expected in (
+            ("B1", [{"url": "https://example.com/photo.jpg"}], "https://example.com/photo.jpg"),
+            ("B2", [], None),
+        ):
+            data = {"status": "1", "pois": [{"id": poi_id, "photos": photos}]}
+            with patch.object(amap, "AMAP_API_KEY", "secret"), patch.object(
+                amap.urllib.request, "urlopen", return_value=self.response(json.dumps(data).encode()),
+            ) as request:
+                self.assertEqual(amap.place_photo_url(poi_id), expected)
+                self.assertEqual(amap.place_photo_url(poi_id), expected)
+                request.assert_called_once()
+                url = urlsplit(request.call_args.args[0])
+                self.assertEqual(url.path, "/v5/place/detail")
+                self.assertEqual(parse_qs(url.query)["show_fields"], ["photos"])
+
     def test_request_checks_amap_status_and_redacts_key(self):
         with patch.object(amap, "AMAP_API_KEY", "secret"), patch.object(amap.urllib.request, "urlopen", return_value=self.response(b'{"status":"0","infocode":"10001","info":"INVALID_USER_KEY"}')) as call:
             with self.assertRaisesRegex(RuntimeError, "10001"):
                 amap.request_amap("/v3/place/text", {"keywords": "西湖"})
             self.assertEqual(parse_qs(urlsplit(call.call_args.args[0]).query)["key"], ["secret"])
             self.assertNotIn("secret", amap.amap_error(RuntimeError("url?key=secret"))["message"])
+
+    def test_business_qps_response_retries_and_gates_next_request(self):
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+
+        with patch.object(amap, "_cooldowns", {}), patch.object(amap, "AMAP_API_KEY", "secret"), patch.object(
+            amap, "monotonic", side_effect=lambda: clock[0],
+        ), patch.object(amap, "sleep", side_effect=advance) as delay, patch.object(
+            amap.urllib.request, "urlopen", side_effect=[
+                self.response(b'{"status":"0","infocode":"10021","info":"CUQPS_HAS_EXCEEDED_THE_LIMIT"}'),
+                self.response(b'{"status":"1","pois":[]}'),
+                self.response(b'{"status":"1","pois":[]}'),
+            ],
+        ) as request:
+            self.assertTrue(amap.retry_amap_call(server.amap_search_places, "西湖")["success"])
+            self.assertTrue(amap.retry_amap_call(server.amap_search_places, "灵隐寺")["success"])
+        self.assertEqual(request.call_count, 3)
+        self.assertGreaterEqual(delay.call_args_list[0].args[0], 0.5)
+        self.assertAlmostEqual(delay.call_args_list[1].args[0], 0.2)
+
+    def test_day_quota_suppresses_requests_and_preserves_reason(self):
+        with patch.object(amap, "_cooldowns", {}), patch.object(amap, "AMAP_API_KEY", "secret"), patch.object(
+            amap.urllib.request, "urlopen", return_value=self.response(
+                b'{"status":"0","infocode":"10003","info":"DAILY_QUERY_OVER_LIMIT"}'
+            ),
+        ) as request:
+            first = amap.retry_amap_call(server.amap_search_places, "西湖")
+            second = amap.retry_amap_call(server.amap_search_places, "灵隐寺")
+        self.assertEqual(first, second)
+        self.assertEqual(second["infocode"], "10003")
+        self.assertIn("日调用额度已用尽", second["message"])
+        request.assert_called_once()
 
     def test_missing_key_and_network_errors(self):
         with patch.object(amap, "AMAP_API_KEY", ""):
@@ -62,6 +111,21 @@ class AmapTests(unittest.TestCase):
         place = amap.place_summary({"id": "food", "name": "知味观", "location": "120.1,30.2",
                                     "biz_ext": {"cost": "68"}})
         self.assertEqual(place["cost_per_person"], 68.0)
+
+    def test_poi_search_prefixes_city_name_once_in_amap_keywords(self):
+        for query, region, expected in (
+            ("西湖", "杭州", "杭州 西湖"),
+            ("湖滨酒店", "杭州市", "杭州市 湖滨酒店"),
+            ("杭州西湖", "杭州市", "杭州西湖"),
+            ("西湖", "330100", "西湖"),
+        ):
+            with self.subTest(query=query, region=region), patch.object(
+                amap, "request_amap", return_value={"pois": []}
+            ) as request:
+                self.assertTrue(server.amap_search_places(query, region_code=region)["success"])
+                payload = request.call_args.args[1]
+                self.assertEqual(payload["keywords"], expected)
+                self.assertEqual(payload["city"], region)
 
     def test_geocoding_and_empty_result(self):
         with patch.object(amap, "request_amap", return_value={"geocodes": []}) as call:
@@ -143,3 +207,18 @@ class AmapTests(unittest.TestCase):
             self.assertEqual(first, second)
             network.assert_called_once()
             self.assertNotIn("secret", json.dumps(self.cache))
+
+    def test_route_refresh_bypasses_the_persisted_duration(self):
+        def response(seconds):
+            return self.response(json.dumps({"status": "1", "route": {"paths": [
+                {"distance": "200", "cost": {"duration": str(seconds)}},
+            ]}}).encode())
+
+        with patch.object(amap, "AMAP_API_KEY", "secret"), patch.object(
+            amap.urllib.request, "urlopen", side_effect=[response(600), response(300)]
+        ) as network:
+            points = ("120,30", "120.002,30.002")
+            self.assertEqual(server.amap_compute_route(*points)["duration"], "600s")
+            self.assertEqual(server.amap_compute_route(*points, refresh=True)["duration"], "300s")
+            self.assertEqual(server.amap_compute_route(*points)["duration"], "300s")
+            self.assertEqual(network.call_count, 2)

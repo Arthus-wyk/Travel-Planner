@@ -15,16 +15,45 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_network_error(httpx.ConnectError("All connection attempts failed")))
         self.assertTrue(is_network_error(httpx.ReadTimeout("")))
 
-    def test_cli_and_http_use_only_environment_model(self):
+    def test_cli_model_selection_ignores_environment(self):
         from service import cli
+
+        model = "Qwen/Qwen3.5-122B-A10B"
+        with patch.dict(os.environ, {"LLM_MODEL": "legacy", "SILICONFLOW_MODEL": "legacy"}):
+            with patch("sys.argv", ["program", "--model", model]):
+                self.assertEqual(cli.parse_args().model, model)
+            self.assertEqual(model_client.get_model(), "deepseek-ai/DeepSeek-V4.1-Flash")
+
+    def test_planning_graph_propagates_model_to_nodes(self):
+        from agent.planning import planning_graph
+
+        graph = planning_graph.StateGraph(dict)
+        graph.add_node("read_model", lambda _: {"model": model_client.get_model()})
+        graph.add_edge(planning_graph.START, "read_model")
+        graph.add_edge("read_model", planning_graph.END)
+        default, chosen = model_client.AVAILABLE_MODELS[:2]
+        with patch.object(planning_graph, "GRAPH", graph.compile()):
+            for progress in (None, lambda *_: None):
+                result = planning_graph.run_planning_action({}, "generate_from_guide", {"model": chosen}, progress)
+                self.assertEqual(result["model"], chosen)
+                self.assertEqual(model_client.get_model(), default)
+
+    def test_model_catalog_and_generation_request(self):
+        from pathlib import Path
+        from fastapi.testclient import TestClient
         from service.api import server
-        with patch.dict(os.environ, {"LLM_PROVIDER": "ollama", "LLM_MODEL": "configured"}):
-            for entry in (cli, server):
-                with patch("sys.argv", ["program"]):
-                    self.assertEqual(entry.parse_args().model, "configured")
-                with patch("sys.argv", ["program", "--model", "override"]):
-                    with self.assertRaises(SystemExit):
-                        entry.parse_args()
+
+        client = TestClient(server.create_app(Path("mcp_server.py")))
+        models = model_client.AVAILABLE_MODELS
+        self.assertEqual(client.get("/api/models").json(), {"models": list(models), "default": models[0]})
+        url = "/api/plans/plan/generation"
+        with patch.object(server.planning_jobs, "create_job", return_value=("job", None)) as create_job:
+            invalid = client.post(url, json={"text": "guide", "model": "unknown"})
+            self.assertEqual(invalid.status_code, 400)
+            create_job.assert_not_called()
+            payload = {"text": "guide", "model": models[1]}
+            self.assertEqual(client.post(url, json=payload).json()["job_id"], "job")
+            create_job.assert_called_once_with("plan", payload, retry=False)
 
     async def test_context_error_keeps_provider_message(self):
         client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(lambda _: httpx.Response(400, json={"error": {"message": "maximum context length exceeded"}})))
@@ -50,17 +79,13 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
     def test_configuration_requires_explicit_values(self):
-        values = {"LLM_PROVIDER": "openai", "LLM_MODEL": "demo", "LLM_BASE_URL": "https://example.com/v1", "LLM_API_KEY": "key", "AGENT_MODEL": "legacy", "OLLAMA_HOST": "https://legacy.example"}
+        values = {"LLM_PROVIDER": "openai", "LLM_BASE_URL": "https://example.com/v1", "LLM_API_KEY": "key", "AGENT_MODEL": "legacy", "OLLAMA_HOST": "https://legacy.example"}
         with patch.dict(os.environ, values):
-            self.assertEqual(model_client.get_model(), "demo")
             self.assertIsInstance(model_client.create_model_client(), model_client.OpenAICompatibleClient)
             for name in ("LLM_PROVIDER", "LLM_BASE_URL", "LLM_API_KEY"):
                 with self.subTest(name=name), patch.dict(os.environ, {name: ""}):
                     with self.assertRaisesRegex(ValueError, name):
                         model_client.create_model_client()
-            with patch.dict(os.environ, {"LLM_MODEL": ""}):
-                with self.assertRaisesRegex(ValueError, "LLM_MODEL"):
-                    model_client.get_model()
             with patch.dict(os.environ, {"LLM_PROVIDER": "unknown"}):
                 with self.assertRaisesRegex(ValueError, "LLM_PROVIDER"):
                     model_client.create_model_client()
@@ -75,10 +100,10 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
         def handler(request):
             self.assertEqual(str(request.url), "https://api.siliconflow.cn/v1/chat/completions")
             self.assertEqual(request.headers["authorization"], "Bearer siliconflow-test-key")
-            self.assertEqual(json.loads(request.content)["model"], "org/siliconflow-model")
+            self.assertEqual(json.loads(request.content)["model"], model_client.AVAILABLE_MODELS[0])
             return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
 
-        values = {"LLM_PROVIDER": "siliconflow", "SILICONFLOW_MODEL": "org/siliconflow-model",
+        values = {"LLM_PROVIDER": "siliconflow",
                   "SILICONFLOW_API_KEY": "siliconflow-test-key", "SILICONFLOW_BASE_URL": "",
                   "LLM_MODEL": "ollama-model", "LLM_BASE_URL": "https://ollama.example", "LLM_API_KEY": "ollama-key"}
         with patch.dict(os.environ, values):
@@ -89,9 +114,6 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
             with patch.dict(os.environ, {"SILICONFLOW_API_KEY": ""}):
                 with self.assertRaisesRegex(ValueError, "SILICONFLOW_API_KEY"):
                     model_client.create_model_client()
-            with patch.dict(os.environ, {"SILICONFLOW_MODEL": ""}):
-                with self.assertRaisesRegex(ValueError, "SILICONFLOW_MODEL"):
-                    model_client.get_model()
 
     async def test_tool_history_json_usage_and_retry(self):
         requests = []

@@ -201,6 +201,8 @@ def amap_compute_route(
     avoid_tolls: bool = False,
     avoid_highways: bool = False,
     avoid_ferries: bool = False,
+    *,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Compute distance and travel time between two addresses with 高德地图.
 
@@ -220,6 +222,8 @@ def amap_compute_route(
     )
     if validation_error is not None:
         return validation_error
+    if refresh:
+        payload["refresh"] = True
 
     try:
         routes = compute_route(payload or {})
@@ -586,6 +590,8 @@ def add_itinerary_item(
         if entry.get("day") == day and entry.get("item_id")
     }
     plan["itinerary"].append(item)
+    if "day_departures" in plan.get("planning", {}):
+        item["requested_time"] = item["time_of_day"]
     _remove_routes_for_items(plan, existing_day_item_ids)
     plan["updated_at"] = now()
 
@@ -694,6 +700,8 @@ def update_itinerary_item(
 
     for field, value in updates.items():
         item[field] = value
+    if "time_of_day" in updates and "day_departures" in plan.get("planning", {}):
+        item["requested_time"] = item["time_of_day"]
 
     _remove_routes_for_items(plan, {item_id})
     plan["updated_at"] = now()
@@ -838,6 +846,8 @@ def move_itinerary_item(
 
     item["day"] = target_day
     item["time_of_day"] = target_time_of_day
+    if "day_departures" in plan.get("planning", {}):
+        item["requested_time"] = target_time_of_day
     _remove_routes_for_items(plan, {item_id})
     plan["updated_at"] = now()
     try:

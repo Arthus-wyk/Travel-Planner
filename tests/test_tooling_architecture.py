@@ -1,12 +1,12 @@
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from agent.executor import ToolExecutor
+from agent.chat.executor import ToolExecutor
 from tooling.context import ToolContext
 from tooling.mcp import build_registry
 from tooling.registry import ToolRegistry
 from tooling.spec import ToolSpec
-from agent.router import select_tools
+from agent.chat.router import select_tools
 from tools.catalog import tool_metadata
 
 

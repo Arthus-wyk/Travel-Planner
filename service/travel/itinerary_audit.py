@@ -8,6 +8,19 @@ from typing import Any
 from service.validation import time_minutes
 
 
+MEAL_WINDOWS = ((600, 780), (960, 1140))
+MEAL_GAP = 240
+
+
+def meal_types(plan):
+    return {activity["id"]: activity.get("meal_type")
+            for activity in (plan.get("planning") or {}).get("activities", [])}
+
+
+def is_main_meal(item, types):
+    return item.get("category") == "food" and types.get(item.get("reference_id")) != "dessert"
+
+
 def _scheduled_minutes(item):
     value = time_minutes(item.get("time_of_day"))
     return value + item.get("day_offset", 0) * 1440 if value is not None else None
@@ -24,6 +37,24 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
     suggestions: list[str] = []
     guide_results = []
+
+    types = meal_types(plan)
+    meals = []
+    for item in itinerary:
+        start = _scheduled_minutes(item)
+        if not is_main_meal(item, types) or start is None:
+            continue
+        end = start + number(item.get("duration_minutes"))
+        if not any(begin <= start and end <= close for begin, close in MEAL_WINDOWS):
+            issues.append(issue("meal_window", "high", f"{item.get('title', '正餐')}须完整安排在 10:00–13:00 或 16:00–19:00。", item.get("item_id")))
+        day = item.get("day")
+        if isinstance(day, int):
+            meals.append((day * 1440 + start, item))
+    meals.sort(key=lambda meal: meal[0])
+    for (before, first), (after, second) in zip(meals, meals[1:]):
+        if after - before < MEAL_GAP:
+            issues.append(issue("meal_spacing", "high", f"{first.get('title', '正餐')}与{second.get('title', '正餐')}开餐须至少间隔 4 小时。",
+                                [first.get("item_id"), second.get("item_id")]))
 
     for item in itinerary:
         start = time_minutes(item.get("time_of_day"))
@@ -127,9 +158,13 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
 
         home_location = planning.get("home_location") or plan.get("departure_city")
         selected_hotel = next((x for x in planning.get("hotel_candidates") or [] if x.get("id") == planning.get("selected_hotel")), None)
-        hotel_location = (selected_hotel or {}).get("location")
-        if trip_days and trip_days > 1 and not selected_hotel:
-            issues.append(issue("missing_hotel", "high", "尚未确定住宿，请选择具体酒店后重新生成。", None))
+        missing_lodging = [x for x in itinerary if x.get("lodging_pending")]
+        if missing_lodging:
+            first_missing = next((x for x in missing_lodging if x.get("anchor_role") == "end"), missing_lodging[0])
+            issues.append(issue("missing_hotel", "high", "尚未确定住宿，请在住宿卡片选择酒店。", first_missing["item_id"]))
+        elif trip_days and trip_days > 1 and not selected_hotel and not any(
+                x.get("category") == "hotel_anchor" for x in itinerary):
+            issues.append(issue("missing_hotel", "high", "尚未确定住宿，请重新生成以添加住宿卡片。", None))
         unresolved_places = [x["id"] for x in planning.get("activities", [])
                              if x.get("choice") != "exclude" and x.get("category") != "hotel" and not x.get("place")]
         if planning.get("guide_auto") and unresolved_places:
@@ -138,11 +173,9 @@ def audit_plan(plan: dict[str, Any]) -> dict[str, Any]:
             ordered = sorted(by_day.get(day, []), key=lambda x: _scheduled_minutes(x) if _scheduled_minutes(x) is not None else 1440)
             expected_start = "home_anchor" if day == 1 else "hotel_anchor"
             expected_end = "home_anchor" if day == trip_days else "hotel_anchor"
-            start_location = home_location if day == 1 else hotel_location
-            end_location = home_location if day == trip_days else hotel_location
-            if not ordered or ordered[0].get("category") != expected_start or ordered[0].get("anchor_role") != "start" or ordered[0].get("location") != start_location:
+            if not ordered or ordered[0].get("category") != expected_start or ordered[0].get("anchor_role") != "start" or day == 1 and ordered[0].get("location") != home_location:
                 issues.append(issue("missing_start_anchor", "high", f"第 {day} 天没有从指定的家或酒店出发。", day))
-            if not ordered or ordered[-1].get("category") != expected_end or ordered[-1].get("anchor_role") != "end" or ordered[-1].get("location") != end_location:
+            if not ordered or ordered[-1].get("category") != expected_end or ordered[-1].get("anchor_role") != "end" or day == trip_days and ordered[-1].get("location") != home_location:
                 issues.append(issue("missing_end_anchor", "high", f"第 {day} 天没有返回指定的家或酒店。", day))
             route_pairs = {(x.get("origin_item_id"), x.get("destination_item_id")): x for x in plan.get("routes") or []}
             for previous, current in zip(ordered, ordered[1:]):

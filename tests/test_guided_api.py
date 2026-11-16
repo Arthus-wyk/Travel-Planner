@@ -17,9 +17,9 @@ class GuidedApiTests(unittest.TestCase):
         self.patches = [
             patch.object(server, "save_plan", side_effect=lambda plan: self.plans.update({plan["plan_id"]: plan})),
             patch.object(server, "get_plan", side_effect=lambda plan_id: (self.plans.get(plan_id), None if plan_id in self.plans else {"message": "Travel plan not found."})),
-            patch("agent.planning_graph._hotel_places", return_value=[]),
-            patch("agent.planning_graph.AMAP_API_KEY", ""),
-            patch("agent.planning_graph.generate_itinerary_proposal", side_effect=mock_itinerary_proposal),
+            patch("agent.planning.planning_graph._hotel_places", return_value=[]),
+            patch("agent.planning.planning_graph.AMAP_API_KEY", ""),
+            patch("agent.planning.planning_graph.generate_itinerary_proposal", side_effect=mock_itinerary_proposal),
         ]
         for item in self.patches:
             item.start()
@@ -38,6 +38,21 @@ class GuidedApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
+    def test_reorder_requires_current_version_and_preserves_plan_on_failure(self):
+        plan_id = self.request("/api/plans/drafts", FORM)["plan"]["plan_id"]
+        plan = self.plans[plan_id]
+        plan["planning"]["stage"] = "review"
+        plan["planning"]["generation"] = {"constraint_results": [{"old": True}]}
+        path = f"/api/plans/{plan_id}"
+        version = self.get(path)["plan_version"]
+        with patch.object(server.planning_jobs, "save_review_changes") as save:
+            stale = self.client.post(f"{path}/planning/optimize_routes", json={"plan_version": "stale"})
+            self.assertEqual(stale.status_code, 409)
+            result = self.request(f"{path}/planning/optimize_routes", {"plan_version": version})
+            save.assert_not_called()
+        self.assertIn("已保留原行程", result["optimization_message"])
+        self.assertEqual(result["plan_version"], version)
+
     def test_form_and_candidate_actions_persist_plan(self):
         created = self.request("/api/plans/drafts", FORM)
         self.assertTrue(created["success"])
@@ -52,7 +67,7 @@ class GuidedApiTests(unittest.TestCase):
         self.assertEqual(created["plan"]["end_date"], "2026-11-08")
 
     def test_audit_is_readable_after_reload_and_sheet_requires_confirmation(self):
-        created = self.request("/api/plans/drafts", FORM)
+        created = self.request("/api/plans/drafts", {**FORM, "budget": 1})
         plan_id = created["plan"]["plan_id"]
         self.request(f"/api/plans/{plan_id}/planning/candidates", {})
         candidates = self.plans[plan_id]["planning"]["transport_candidates"]
@@ -62,10 +77,15 @@ class GuidedApiTests(unittest.TestCase):
             "return": next(x["id"] for x in candidates if x["direction"] == "return"),
             "hotel": hotel["id"],
         })
+        self.request(f"/api/plans/{plan_id}/planning/add_activity", {"name": "西湖"})
+        self.plans[plan_id]["budget_items"].append({"description": "已知费用", "amount": 100})
         self.plans[plan_id] = located_plan(self.plans[plan_id])
         self.request(f"/api/plans/{plan_id}/planning/draft", {})
         self.assertTrue(self.get(f"/api/plans/{plan_id}/planning/audit")["audit"]["success"])
         self.assertEqual(self.client.get(f"/api/plans/{plan_id}/sheet").status_code, 400)
+        self.request(f"/api/plans/{plan_id}/planning/confirm", {})
+        sheet = self.get(f"/api/plans/{plan_id}/sheet")["sheet"]
+        self.assertIn("budget_overrun", {issue["type"] for issue in sheet["audit"]["issues"]})
 
     def test_confirmed_sheet_records_actual_purchase_price(self):
         created = self.request("/api/plans/drafts", FORM)

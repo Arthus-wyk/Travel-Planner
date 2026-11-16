@@ -116,7 +116,7 @@ class ApiChatTests(unittest.IsolatedAsyncioTestCase):
             )
             self.memory = stack.enter_context(
                 patch(
-                    "agent.memory.extract_and_store",
+                    "agent.chat.memory.extract_and_store",
                     new_callable=AsyncMock,
                     return_value={"success": True},
                 )

@@ -3,13 +3,17 @@ import { Link, useLocation, useNavigate, useParams, useSearchParams } from "reac
 import "./guided-planner.css";
 import GuideGeneration from "./GuideGeneration";
 import { refreshAfterCommit } from "./api";
-import { activitySnapshot as buildSnapshot, activityIssues, transportIssues, validMoney } from "./planningValidation";
+import { transportIssues, validMoney } from "./planningValidation";
 import { BusyStatus, IssueList, LoadError, useUnsavedChanges } from "./planningUi";
 import { transportLabels, categoryLabels, isMovableStop } from "./planningLabels";
+import { orderedSheetStops, routeInstructions, sheetRouteModes, sheetStopTime } from "./sheetRoutes";
+import SheetDayMap from "./SheetDayMap";
+import RoadbookOverview from "./RoadbookOverview";
+import PlacePhoto from "./PlacePhoto";
 
 const encode = (value) => encodeURIComponent(value);
 const returnDate = (start, days) => {
-  if (!start || !Number.isInteger(Number(days)) || Number(days) < 1) return "选择出发日期和天数后显示";
+  if (!start || !Number.isInteger(Number(days)) || Number(days) < 1) return "待计算";
   const date = new Date(`${start}T00:00:00Z`);
   date.setUTCDate(date.getUTCDate() + Number(days) - 1);
   return date.toISOString().slice(0, 10);
@@ -33,11 +37,11 @@ export function NewTripForm({ api, refreshPlans }) {
     } catch (cause) { setError(cause.message); setUncertain(Boolean(cause.uncertain)); }
     finally { createLock.current = false; setBusy(false); }
   }
-  return <div className="guided-page"><header className="guided-header"><Link to="/">← 返回</Link><h1>创建旅行计划</h1><p>先选择往返交通，再核对攻略、分类地点与住宿。</p></header>
+  return <div className="guided-page new-trip-page"><header className="guided-header"><Link to="/">← 返回</Link><h1>创建旅行计划</h1><p>先选择往返交通，再核对攻略、分类地点与住宿。</p></header>
     <form className="guided-card guided-form" onSubmit={submit}>
       <label>目的地<input required value={form.destination} onChange={(e) => field("destination", e.target.value)} placeholder="例如：杭州" /></label>
       <label>出发城市<input required value={form.departure_city} onChange={(e) => field("departure_city", e.target.value)} placeholder="例如：上海" /></label>
-      <label>家或实际出发地点<input value={form.home_location} onChange={(e) => field("home_location", e.target.value)} placeholder="不填则使用出发城市" /></label>
+      <label className="wide">家或实际出发地点<input value={form.home_location} onChange={(e) => field("home_location", e.target.value)} placeholder="不填则使用出发城市" /></label>
       <label>出发日期<input required type="date" value={form.start_date} onChange={(e) => field("start_date", e.target.value)} /></label>
       <label>旅行天数<input required type="number" min="1" max="365" step="1" value={form.trip_days} onChange={(e) => field("trip_days", e.target.value)} /></label>
       <label>返回日期<input readOnly value={returnDate(form.start_date, form.trip_days)} /></label>
@@ -45,7 +49,7 @@ export function NewTripForm({ api, refreshPlans }) {
       <label>总预算<input required type="number" min="0" step="0.01" value={form.budget} onChange={(e) => field("budget", e.target.value)} /></label>
       <label>币种<input value="CNY 人民币" readOnly /></label>
       <label>旅行节奏<select value={form.pace} onChange={(e) => field("pace", e.target.value)}><option value="relaxed">轻松</option><option value="moderate">适中</option><option value="active">充实</option></select></label>
-      <label>兴趣（用逗号分隔）<input value={form.interests} onChange={(e) => field("interests", e.target.value)} placeholder="博物馆，美食" /></label>
+      <label className="wide">兴趣（用逗号分隔）<input value={form.interests} onChange={(e) => field("interests", e.target.value)} placeholder="博物馆，美食" /></label>
       <label className="wide">特殊限制（用逗号分隔）<input value={form.constraints} onChange={(e) => field("constraints", e.target.value)} placeholder="例如：行动不便，避免深夜活动" /></label>
       {error && <p className="guided-error wide" role="alert">{error}</p>}
       {uncertain && <p className="wide">请先在侧栏或首页核实是否已创建行程。<button type="button" onClick={() => { if (window.confirm("已核实没有创建成功，允许重新创建？")) setUncertain(false); }}>已核实未创建</button></p>}
@@ -72,10 +76,6 @@ export function PlanningPage({ api, refreshPlans }) {
   const [kinds, setKinds] = useState({ outbound: "train", return: "train" });
   const [driveDepartures, setDriveDepartures] = useState({ outbound: "07:00", return: "17:00" });
   const [vehicles, setVehicles] = useState(1);
-  const [choices, setChoices] = useState({});
-  const [categories, setCategories] = useState({});
-  const [details, setDetails] = useState({});
-  const [selectedHotel, setSelectedHotel] = useState("");
   const [guideText, setGuideText] = useState("");
   const [busy, setBusy] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -94,10 +94,7 @@ export function PlanningPage({ api, refreshPlans }) {
   function hydrate(nextPlan) {
     const state = nextPlan.planning || {};
     setPlan(nextPlan); setGuideText(state.draft_text ?? state.guide_text ?? "");
-    setChoices(Object.fromEntries((state.activities || []).map(item => [item.id, item.choice || "optional"])));
-    setCategories(Object.fromEntries((state.activities || []).map(item => [item.id, item.category || "attraction"])));
-    setDetails(Object.fromEntries((state.activities || []).map(item => [item.id, { duration_minutes: item.duration_minutes ?? 90, visit_tips: item.visit_tips || "" }])));
-    setSelectedHotel(state.selected_hotel || ""); setDirty(false);
+    setDirty(false);
     const selected = state.selected_transport || {};
     setSelection({ outbound: selected.outbound || "", return: selected.return || "" });
     setKinds(Object.fromEntries(["outbound", "return"].map(direction => [direction, (state.transport_candidates || []).find(item => item.id === selected[direction])?.kind || "train"])));
@@ -119,35 +116,22 @@ export function PlanningPage({ api, refreshPlans }) {
       navigate(`/plans/${encode(planId)}/review`, { replace: true });
     }
   }, [plan, planId, navigate, viewingActivities]);
-  async function action(name, payload = {}, file = null) {
+  async function action(name, payload = {}) {
     if (requestBusy.current || uncertain) return null;
     if (name === "candidates" && plan.planning?.stage === "candidates" && dirty && !window.confirm("重新查询会重置尚未确认的交通选择，是否继续？")) return null;
     requestBusy.current = true; setBusy(true); setError("");
-    const labels = { guide: "正在识别攻略图片", activities: "正在识别地点与要求", draft: "正在生成并检查路线", candidates: "正在查询交通候选", resolve_place: "正在确认地点", choose_activities: "正在保存地点选择", choose_candidates: "正在保存交通并查询住宿", add_activity: "正在添加地点" };
+    const labels = { candidates: "正在查询交通候选", choose_candidates: "正在保存交通并查询住宿" };
     setTask(labels[name] || "正在保存");
     try {
-      if (plan.planning?.stage === 'activities' || (viewingActivities && guideText !== savedGuideText)) payload = { ...activitySnapshot(), text: guideText, ...payload };
-      if (file) {
-        const dataUrl = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error("图片读取失败，请重试。")); reader.readAsDataURL(file); });
-        payload = { ...payload, image_base64: String(dataUrl).split(",")[1] };
-      }
+      if (name === "candidates" && (plan.planning?.stage === "activities" || viewingActivities)) payload = { text: guideText, ...payload };
       const result = await api(`/api/plans/${encode(planId)}/planning/${name}`, { method: "POST", body: JSON.stringify(payload) });
       if (!mounted.current) return result;
       hydrate(result.plan);
-      if (name === "guide" || name === "activities") setGuideText(result.plan.planning?.guide_text || "");
       setNotice("修改已保存");
       void refreshAfterCommit(refreshPlans, setNotice);
       return result;
     } catch (cause) { if (mounted.current) { setError(cause.message); setUncertain(Boolean(cause.uncertain)); } return null; }
     finally { requestBusy.current = false; if (mounted.current) { setBusy(false); setTask(""); } }
-  }
-  const edits = { choices, categories, details, selected_hotel: selectedHotel, text: guideText };
-  const activitySnapshot = () => buildSnapshot(plan, edits);
-  async function generateFromSavedPlaces() {
-    if (activityIssues(plan, edits).some(issue => issue.blocking)) return;
-    if (await action("draft", { ...activitySnapshot(), text: plan.planning?.guide_text || "" })) {
-      allowNavigation(); navigate(`/plans/${encode(planId)}/review`);
-    }
   }
   async function reloadGeneratedPlaces() {
     // Keep inputs locked while loading the partial result so hydration cannot overwrite a new edit.
@@ -173,24 +157,19 @@ export function PlanningPage({ api, refreshPlans }) {
   if (!plan) return <div className="guided-page">{error ? <LoadError error={error} onRetry={() => setRevision(x => x + 1)} /> : <p role="status">正在加载旅行计划…</p>}</div>;
   const state = plan.planning || {};
   const transports = state.transport_candidates || [];
-  const activities = state.activities || [];
   const stage = state.stage || "requirements";
   const canReview = ["review", "confirmed"].includes(stage);
   const displayStage = viewingActivities && canReview ? "activities" : stage;
   const driving = kinds.outbound === "drive";
   const transportProblems = transportIssues(selection, driving, vehicles, driveDepartures);
-  const problems = activityIssues(plan, edits);
-  const blockers = problems.filter(x => x.blocking);
-  const detailProblems = blockers.filter(x => x.code === 'duration' || x.code === 'tips' || x.code === 'guide_length');
-  const validDetails = !detailProblems.length;
   if (stage === "review" && !viewingActivities) return <p role="status">正在打开路线审核…</p>;
-  return <div className="guided-page" aria-busy={busy || generating}><header className="guided-header"><Link to={`/plans/${encode(planId)}`}>← 行程详情</Link><h1>{plan.destination} · 规划向导</h1><p>{plan.start_date} 至 {plan.end_date} · {plan.travelers} 人 · 预算 {plan.budget} {plan.currency}</p></header>
+  return <div className="guided-page" aria-busy={busy || generating}><header className="guided-header"><Link to={`/plans/${encode(planId)}`}>← 行程详情</Link><h1>{plan.destination}规划向导</h1><p className="guided-head-meta"><span>{plan.start_date} 至 {plan.end_date}</span><span>{plan.travelers} 人</span><span>预算 {plan.budget} {plan.currency}</span></p></header>
     <nav className="guided-steps" aria-label="规划步骤">{[['candidates', '1 选交通'], ['activities', '2 选活动与攻略'], ['review', '3 审核路线'], ['confirmed', '4 行程单']].map(([step, label], index) => {
       const current = ['requirements', 'candidates'].includes(displayStage) ? 0 : ['activities', 'review', 'confirmed'].indexOf(displayStage) + 1;
       const enabled = index === 0 || (index === 1 && Boolean(state.selected_transport?.outbound)) || (index === 2 && canReview) || (index === 3 && stage === 'confirmed');
       return <button key={step} type="button" className={index === current ? 'active' : index < current ? 'complete' : ''} aria-current={index === current ? 'step' : undefined} disabled={!enabled || busy || generating || uncertain} onClick={async () => {
         if (step === displayStage) return;
-        if (step === 'candidates') { if (!validDetails && displayStage === 'activities') { setError('请先修正地点详情再保存并返回交通选择。'); return; } await action('candidates'); }
+        if (step === 'candidates') await action('candidates');
         else if (step === 'activities') {
           if (stage === 'candidates' && dirty) { setError('交通选择尚未确认，请先点击“确认交通，继续”。'); return; }
           // Browsing activities must leave the existing review available.
@@ -201,6 +180,7 @@ export function PlanningPage({ api, refreshPlans }) {
       }}>{index < current ? '✓ ' : ''}{label}</button>;
     })}</nav>
     {error && <p className="guided-error" role="alert">{error}</p>}
+    {Object.entries(state.lodging_search_errors || {}).map(([area, reason]) => <p key={area} className="guided-note" role="status">{area}住宿查询失败：{reason}</p>)}
     {notice && <p role="status">{notice}{notice.includes('列表') && <button onClick={() => refreshAfterCommit(refreshPlans, setNotice)}>刷新列表</button>}</p>}
     <BusyStatus task={task} />
     {uncertain && <div className="guided-error"><p>为避免重复执行，请先重新读取已保存状态。若服务仍在执行，请等待完成后再重试。</p><button disabled={busy} onClick={() => { if (!dirty || window.confirm('重新读取会放弃尚未保存的修改，是否继续？')) { setUncertain(false); setRevision(x => x + 1); } }}>重新读取并核实</button></div>}
@@ -213,7 +193,7 @@ export function PlanningPage({ api, refreshPlans }) {
       <div className="guided-actions"><button className="primary-button" disabled={transportProblems.length > 0} onClick={() => action("choose_candidates", { ...selection, ...(driving ? { drive_departures: driveDepartures, vehicles: Number(vehicles) } : {}) })}>确认交通，继续</button><button onClick={() => action("candidates")}>重新查询交通候选</button></div>
       </fieldset>
     </section>}
-    {displayStage === "activities" && <GuideGeneration api={api} planId={planId} initialJobId={generationJobId} text={guideText} onText={setGuideText} onAttachmentChange={setHasGuideImage} getSnapshot={activitySnapshot} disabled={busy || uncertain} onRunning={setGenerating} onNeedsInput={reloadGeneratedPlaces} manualAvailable={activities.some(item => item.category !== "hotel" && choices[item.id] !== "exclude")} onManual={generateFromSavedPlaces} onComplete={() => { allowNavigation(); navigate(`/plans/${encode(planId)}/review`, { replace: true }); }} />}
+    {displayStage === "activities" && <GuideGeneration api={api} planId={planId} initialJobId={generationJobId} text={guideText} onText={setGuideText} onAttachmentChange={setHasGuideImage} disabled={busy || uncertain} onRunning={setGenerating} onNeedsInput={reloadGeneratedPlaces} onComplete={() => { allowNavigation(); navigate(`/plans/${encode(planId)}/review`, { replace: true }); }} />}
 
     {displayStage === "confirmed" && <section className="guided-card"><h2>已确认行程</h2><p>行程单可查看、打印，并登记交通、酒店与门票购买价格。</p><Link className="primary-button" to={`/plans/${encode(planId)}/sheet`}>查看行程单</Link></section>}
   </div>;
@@ -230,80 +210,95 @@ export function GenerationView({ generation, activities = [] }) {
   </section>;
 }
 
-export function AuditView({ audit, plan, onIssue, busy = false }) {
-  const issues = audit?.issues || [];
-  const total = audit?.metrics?.tracked_cost_range?.max;
-  return <div className="guided-audit"><p>预算 {plan.budget} {plan.currency}{total != null && ` · 已知费用 ${total} · 扣除已知费用后 ${Math.round((plan.budget - total) * 100) / 100}`} · {issues.some((item) => item.type === "budget_overrun") ? "已知费用超预算" : "未知费用未计入"}</p>
-    {issues.length ? <ul>{issues.map((item, index) => <li className={`severity-${item.severity}`} key={`${item.type}-${index}`}><strong>{item.severity === "high" ? "必须处理" : "提示"}</strong> {item.message}{onIssue && <button type="button" disabled={busy} onClick={() => onIssue(item)}>去处理</button>}</li>)}</ul> : <p>未发现行程问题。</p>}
-  </div>;
-}
-
-export function ActivityDetailsEditor({ item, onEdit, busy, live = false }) {
+export function ActivityDetailsEditor({ item, onEdit, busy, live = false, draft }) {
+  const [expanded, setExpanded] = useState(Boolean(draft?.invalid));
   function submit(event) {
     event.preventDefault();
     const values = new FormData(event.currentTarget);
     const ticket = values.get("ticket_required") ?? (item.ticket_required == null ? "unknown" : item.ticket_required ? "yes" : "no");
-    onEdit(item.reference_id, { time_of_day: String(values.get("time_of_day")), duration_minutes: Number(values.get("duration_minutes")),
+    onEdit(item.reference_id, { ...(!live && { time_of_day: String(values.get("time_of_day")) }), duration_minutes: Number(values.get("duration_minutes")),
       ticket_required: ticket === "unknown" ? null : ticket === "yes",
       estimated_cost: Number(values.get("estimated_cost")), visit_tips: String(values.get("visit_tips") || "") });
   }
-  return <details className="guided-item-editor"><summary>调整停留信息</summary><form onSubmit={submit} onChange={live ? event => { const form = event.currentTarget; if (form.checkValidity()) submit({ preventDefault() {}, currentTarget: form }); } : undefined}>
-    <label>开始时间<input name="time_of_day" type="time" defaultValue={item.time_of_day} required /></label>
-    <label>停留时长（分钟）<input name="duration_minutes" type="number" min="30" max="600" step="1" defaultValue={item.duration_minutes || 90} required /></label>
-    {item.category === "attraction" && <label>是否需要门票<select name="ticket_required" defaultValue={item.ticket_required == null ? "unknown" : item.ticket_required ? "yes" : "no"}><option value="unknown">待确认</option><option value="yes">需要</option><option value="no">不需要</option></select></label>}
-    <label>预计总费用（元）<input name="estimated_cost" type="number" min="0" step="0.01" defaultValue={item.estimated_cost || 0} required /></label>
-    <label className="wide">停留注意事项<textarea name="visit_tips" maxLength="500" rows="2" defaultValue={item.visit_tips || ""} placeholder="例如预约、开放时间或交通提醒" /></label>
+  return <details className="guided-item-editor" open={expanded} onToggle={event => setExpanded(event.currentTarget.open)}><summary>调整停留信息</summary><form data-review-form={live ? item.item_id : undefined} onSubmit={submit} onChange={live ? event => { const form = event.currentTarget; if (form.checkValidity()) submit({ preventDefault() {}, currentTarget: form }); } : undefined}>
+    {!live && <label>开始时间<input name="time_of_day" type="time" defaultValue={item.time_of_day} required /></label>}
+    <label>停留时长（分钟）<input name="duration_minutes" type="number" min="30" max="600" step="1" defaultValue={draft?.values.duration_minutes ?? (item.duration_minutes || 90)} required /></label>
+    {item.category === "attraction" && <label>是否需要门票<select name="ticket_required" defaultValue={draft?.values.ticket_required ?? (item.ticket_required == null ? "unknown" : item.ticket_required ? "yes" : "no")}><option value="unknown">待确认</option><option value="yes">需要</option><option value="no">不需要</option></select></label>}
+    <label>预计总费用（元）<input name="estimated_cost" type="number" min="0" step="0.01" defaultValue={draft?.values.estimated_cost ?? (item.estimated_cost || 0)} required /></label>
+    <label className="wide">停留注意事项<textarea name="visit_tips" maxLength="500" rows="2" defaultValue={draft?.values.visit_tips ?? (item.visit_tips || "")} placeholder="例如预约、开放时间或交通提醒" /></label>
     {!live && <button disabled={busy}>保存并重新审核</button>}
   </form></details>;
 }
 
-function DayList({ items, routes, onMove, onEdit, busy = false }) {
-  const [dragged, setDragged] = useState(null);
-  const [dropTarget, setDropTarget] = useState(null);
-  const days = [...new Set(items.map((item) => item.day))].sort((a, b) => a - b);
-  function drop(event, day, beforeId) {
-    event.preventDefault();
-    const itemId = event.dataTransfer.getData("text/plain") || dragged;
-    setDragged(null); setDropTarget(null);
-    if (itemId && itemId !== beforeId && !busy) onMove?.(itemId, day, beforeId);
+
+function SheetLeg({ route, from, to }) {
+  if (!route) return <p className="guided-note sheet-leg">这段路线待核对。</p>;
+  if (route.source === "same_place") return <p className="guided-note sheet-leg">同一地点，继续下一项安排。</p>;
+  if (route.source === "lodging_pending") return <p className="guided-note sheet-leg">住宿确定后可核对这段路线。</p>;
+
+  const steps = routeInstructions(route);
+  const estimated = route.source === "provisional_estimate";
+  const distance = route.distance_meters;
+  return <div className="sheet-leg">
+    <p className="sheet-leg-heading"><strong>{sheetRouteModes[route.travel_mode] || "前往下一站"}</strong>
+      {route.station_transfer && <span>车站 / 机场接驳</span>}
+      {route.duration_minutes > 0 && <span>约 {route.duration_minutes} 分钟</span>}
+      {distance > 0 && !estimated && <span>{distance < 1000 ? `${distance} 米` : `${(distance / 1000).toFixed(1)} 公里`}</span>}
+      {estimated && <span className="sheet-leg-estimate">临时估算</span>}
+    </p>
+    <p className="guided-note">{route.origin || from.arrival_location || from.location} → {route.destination || to.location}</p>
+    {steps.length > 0 ? <ol className="sheet-directions">{steps.map((step, index) => <li key={index}>{step}</li>)}</ol>
+      : <p className="guided-note">{estimated ? "出发前请核对实时路线。" : "暂无逐步指引，出发前请查导航。"}</p>}
+  </div>;
+}
+
+function SheetDay({ api, planId, title, day, items, routes, date, active }) {
+  const stops = orderedSheetStops(items, routes);
+  const stopId = index => `sheet-day-${day}-stop-${index + 1}`;
+  function openStation(number) {
+    const details = document.getElementById(stopId(number - 1));
+    if (details) {
+      details.open = true;
+      details.querySelector("summary").focus();
+    }
   }
-  function slot(day, beforeId = null) {
-    if (!onMove) return null;
-    const key = `${day}:${beforeId || "end"}`;
-    return <div key={`slot-${key}`} className={`guided-drop-slot ${dragged ? "is-available" : ""} ${dropTarget === key ? "is-target" : ""}`}
-      onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget(key); }}
-      onDragLeave={() => setDropTarget((current) => current === key ? null : current)}
-      onDrop={(event) => drop(event, day, beforeId)}>{dragged && <span>放在这里</span>}</div>;
-  }
-  return <div className="guided-days">{days.map((day) => {
-    const ordered = items.filter((item) => item.day === day).sort((a, b) => a.time_of_day.localeCompare(b.time_of_day));
-    const returnTransport = day === days[days.length - 1] ? ordered.filter((item) => item.category === "intercity_transport").at(-1) : null;
-    return <section className="guided-day-panel" key={day}><h3>第 {day} 天</h3><div className="guided-day-stack">
-      {ordered.map((item) => isMovableStop(item) ? <React.Fragment key={item.item_id}>
-        {slot(day, item.item_id)}
-        <article className={`guided-activity-card ${dragged === item.item_id ? "is-dragging" : ""}`}
-          draggable={Boolean(onMove) && !busy}
-          onDragStart={onMove ? (event) => {
-            if (event.target.closest("form, input, select, textarea, summary, button")) { event.preventDefault(); return; }
-            event.dataTransfer.setData("text/plain", item.item_id);
-            event.dataTransfer.effectAllowed = "move";
-            setDragged(item.item_id);
-          } : undefined}
-          onDragEnd={() => { setDragged(null); setDropTarget(null); }}>
-          <div className="guided-card-top"><time>{item.time_of_day}</time><span className="guided-card-grip" aria-hidden="true">⠿</span><div><strong>{item.title}</strong><small>{item.location}</small></div>{onMove && <span className="guided-card-hint">拖动卡片</span>}</div>
-          <p className="guided-item-meta">约 {item.duration_minutes || 90} 分钟 · {categoryLabels[item.category] || "停留地点"}{item.category === "attraction" ? ` · 门票${item.ticket_required == null ? "待确认" : item.ticket_required ? "需要" : "无需"}` : item.category === "food" && item.place?.cost_per_person ? ` · 地图人均 ${item.place.cost_per_person} 元` : ` · 费用${item.estimated_cost > 0 ? ` ${item.estimated_cost} 元` : "未知"}`}{item.category === "attraction" && item.ticket_required && ` · 门票费用${item.estimated_cost > 0 ? ` ${item.estimated_cost} 元` : "未知"}`}</p>
-          {item.visit_tips && <p className="guided-item-tips">注意：{item.visit_tips}</p>}
-          {item.reason && <p className="guided-item-tips">安排理由：{item.reason}</p>}
-          {onEdit && <ActivityDetailsEditor key={`${item.reference_id}-${item.duration_minutes}-${item.ticket_required}-${item.estimated_cost}-${item.visit_tips}`} item={item} onEdit={onEdit} busy={busy} />}
-        </article>
-      </React.Fragment> : <React.Fragment key={item.item_id}>{(item.item_id === returnTransport?.item_id || (!returnTransport && item.anchor_role === "end")) && slot(day)}<div className="guided-fixed-stop"><time>{item.time_of_day}</time><div><strong>{item.title}</strong><small>{item.location}</small></div></div></React.Fragment>)}
-    </div></section>;
-  })}{routes.some((route) => route.source === "provisional_estimate") && <p className="guided-note">地点间通勤暂按估算安排，出行前请核对实时路线。</p>}</div>;
+  return <section className="guided-day-panel sheet-day" id={`sheet-day-${day}`} data-active={active}>
+    <h3>第 {day} 天 <small>{date}</small></h3>
+    {!stops.length ? <p className="guided-note">当天暂无行程安排。</p> : <>
+      {active && <SheetDayMap api={api} planId={planId} day={day} date={date} title={title} stops={stops} onStation={openStation} />}
+      <ol className="sheet-route-timeline" aria-label={`第 ${day} 天行程与交通`}>
+        {stops.map(({ item, route }, index) => {
+          const next = stops[index + 1]?.item;
+          const place = item.arrival_location ? `${item.location} → ${item.arrival_location}` : item.location;
+          return <li key={item.item_id} className="sheet-route-stop"><details id={stopId(index)}>
+            <summary className="sheet-stop-heading">
+              <span className="sheet-stop-label">
+              <span className="sheet-stop-number" aria-hidden="true">{index + 1}</span>
+              <time>{sheetStopTime(item)}</time>
+              <strong>{item.title}{item.hotel_name && ` · ${item.hotel_name}`}</strong>
+              </span>
+              <PlacePhoto item={item} />
+            </summary>
+            <div className="sheet-stop-detail">
+              {place && <p className="guided-note">{place}</p>}
+              {item.arrival_location && !item.station_confirmed && <p className="guided-note">具体上下车地点待核对。</p>}
+              {isMovableStop(item) && <p className="guided-item-meta">约 {item.duration_minutes || 90} 分钟 · {categoryLabels[item.category]}{item.category === "attraction" ? ` · 门票${item.ticket_required == null ? "待确认" : item.ticket_required ? "需要" : "无需"}` : item.category === "food" && item.place?.cost_per_person ? ` · 地图人均 ${item.place.cost_per_person} 元` : ` · 费用${item.estimated_cost > 0 ? ` ${item.estimated_cost} 元` : "未知"}`}{item.category === "attraction" && item.ticket_required && ` · 门票费用${item.estimated_cost > 0 ? ` ${item.estimated_cost} 元` : "未知"}`}</p>}
+              {item.visit_tips && <p className="guided-item-tips">注意：{item.visit_tips}</p>}
+              {item.reason && <p className="guided-item-tips">安排理由：{item.reason}</p>}
+              {next && <SheetLeg route={route} from={item} to={next} />}
+            </div>
+          </details></li>;
+        })}
+      </ol>
+    </>}
+  </section>;
 }
 
 export function SheetPage({ api }) {
   const { planId } = useParams();
   const [sheet, setSheet] = useState(null);
+  const [summaries, setSummaries] = useState({});
+  const [selectedDay, setSelectedDay] = useState(null);
   const [prices, setPrices] = useState({});
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -311,7 +306,30 @@ export function SheetPage({ api }) {
   const [uncertain, setUncertain] = useState(false);
   const purchaseLock = useRef(false);
   const load = () => api(`/api/plans/${encode(planId)}/sheet`).then(({ sheet }) => setSheet(sheet));
-  useEffect(() => { let active = true; setSheet(null); setPrices({}); setError(""); api(`/api/plans/${encode(planId)}/sheet`).then(({ sheet }) => { if (active) setSheet(sheet); }).catch(cause => { if (active) setError(cause.message); }); return () => { active = false; }; }, [api, planId, revision]);
+  useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
+    const url = `/api/plans/${encode(planId)}`;
+    setSheet(null);
+    setSelectedDay(null);
+    setPrices({});
+    setError("");
+
+    async function prepareRoadbook() {
+      try {
+        const { sheet } = await api(`${url}/sheet`, { signal });
+        if (signal.aborted) return;
+        const { summaries } = await api(`${url}/roadbook`, { method: "POST", signal });
+        if (signal.aborted) return;
+        setSummaries(summaries);
+        setSheet(sheet);
+      } catch (cause) {
+        if (!signal.aborted) setError(`无法展示路书。${cause.status === 502 ? "每日概述生成失败，请重试。" : cause.message}`);
+      }
+    }
+    prepareRoadbook();
+    return () => controller.abort();
+  }, [api, planId, revision]);
   async function buy(item) {
     const price = prices[item.reference_id] ?? item.actual_total;
     if (purchaseLock.current || uncertain) return;
@@ -323,12 +341,23 @@ export function SheetPage({ api }) {
     } catch (cause) { setError(cause.message); setUncertain(Boolean(cause.uncertain)); }
     finally { purchaseLock.current = false; setBusy(false); }
   }
-  if (!sheet) return <div className="guided-page">{error ? <LoadError error={error} onRetry={() => setRevision(x => x + 1)} /> : <p>正在生成行程单…</p>}</div>;
-  return <div className="guided-page guided-sheet"><header className="guided-header"><Link to={`/plans/${encode(planId)}/planning`}>← 返回规划</Link><h1>{sheet.title} · 行程单</h1><p>{sheet.dates.join(" 至 ")} · {sheet.travelers} 人</p><button onClick={() => window.print()}>打印 / 保存为 PDF</button></header>
+  if (!sheet) return <div className="guided-page">{error ? <LoadError error={error} onRetry={() => setRevision(x => x + 1)} /> : <BusyStatus task="正在准备路书" />}</div>;
+  const activeDay = sheet.days.some(({ day }) => day === selectedDay) ? selectedDay : null;
+  return <div className="guided-page guided-sheet"><header className="guided-header"><Link to={`/plans/${encode(planId)}/planning`}>← 返回规划</Link><h1>{sheet.title} · 路书</h1><p className="guided-head-meta"><span>{sheet.dates.join(" 至 ")}</span><span>{sheet.travelers} 人</span></p><button onClick={() => window.print()}>打印 / 保存为 PDF</button></header>
     {error && <LoadError error={error} onRetry={() => setRevision(x => x + 1)} />}
-    {uncertain && <button onClick={() => { setUncertain(false); setRevision(x => x + 1); }}>重新读取购买记录并核实</button>}<section className="guided-card"><h2>交通与住宿</h2><p>去程：{transportLabels[sheet.transport.outbound.kind] || sheet.transport.outbound.kind} {sheet.transport.outbound.date} {sheet.transport.outbound.depart_time}–{sheet.transport.outbound.arrive_time}</p><p>返程：{transportLabels[sheet.transport.return.kind] || sheet.transport.return.kind} {sheet.transport.return.date} {sheet.transport.return.depart_time}–{sheet.transport.return.arrive_time}</p><p>酒店：{sheet.hotel?.name || "一日行程，无住宿"} {sheet.hotel?.location || ""}</p><p className="guided-note">未知价格不计入合计；已购项目按记录的实际支付价格计算。</p></section>
-    <section className="guided-card"><h2>每日安排</h2><DayList items={sheet.days.flatMap((day) => day.items)} routes={sheet.routes} /></section>
-    <section className="guided-card"><h2>购买记录与预算</h2><p>已付 {sheet.budget.paid_total} · 已知费用合计 {sheet.budget.estimated_total} · 扣除已知费用后 {sheet.budget.remaining} {sheet.currency}</p><div className="guided-options">{sheet.budget.items.map((item) => <div className="guided-option" key={item.reference_id}><span><strong>{item.label}</strong><small>{item.category} · {item.cost_unknown ? "费用未知" : `已知费用 ${item.estimate}`}</small></span>{item.bookable === false ? <small>{item.retained_expense ? "已保留的历史支出（只读）" : "来自地图路线或用户记录"}</small> : <div className="guided-purchase"><input type="number" min="0" step="0.01" aria-label={`${item.label}实际购买价格`} value={prices[item.reference_id] ?? (item.purchased ? item.actual_total : "")} onChange={(e) => setPrices((current) => ({ ...current, [item.reference_id]: e.target.value }))} placeholder="实际总价" /><button disabled={busy || uncertain || !validMoney(prices[item.reference_id] ?? (item.purchased ? item.actual_total : ""))} onClick={() => buy(item)}>{item.purchased ? "更新已购价格" : "标记已购买"}</button></div>}</div>)}</div></section>
-    <section className="guided-card"><h2>行程检查</h2><AuditView audit={sheet.audit} plan={{ budget: sheet.budget_limit, currency: sheet.currency }} /></section>
+    {uncertain && <button onClick={() => { setUncertain(false); setRevision(x => x + 1); }}>重新读取购买记录并核实</button>}
+    <section className="guided-card sheet-itinerary"><h2>{activeDay ? "分天预览" : "旅程总览"}</h2>
+      {sheet.days.length > 0 && <nav className="review-day-nav sheet-day-nav" aria-label="选择行程日期">
+        <button type="button" aria-pressed={!activeDay} onClick={() => setSelectedDay(null)}>总览</button>
+        {sheet.days.map(({ day }) => <button key={day} type="button" aria-pressed={day === activeDay} aria-controls={`sheet-day-${day}`} onClick={() => setSelectedDay(day)}>第 {day} 天</button>)}
+      </nav>}
+      {!activeDay && <RoadbookOverview api={api} planId={planId} sheet={sheet} summaries={summaries} onDay={setSelectedDay} />}
+      <div className="guided-days">{sheet.days.map(({ day, items }) => <SheetDay key={day} api={api} planId={planId} title={sheet.title} day={day} items={items} active={day === activeDay} routes={sheet.routes || []} date={returnDate(sheet.dates[0], day)} />)}</div>
+    </section>
+    <section className="guided-card"><h2>交通与住宿</h2><p>去程：{transportLabels[sheet.transport.outbound.kind] || sheet.transport.outbound.kind} {sheet.transport.outbound.date} {sheet.transport.outbound.depart_time} 至 {sheet.transport.outbound.arrive_time}</p><p>返程：{transportLabels[sheet.transport.return.kind] || sheet.transport.return.kind} {sheet.transport.return.date} {sheet.transport.return.depart_time} 至 {sheet.transport.return.arrive_time}</p>
+      {(sheet.hotels ?? (sheet.hotel ? [sheet.hotel] : [])).map(hotel => <p key={hotel.id}>酒店：{hotel.name} {hotel.location}{hotel.nights > 0 && ` · ${hotel.nights} 晚`}</p>)}
+      {!sheet.hotel && !sheet.hotels?.length && <p>一日行程，无住宿</p>}
+      <p className="guided-note">未知价格不计入合计；已购项目按记录的实际支付价格计算。</p></section>
+    <section className="guided-card"><h2>购买记录与预算</h2><p className="sheet-budget-summary"><span>已付 <data value={sheet.budget.paid_total}>{sheet.budget.paid_total}</data></span><span>已知费用合计 <data value={sheet.budget.estimated_total}>{sheet.budget.estimated_total}</data></span><span>扣除已知费用后 <data value={sheet.budget.remaining}>{sheet.budget.remaining}</data> {sheet.currency}</span></p><div className="guided-options">{sheet.budget.items.map((item) => <div className="guided-option" key={item.reference_id}><span><strong>{item.label}</strong><small>{item.category} · {item.cost_unknown ? "费用未知" : `已知费用 ${item.estimate}`}</small></span>{item.bookable === false ? <small>{item.retained_expense ? "已保留的历史支出（只读）" : "来自地图路线或用户记录"}</small> : <div className="guided-purchase"><input type="number" min="0" step="0.01" aria-label={`${item.label}实际购买价格`} value={prices[item.reference_id] ?? (item.purchased ? item.actual_total : "")} onChange={(e) => setPrices((current) => ({ ...current, [item.reference_id]: e.target.value }))} placeholder="实际总价" /><button disabled={busy || uncertain || !validMoney(prices[item.reference_id] ?? (item.purchased ? item.actual_total : ""))} onClick={() => buy(item)}>{item.purchased ? "更新已购价格" : "标记已购买"}</button></div>}</div>)}</div></section>
   </div>;
 }

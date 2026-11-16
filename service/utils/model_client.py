@@ -1,6 +1,7 @@
 """Model configuration and OpenAI Chat Completions transport."""
 
 import json
+from contextvars import ContextVar
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -21,11 +22,21 @@ class OllamaClient(AsyncClient):
         return await super().chat(**kwargs)
 
 
+AVAILABLE_MODELS = (
+    "deepseek-ai/DeepSeek-V4.1-Flash",
+    "Qwen/Qwen3.5-122B-A10B",
+    "zai-org/GLM-5.3-Flash",
+)
+selected_model = ContextVar("selected_model", default=AVAILABLE_MODELS[0])
+
+
 def get_model():
-    name = "SILICONFLOW_MODEL" if env("LLM_PROVIDER").strip().lower() == "siliconflow" else "LLM_MODEL"
-    model = env(name).strip()
-    if not model:
-        raise ValueError(f"{name} is required")
+    return selected_model.get()
+
+
+def validate_model(model):
+    if model not in AVAILABLE_MODELS:
+        raise ValueError("请选择列表中的模型")
     return model
 
 

@@ -6,10 +6,11 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta
 from hashlib import sha256
 from math import ceil, isfinite
+import re
 from typing import Any
 
 from service.storage.travel_db import now
-from service.travel.guide import analyze_guide
+from service.travel.guide import analyze_guide, split_guide_days
 from service.mcp.server import amap_compute_route
 
 
@@ -256,6 +257,7 @@ def build_activities(
     planning = updated.setdefault("planning", {})
     guide = analyze_guide(guide_text)
     planning["guide_text"] = guide["text"]
+    planning["guide_days"], planning["guide_reserve"] = split_guide_days(guide["text"])
     planning["guide_places"] = guide["places"]
     planning["lodging_areas"] = guide.get("lodging_areas", [])
     planning["guide_constraints"] = guide.get("constraints", [])
@@ -461,7 +463,8 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
     outbound, returning, hotel = _selected(updated)
     days = (date.fromisoformat(updated["end_date"]) - date.fromisoformat(updated["start_date"])).days + 1
     home = planning.get("home_location") or updated["departure_city"]
-    lodging = hotel["location"] if hotel else None
+    lodging = hotel["location"] if hotel else "待选择住宿"
+    lodging_fields = {"place": hotel.get("place"), "hotel_name": hotel["name"], "reference_id": hotel["id"]} if hotel else {"lodging_pending": True}
     pending = [deepcopy(x) for x in planning.get("unscheduled_items", []) if x.get("manual_pending")]
     pending_ids = {x["reference_id"] for x in pending}
     activities = sorted(
@@ -492,10 +495,10 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
             itinerary[-1]["location"] = outbound.get("departure_location") or updated["departure_city"]
             if not last and hotel:
                 itinerary.append(_item(day, "arrival", arrivals + 60, "抵达酒店", lodging,
-                                       "hotel_arrival", place=hotel.get("place"), hotel_name=hotel["name"]))
-        elif hotel:
+                                       "hotel_arrival", **lodging_fields))
+        else:
             itinerary.append(_item(day, "start", 8 * 60, "从酒店出发", lodging,
-                                       "hotel_anchor", anchor_role="start", place=hotel.get("place"), hotel_name=hotel["name"]))
+                                       "hotel_anchor", anchor_role="start", **lodging_fields))
 
         slot = window_start
         planned_today = 0
@@ -539,9 +542,9 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
             itinerary[-1]["location"] = returning.get("departure_location") or updated["destination"]
             itinerary.append(_item(day, "end", _minute(returning["arrive_time"]) + 60,
                                    "回到家", home, "home_anchor", anchor_role="end"))
-        elif hotel:
+        else:
             itinerary.append(_item(day, "end", max(slot, 20 * 60), "返回酒店", lodging,
-                                   "hotel_anchor", anchor_role="end", place=hotel.get("place"), hotel_name=hotel["name"]))
+                                   "hotel_anchor", anchor_role="end", **lodging_fields))
 
     scheduled_ids = ({stop["activity_id"] for day in proposal["days"] for stop in day["visits"]}
                      if "days" in proposal else {stop["activity_id"] for stop in proposal["stops"]}) if proposal is not None else None
@@ -568,16 +571,161 @@ def draft_itinerary(plan: dict[str, Any], proposal: dict | None = None) -> dict[
         planning["generation"]["contract_version"] = 3
     planning["stage"] = "review"
     planning["needs_replan"] = False
+    planning.pop("day_departures", None)
     return updated
+
+
+def edit_review_place(plan: dict, payload: dict) -> dict:
+    from service.travel.map_planning import lookup_review_place
+
+    updated = deepcopy(plan)
+    planning = updated["planning"]
+    items = updated["itinerary"]
+    index = next((i for i, item in enumerate(items) if item["item_id"] == payload.get("item_id")), None)
+    if planning["stage"] != "review" or index is None:
+        raise ValueError("请在审核阶段选择有效的行程卡片")
+    anchor = items[index]
+    category = payload.get("category")
+    replacing = payload.get("replace", False)
+    if type(replacing) is not bool or category not in ("attraction", "food", "hotel"):
+        raise ValueError("请选择有效的行程类型")
+    if replacing and (category != "hotel" or anchor["category"] not in {"hotel", "hotel_anchor", "hotel_arrival"}):
+        raise ValueError("请选择住宿卡片")
+    if not replacing and (anchor.get("anchor_role") == "end" or anchor["item_id"].endswith("-return")):
+        raise ValueError("请在当天结束卡片之前添加行程")
+    activity_id = payload.get("activity_id")
+    if not isinstance(activity_id, str) or not re.fullmatch(r"manual-[0-9a-f]{32}", activity_id):
+        raise ValueError("行程标识无效")
+    if any(x["id"] == activity_id for x in planning["activities"] + planning["hotel_candidates"]):
+        raise ValueError("行程标识已存在")
+    tips = payload.get("visit_tips", "")
+    if not isinstance(tips, str) or len(tips) > 500:
+        raise ValueError("注意事项最多 500 字")
+    duration = payload.get("duration_minutes") if category == "attraction" else 60 if category == "food" else 0
+    if type(duration) is not int or (category == "attraction" and not 30 <= duration <= 600):
+        raise ValueError("景点停留时间应为 30–600 分钟")
+    place = lookup_review_place(payload.get("poi_id"))
+    location = place["address"] or place["name"]
+    details = {"place": place, "location": location, "visit_tips": tips.strip()}
+    activity = {"id": activity_id, "name": place["name"], "category": category,
+                "duration_minutes": duration, "estimated_cost": 0, "source": "高德 POI",
+                "choice": "optional", "place_status": "manual_confirmed", **details}
+    planning["activities"].append(activity)
+    if category == "hotel":
+        planning["hotel_candidates"].append({"id": activity_id, "name": place["name"],
+            "location": location, "place": place, "nights": 0, "price_source": "unknown", "cost_unknown": True})
+    if replacing:
+        targets = [anchor]
+        if anchor.get("lodging_pending"):
+            is_end = anchor["anchor_role"] == "end"
+            paired_day = anchor["day"] + (1 if is_end else -1)
+            targets.extend(x for x in items if x["day"] == paired_day and x.get("lodging_pending")
+                           and x["anchor_role"] == ("start" if is_end else "end"))
+        for item in targets:
+            item.update(reference_id=activity_id, hotel_name=place["name"], **details)
+            if item["category"] == "hotel":
+                item.update(title=place["name"], hotel_name=None)
+            item.pop("lodging_pending", None)
+        anchor["lodging_selected_here"] = True
+    else:
+        items.insert(index + 1, _item(anchor["day"], activity_id, _start_minutes(anchor),
+                     place["name"], location, category, duration, reference_id=activity_id,
+                     place=place, visit_tips=tips.strip()))
+        targets = []
+    changed_ids = {item["item_id"] for item in targets}
+    updated["routes"] = [route for route in updated["routes"]
+                         if not changed_ids.intersection((route["origin_item_id"], route["destination_item_id"]))]
+    return _reflow_review(updated)
+
+
+def complete_review_lodging(plan: dict, activity_id: str) -> dict:
+    updated = deepcopy(plan)
+    items = updated["itinerary"]
+    lodging_categories = {"hotel", "hotel_anchor", "hotel_arrival"}
+    source = next((item for item in items if item["category"] in lodging_categories
+                   and item.get("reference_id") == activity_id and not item.get("lodging_pending")), None)
+    days = (date.fromisoformat(updated["end_date"]) - date.fromisoformat(updated["start_date"])).days + 1
+    if not isinstance(activity_id, str) or not activity_id or updated["planning"]["stage"] != "review" or not source or days < 2:
+        raise ValueError("请选择当前多日行程中的有效住宿")
+    hotel_name = source.get("hotel_name") or source["title"]
+    poi_id = (source.get("place") or {}).get("place_id")
+    details = {"place": source.get("place"), "location": source["location"],
+               "reference_id": activity_id, "hotel_name": hotel_name}
+
+    def same_hotel(item):
+        other_poi = (item.get("place") or {}).get("place_id")
+        return poi_id == other_poi if poi_id and other_poi else item["location"] == source["location"]
+
+    changed = set()
+    itinerary = []
+    for day in range(1, days + 1):
+        stops = [item for item in items if item["day"] == day]
+        slots = [("arrival", "hotel_arrival", None, "抵达酒店")] if day == 1 else [
+            ("start", "hotel_anchor", "start", "从酒店出发")]
+        if day < days:
+            slots.append(("end", "hotel_anchor", "end", "返回酒店"))
+        else:
+            slots.append(("checkout", "hotel", "checkout", "返回酒店"))
+        # Reuse a single hotel stop as the arrival or departure before placing a return.
+        for key, category, role, title in slots:
+            if key == "checkout":
+                position = next((i for i, item in enumerate(stops) if item["category"] == "intercity_transport"
+                                 or item["category"] == "home_anchor"), len(stops))
+            else:
+                position = (len(stops) if key == "end" else 0 if key == "start" else next(
+                    (i for i, item in enumerate(stops) if item["category"] in MOVABLE_CATEGORIES
+                     or item["category"] == "hotel_anchor" and item.get("anchor_role") == "end"), len(stops)))
+            target = next((item for item in stops if item["category"] == category and item.get("anchor_role") == role), None)
+            edge = position if key == "start" else position - 1
+            if 0 <= edge < len(stops) and stops[edge] is target:
+                edge += 1 if key == "start" else -1
+            standalone = stops[edge] if 0 <= edge < len(stops) else None
+            if not standalone or standalone.get("anchor_role") or standalone["category"] != "hotel" or not same_hotel(standalone):
+                standalone = None
+            if not standalone and key in {"start", "arrival"}:
+                last_visit = next((item for item in reversed(stops) if item.get("anchor_role") != "end"), None) if day < days else None
+                standalone = next((item for item in stops if item is not last_visit and item["category"] == "hotel"
+                                   and not item.get("anchor_role") and same_hotel(item)), None)
+            before = stops[position] if position < len(stops) else None
+            if standalone:
+                if target:
+                    stops.remove(target)
+                target = standalone
+            elif not target:
+                time = (8 * 60 if role == "start" else _start_minutes(stops[position - 1]) if position else 20 * 60)
+                target = _item(day, f"lodging-{key}", time, title, source["location"], category)
+            if before is not target:
+                if target in stops:
+                    stops.remove(target)
+                position = 0 if key == "start" else stops.index(before) if before in stops else len(stops)
+                stops.insert(position, target)
+            previous = target.copy()
+            if not same_hotel(target) or target.get("lodging_pending") or "visit_tips" not in target:
+                target["visit_tips"] = source.get("visit_tips", "")
+            if target.get("reference_id") != activity_id:
+                target.pop("lodging_selected_here", None)
+            target.update(**details, category=category, title=title)
+            if role:
+                target["anchor_role"] = role
+            target.pop("lodging_pending", None)
+            if target != previous:
+                changed.add(target["item_id"])
+        itinerary.extend(stops)
+    updated["itinerary"] = itinerary
+    updated["routes"] = [route for route in updated["routes"]
+                         if not changed.intersection((route["origin_item_id"], route["destination_item_id"]))]
+    return _reflow_review(updated)
 
 
 def _reflow_review(plan: dict[str, Any]) -> dict[str, Any]:
     """Keep transport and home/hotel anchors fixed while rebuilding local legs."""
     outbound, _, _ = _selected(plan)
     days = (date.fromisoformat(plan["end_date"]) - date.fromisoformat(plan["start_date"])).days + 1
-    routes = []
+    routes, itinerary = [], []
     existing = {(x["origin_item_id"], x["destination_item_id"]): x for x in plan.get("routes", [])}
+    explicit_departures = "day_departures" in plan["planning"]
     for day in range(1, days + 1):
+        day_items = [x for x in plan["itinerary"] if x["day"] == day]
         attractions = [x for x in plan["itinerary"] if x["day"] == day and x["category"] in MOVABLE_CATEGORIES]
         slot = max(9 * 60, _minute(outbound["arrive_time"]) + 90) if day == 1 else 9 * 60 + 30
         for item in attractions:
@@ -588,19 +736,73 @@ def _reflow_review(plan: dict[str, Any]) -> dict[str, Any]:
             end = next((x for x in plan["itinerary"] if x["day"] == day and x.get("anchor_role") == "end"), None)
             if end:
                 _set_start(end, max(slot, 20 * 60))
-        ordered = sorted((x for x in plan["itinerary"] if x["day"] == day), key=_start_minutes)
+        anchors = [x for x in plan["itinerary"] if x["day"] == day and x["category"] not in MOVABLE_CATEGORIES]
+        ordered = day_items if explicit_departures else sorted(anchors + attractions, key=_start_minutes)
+        itinerary.extend(ordered)
         for origin, destination in zip(ordered, ordered[1:]):
             old = existing.get((origin["item_id"], destination["item_id"]), {})
             start = origin.get("arrival_location", origin["location"])
             end = destination["location"]
-            cached = {key: old[key] for key in ("route_options", "route_options_key", "mode_locked") if key in old} if old.get("origin") == start and old.get("destination") == end else {}
-            routes.append({"origin_item_id": origin["item_id"], "destination_item_id": destination["item_id"],
-                           "origin": start, "destination": end,
-                           "duration_minutes": 30, "source": "provisional_estimate",
-                           "travel_mode": old.get("travel_mode", "TRANSIT"), **cached})
-    plan["itinerary"].sort(key=lambda x: (x["day"], _start_minutes(x)))
+            if old.get("origin") == start and old.get("destination") == end:
+                routes.append(old)
+            else:
+                routes.append({"origin_item_id": origin["item_id"], "destination_item_id": destination["item_id"],
+                               "origin": start, "destination": end,
+                               "duration_minutes": 30, "source": "provisional_estimate",
+                               "travel_mode": old.get("travel_mode", "TRANSIT")})
+    plan["itinerary"] = itinerary
     plan["routes"] = routes
     return plan
+
+
+def update_day_departure(plan: dict, day: int, time: str) -> dict:
+    if plan["planning"]["stage"] != "review" or type(day) is not int:
+        raise ValueError("请在审核阶段选择有效的行程日期")
+    _validate_clock(time)
+    first = next((x for x in plan["itinerary"] if x["day"] == day), None)
+    if first is None or not (first.get("anchor_role") == "start" or first["category"] in MOVABLE_CATEGORIES):
+        raise ValueError("当天出发时刻由固定交通决定或没有可调整的地点")
+    planning = plan["planning"]
+    departures = {**planning.get("day_departures", {}), str(day): time}
+    if "requested_time" in first:
+        itinerary = [{key: value for key, value in item.items() if key != "requested_time"} if item is first else item
+                     for item in plan["itinerary"]]
+        plan = {**plan, "itinerary": itinerary}
+    return {**plan, "planning": {**planning, "day_departures": departures}}
+
+
+def schedule_review(plan: dict) -> dict:
+    """Derive the review timetable from ordered stops, departures and selected legs."""
+    departures = plan["planning"]["day_departures"]
+    routes = {(r["origin_item_id"], r["destination_item_id"]): r for r in plan["routes"]}
+    days = {}
+    for item in plan["itinerary"]:
+        days.setdefault(item["day"], []).append(item)
+    for day, items in days.items():
+        first = items[0]
+        if first.get("anchor_role") == "start" or first["category"] in MOVABLE_CATEGORIES:
+            if str(day) not in departures:
+                departures[str(day)] = first.get("time_of_day") or "09:30"
+            _set_start(first, _minute(first.get("requested_time") or departures[str(day)]))
+        for previous, item in zip(items, items[1:]):
+            route = routes.get((previous["item_id"], item["item_id"]), {})
+            earliest = _start_minutes(previous) + previous.get("duration_minutes", 0) + route.get("duration_minutes", 30)
+            if item["category"] in MOVABLE_CATEGORIES:
+                _set_start(item, _minute(item["requested_time"]) if item.get("requested_time") else earliest)
+            elif item["category"] != "intercity_transport":
+                _set_start(item, _minute(item["requested_time"]) if item.get("requested_time") else earliest)
+    return plan
+
+
+def itinerary_for_storage(plan: dict) -> list[dict]:
+    planning = plan.get("planning") or {}
+    if "day_departures" not in planning or planning.get("optimized_timetable"):
+        return plan["itinerary"]
+    return [
+        item if item["category"] == "intercity_transport" else
+        {key: value for key, value in item.items() if key not in {"time_of_day", "day_offset"}}
+        for item in plan["itinerary"]
+    ]
 
 
 def move_activity(plan: dict[str, Any], item_id: str, target_day: int | None,
@@ -636,8 +838,18 @@ def move_activity(plan: dict[str, Any], item_id: str, target_day: int | None,
     moving["manual_pending"] = target_day is None
     moving.pop("requested_time", None)
     updated["planning"].pop("unplaced_activities", None)
-    anchors = [x for x in updated["itinerary"] if x["category"] not in MOVABLE_CATEGORIES]
-    updated["itinerary"] = anchors + [x for day in range(1, days + 1) for x in by_day[day]]
+    if "day_departures" in updated["planning"]:
+        updated["itinerary"] = [x for x in updated["itinerary"] if x is not moving]
+        if target_day is not None:
+            position = next((i for i, x in enumerate(updated["itinerary"])
+                             if x["day"] > target_day or x["day"] == target_day and
+                             (x["item_id"] == before_item_id or not before_item_id and
+                              (x.get("anchor_role") == "end" or x["item_id"].endswith("-return")))),
+                            len(updated["itinerary"]))
+            updated["itinerary"].insert(position, moving)
+    else:
+        anchors = [x for x in updated["itinerary"] if x["category"] not in MOVABLE_CATEGORIES]
+        updated["itinerary"] = anchors + [x for day in range(1, days + 1) for x in by_day[day]]
     return _reflow_review(updated)
 
 
@@ -662,6 +874,7 @@ def update_activity_details(plan: dict[str, Any], activity_id: str, details: dic
     for record in (activity, item):
         record.update(duration_minutes=duration, ticket_required=ticket,
                       visit_tips=tips.strip(), estimated_cost=cost)
+    optimized = updated["planning"].get("optimized_timetable")
     if "time_of_day" in details:
         value = details["time_of_day"]
         if not isinstance(value, str) or len(value) != 5:
@@ -671,7 +884,11 @@ def update_activity_details(plan: dict[str, Any], activity_id: str, details: dic
         except ValueError as exc:
             raise ValueError("Start time must use HH:MM") from exc
         item["requested_time"] = value
-    return _reflow_review(updated)
+        if optimized:
+            _set_start(item, _minute(value))
+    elif "day_departures" in updated["planning"] and not optimized:
+        item.pop("requested_time", None)
+    return updated if optimized else _reflow_review(updated)
 
 
 def update_route_mode(plan: dict[str, Any], origin_id: str, destination_id: str, mode: str) -> dict:
@@ -687,6 +904,13 @@ def update_route_mode(plan: dict[str, Any], origin_id: str, destination_id: str,
     route.update(source="provisional_estimate", duration_minutes=30, legs=[], mode_locked=True)
     route.pop("distance_meters", None)
     route.pop("fare", None)
+    option = (route.get("route_options") or {}).get(mode) or {}
+    if option.get("success"):
+        for field in ("duration_minutes", "distance_meters", "fare", "legs"):
+            if field in option:
+                route[field] = option[field]
+    if updated["planning"].get("optimized_timetable"):
+        return updated
     return _reflow_review(updated)
 
 
@@ -742,22 +966,39 @@ def schedule_itinerary(plan: dict) -> dict:
     return plan
 
 
+def _review_hotel_nights(plan: dict) -> dict:
+    selected = plan.get("planning", {}).get("selected_hotel")
+    lodging_nights = {}
+    has_overnight = False
+    for stop in plan.get("itinerary", []):
+        overnight = stop.get("category") == "hotel_anchor" and stop.get("anchor_role") == "end"
+        has_overnight |= overnight
+        if stop.get("category") == "hotel" or overnight:
+            hotel_id = stop.get("reference_id") or selected
+            if hotel_id and not stop.get("lodging_pending"):
+                lodging_nights[hotel_id] = lodging_nights.get(hotel_id, 0) + int(overnight)
+    if not has_overnight and selected:
+        hotel = next((x for x in plan["planning"].get("hotel_candidates", []) if x["id"] == selected), {})
+        lodging_nights.setdefault(selected, hotel.get("nights", 0))
+    return lodging_nights
+
+
 def _billable_items(plan: dict[str, Any]) -> list[dict[str, Any]]:
     planning = plan.get("planning") or {}
     visits = {}
     for stop in plan.get("itinerary", []):
         if stop.get("category") in MOVABLE_CATEGORIES and stop.get("reference_id"):
             visits[stop["reference_id"]] = visits.get(stop["reference_id"], 0) + 1
-    selected = set((planning.get("selected_transport") or {}).values())
-    if planning.get("selected_hotel"):
-        selected.add(planning["selected_hotel"])
+    lodging_nights = _review_hotel_nights(plan)
+    selected = set((planning.get("selected_transport") or {}).values()) | lodging_nights.keys()
     hotel_ids = {x["id"] for x in planning.get("hotel_candidates", [])}
     items = [
         {"reference_id": item["id"], "label": item.get("name") or f"{'去程' if item.get('direction') == 'outbound' else '返程'}{TRANSPORT_LABELS.get(item.get('kind'), '交通')}：{item.get('origin', '')} → {item.get('destination', '')}",
          "category": "hotel" if item["id"] in hotel_ids else "transport",
-         "estimate": item.get("estimated_total") or 0,
+         "estimate": round(item["estimated_total"] * lodging_nights.get(item["id"], item["nights"]) / item["nights"], 2)
+                     if item.get("estimated_total") and item.get("nights") and item["id"] in lodging_nights else item.get("estimated_total") or 0,
          "source": "实际记录" if item.get("price_source") == "actual" else "API" if item.get("price_source") not in {None, "simulation", "unknown"} else "未知",
-         "basis": f"{item.get('nights', 0)} 晚" if item["id"] in hotel_ids else "往返交通选项",
+         "basis": f"{lodging_nights.get(item['id'], item.get('nights', 0))} 晚" if item["id"] in hotel_ids else "往返交通选项",
          "cost_unknown": item.get("price_source") in {"simulation", "unknown"} or item.get("cost_unknown", False)
                          or item.get("estimated_total") is None}
         for item in (planning.get("transport_candidates") or []) + (planning.get("hotel_candidates") or [])
@@ -854,13 +1095,15 @@ def record_purchase(plan: dict[str, Any], purchase: dict[str, Any]) -> dict[str,
 def itinerary_sheet(plan: dict[str, Any]) -> dict[str, Any]:
     from service.travel.itinerary_audit import audit_plan
 
-    outbound, returning, hotel = _selected(plan)
+    outbound, returning, _ = _selected(plan)
+    nights = _review_hotel_nights(plan)
+    hotels = [{**hotel, "nights": nights[hotel["id"]]} for hotel in plan["planning"]["hotel_candidates"] if hotel["id"] in nights]
     days = sorted({item["day"] for item in plan.get("itinerary") or []})
     return {
         "title": plan["title"], "destination": plan["destination"],
         "dates": [plan["start_date"], plan["end_date"]], "travelers": plan["travelers"],
         "budget_limit": plan["budget"], "currency": plan["currency"],
-        "transport": {"outbound": outbound, "return": returning}, "hotel": hotel,
+        "transport": {"outbound": outbound, "return": returning}, "hotel": hotels[0] if hotels else None, "hotels": hotels,
         "days": [{"day": day, "items": sorted([x for x in plan["itinerary"] if x["day"] == day], key=lambda x: x["time_of_day"])} for day in days],
         "routes": plan.get("routes") or [], "budget": budget_summary(plan),
         "purchases": plan.get("planning", {}).get("purchases") or [],

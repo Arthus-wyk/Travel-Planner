@@ -9,7 +9,7 @@ from service.travel.guide import analyze_guide, recognize_guide
 from service.travel import guide
 from service.travel.itinerary_audit import audit_plan
 from service.mcp import server as mcp_server
-from agent.prompts import build_system_prompt
+from agent.chat.prompts import build_system_prompt
 
 
 FORM = {

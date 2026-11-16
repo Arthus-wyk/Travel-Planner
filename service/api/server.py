@@ -13,9 +13,10 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import WebSocket, WebSocketDisconnect, BackgroundTasks, Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-from agent.planning_graph import run_planning_action
+from agent.planning.planning_graph import run_planning_action
+from agent.planning.roadbook import generate_roadbook, roadbook_signature, roadbook_snapshot
 from service.chat import handle_chat, public_message_items
 from service.runtime_logs import event_entries, list_runs, read_run
 from service.storage.travel_db import (
@@ -23,16 +24,22 @@ from service.storage.travel_db import (
     list_plan_summaries, save_conversation, save_plan,
 )
 from service.travel.itinerary_audit import audit_plan
+from service.travel.guide import split_guide_days
 from service.travel.planning import create_draft, itinerary_sheet
-from service.travel.map_planning import day_map
+from service.travel.map_planning import day_map, roadbook_map
 from service.storage import planning_jobs
 from service.travel.generation_jobs import execute_job
+from service.integrations.travel_amap import place_photo_url, retry_amap_call
 from service.mcp.server import amap_search_places
 from service.storage.travel_db import read_map_cache
-from service.utils.model_client import get_model
+from service.utils.model_client import AVAILABLE_MODELS, validate_model
 
 
 def _public_plan(plan):
+    planning = plan.get("planning") or {}
+    if planning.get("guide_text") and "guide_days" not in planning:
+        days, _ = split_guide_days(planning["guide_text"])
+        plan = {**plan, "planning": {**planning, "guide_days": days}}
     if "routes" not in plan:
         return plan
     routes = []
@@ -68,8 +75,15 @@ def _require_local_log_request(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Runtime logs are available only on localhost.")
 
 
-def create_app(server_file: Path, model: str) -> FastAPI:
+def create_app(server_file: Path, model: str = AVAILABLE_MODELS[0]) -> FastAPI:
     app = FastAPI(title="Travel Planner API", version="0.1")
+    try:
+        from service.api.xiaohongshu import router as xiaohongshu_router
+    except ModuleNotFoundError as exc:
+        if exc.name != "service.api.xiaohongshu":
+            raise
+    else:
+        app.include_router(xiaohongshu_router)
     from service.api.request_logging import RequestLoggingMiddleware
 
     @app.middleware("http")
@@ -156,17 +170,56 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         query = payload.get("query")
         if not isinstance(query, str) or not 1 <= len(query.strip()) <= 100:
             raise ValueError("请输入 1–100 字的地点名称")
-        result = amap_search_places(query.strip(), region_code=plan["destination"])
+        result = retry_amap_call(amap_search_places, query.strip(), region_code=plan["destination"])
         if not result.get("success"):
             raise HTTPException(status_code=502, detail=result.get("message", "地点搜索失败"))
         return {"success": True, "places": result["places"]}
 
     @app.get("/api/plans/{plan_id}/planning/map")
-    def plan_day_map(plan_id: str, day: int = 1):
+    def plan_day_map(plan_id: str, day: int = 1, sheet: bool = False):
         plan, error = get_plan(plan_id)
         if error or plan is None:
             raise HTTPException(status_code=404, detail="Plan not found")
-        return day_map(plan, day)
+        return day_map(plan, day, include_sheet=True) if sheet else day_map(plan, day)
+
+    def confirmed_roadbook_plan(plan_id):
+        plan, error = get_plan(plan_id)
+        if error or plan is None:
+            raise HTTPException(status_code=404, detail="Plan not found")
+        planning = plan.get("planning") or {}
+        if planning.get("stage") != "confirmed" or planning.get("needs_replan"):
+            raise HTTPException(status_code=409, detail="请先确认行程")
+        return plan
+
+    @app.get("/api/plans/{plan_id}/roadbook/map")
+    def plan_roadbook_map(plan_id: str):
+        return roadbook_map(confirmed_roadbook_plan(plan_id))
+
+    @app.post("/api/plans/{plan_id}/roadbook")
+    def plan_roadbook(plan_id: str):
+        plan = confirmed_roadbook_plan(plan_id)
+        planning = plan["planning"]
+        snapshot = roadbook_snapshot(plan)
+        signature = roadbook_signature(snapshot)
+        saved = planning.get("roadbook") or {}
+        route_model = (planning.get("generation") or {}).get("model")
+        if route_model not in AVAILABLE_MODELS:
+            route_model = model
+        if saved.get("signature") == signature and saved.get("model") == route_model:
+            return {"summaries": saved["summaries"]}
+        try:
+            summaries = generate_roadbook(snapshot, route_model)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("路书概述生成失败", exc_info=True)
+            raise HTTPException(status_code=502, detail="路书概述生成失败，请重试。") from exc
+        result = {**plan, "planning": {**planning, "roadbook": {
+            "signature": signature, "model": route_model, "summaries": summaries,
+        }}}
+        try:
+            planning_jobs.save_review_changes(plan_id, plan, result)
+        except planning_jobs.PlanConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"summaries": summaries}
 
     @app.get("/api/maps/images/{image_key}")
     def map_image(image_key: str):
@@ -178,12 +231,25 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         header, body = data.split(",", 1)
         return Response(base64.b64decode(body), media_type=header[5:].split(";")[0], headers={"Cache-Control": "private, max-age=3600"})
 
+    @app.get("/api/maps/place-photos/{poi_id}")
+    def place_photo(poi_id: str):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", poi_id):
+            raise HTTPException(status_code=404, detail="Place photo not found")
+        try:
+            url = place_photo_url(poi_id)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail="Place photo temporarily unavailable") from exc
+        if not url:
+            raise HTTPException(status_code=404, detail="Place photo not found")
+        return RedirectResponse(url, headers={"Cache-Control": "private, max-age=3600"})
+
     @app.get("/api/plans/{plan_id}/sheet")
     def plan_sheet(plan_id: str):
         plan, error = get_plan(plan_id)
         if error or plan is None:
             raise HTTPException(status_code=404, detail=(error or {}).get("message", "Plan not found"))
-        if (plan.get("planning") or {}).get("stage") != "confirmed":
+        planning = plan.get("planning") or {}
+        if planning.get("stage") != "confirmed" or planning.get("needs_replan"):
             raise HTTPException(status_code=400, detail="Confirm the itinerary before opening its sheet")
         return {"success": True, "sheet": itinerary_sheet(_public_plan(plan))}
 
@@ -212,15 +278,21 @@ def create_app(server_file: Path, model: str) -> FastAPI:
             except Exception:
                 pass
 
+    @app.get("/api/models")
+    def models():
+        return {"models": AVAILABLE_MODELS, "default": AVAILABLE_MODELS[0]}
+
     @app.post("/api/plans/{plan_id}/generation")
-    def generate_from_guide(plan_id: str, background: BackgroundTasks, payload: dict = Body(...)):
+    def generate_from_guide(plan_id: str, background: BackgroundTasks, payload: dict = Body(...), retry: bool = False):
         if not isinstance(payload.get("text", ""), str) or len(payload.get("text", "")) > 20000:
             raise ValueError("攻略文字最长 20000 字")
         if not payload.get("image_base64") and not payload.get("text", "").strip():
             raise ValueError("请上传攻略图片或填写攻略文字")
-        job_id, plan = planning_jobs.create_job(plan_id, payload)
+        if "model" in payload:
+            validate_model(payload["model"])
+        job_id, plan = planning_jobs.create_job(plan_id, payload, retry=retry)
         if plan is not None:
-            background.add_task(execute_job, plan_id, job_id, plan, payload)
+            background.add_task(execute_job, plan_id, job_id, plan, payload, retry=retry)
         return {"success": True, "job_id": job_id}
 
     @app.get("/api/plans/{plan_id}/generation")
@@ -232,21 +304,24 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         plan, error = get_plan(plan_id)
         if error or plan is None:
             raise HTTPException(status_code=404, detail=(error or {}).get("message", "Plan not found"))
-        if action == 'review_changes' and (
+        if action in {'review_changes', 'optimize_routes'} and (
             payload.get('plan_version') != planning_jobs.fingerprint(plan)
             if 'plan_version' in payload else payload.get('base_plan') != plan
         ):
             raise HTTPException(status_code=409, detail='行程已在其他页面修改，请重新读取后保存')
         outcome = run_planning_action(plan, action, payload)
-        if action == 'review_changes':
-            try:
-                planning_jobs.save_review_changes(plan_id, plan, outcome['plan'])
-            except planning_jobs.PlanConflict as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            saved, saved_error = get_plan(plan_id)
-            if saved_error or saved is None:
-                raise HTTPException(status_code=500, detail='修改已保存，但读取结果失败，请重新读取核实')
-            outcome['plan'] = saved
+        if action in {'review_changes', 'optimize_routes'}:
+            if outcome.get('optimization_applied', True):
+                try:
+                    planning_jobs.save_review_changes(plan_id, plan, outcome['plan'])
+                except planning_jobs.PlanConflict as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                saved, saved_error = get_plan(plan_id)
+                if saved_error or saved is None:
+                    raise HTTPException(status_code=500, detail='修改已保存，但读取结果失败，请重新读取核实')
+                outcome['plan'] = saved
+            else:
+                outcome['plan'] = plan
         else:
             save_plan(outcome["plan"])
             if include_version:
@@ -255,10 +330,12 @@ def create_app(server_file: Path, model: str) -> FastAPI:
                     raise HTTPException(status_code=500, detail='修改已保存，但读取结果失败，请重新读取核实')
                 outcome['plan'] = saved
         response = {"success": True, "plan": _public_plan(outcome["plan"]), "trace": outcome["trace"]}
-        if action == 'review_changes' or include_version:
+        if action in {'review_changes', 'optimize_routes'} or include_version:
             response["plan_version"] = planning_jobs.fingerprint(outcome["plan"])
         if outcome.get("audit"):
             response["audit"] = outcome["audit"]
+        if action == 'optimize_routes':
+            response['optimization_message'] = outcome['optimization_message']
         return response
 
     @app.get("/api/conversations")
@@ -293,20 +370,7 @@ def create_app(server_file: Path, model: str) -> FastAPI:
         message = str(payload.get("content") or payload.get("message") or "").strip()
         if not message:
             raise HTTPException(status_code=400, detail="content must not be empty.")
-        return await handle_chat(server_file=server_file, model=str(payload.get("model") or model),
-                                 conversation_id=conversation_id, user_message=message)
-
-    @app.post("/api/chat")
-    async def chat(payload: dict = Body(...)):
-        message = str(payload.get("message", "")).strip()
-        conversation_id = str(payload.get("conversation_id") or uuid.uuid4().hex)
-        if not message:
-            raise HTTPException(status_code=400, detail="message must not be empty.")
-        def ensure_conversation():
-            if not get_conversation(conversation_id)[0]:
-                save_conversation(new_conversation(conversation_id=conversation_id, plan_id=payload.get("plan_id"), title="新对话"))
-        await asyncio.to_thread(ensure_conversation)
-        return await handle_chat(server_file=server_file, model=str(payload.get("model") or model),
+        return await handle_chat(server_file=server_file, model=validate_model(payload["model"]) if "model" in payload else model,
                                  conversation_id=conversation_id, user_message=message)
 
     @app.get("/api/logs/runs")
@@ -354,16 +418,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8788)
     parser.add_argument("--server", type=Path, default=Path(__file__).resolve().parents[2] / "mcp_server.py")
-    args = parser.parse_args()
-    try: args.model = get_model()
-    except ValueError as exc: parser.error(str(exc))
-    return args
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     planning_jobs.recover_jobs()
-    uvicorn.run(create_app(args.server.resolve(), args.model), host=args.host, port=args.port)
+    uvicorn.run(create_app(args.server.resolve()), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

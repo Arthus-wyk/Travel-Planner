@@ -46,12 +46,19 @@ try {
     }
     if (path.endsWith('/planning/audit')) return reply({ audit });
     if (path.endsWith('/planning/map')) return reply({ message: '地图服务暂时不可用' }, 502);
+    if (path.startsWith('/api/maps/place-photos/')) {
+      if (path.endsWith('/poi')) return reply({ detail: 'Place photo not found' }, 404);
+      return route.fulfill({ contentType: 'image/png', body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64') });
+    }
     if (path.endsWith('/places/search')) return reply({ places: [place] });
     if (path === '/api/plans/slow') { await new Promise(done => setTimeout(done, 500)); return reply({ plan: { ...plan, plan_id: 'slow', destination: '慢目的地' } }); }
     if (path === '/api/plans/fast') return reply({ plan: { ...plan, plan_id: 'fast', destination: '快目的地' } });
-    if (request.method() === 'GET' && /^\/api\/plans\//.test(path)) return reply({ plan });
+    if (request.method() === 'GET' && /^\/api\/plans\//.test(path)) return reply({ plan, plan_version: 'v1' });
     if (request.method() === 'POST') {
       lastPayload = request.postDataJSON();
+      if (path.endsWith('/optimize_routes')) {
+        return reply({ plan, audit, plan_version: 'v2', optimization_message: '已重排路线和时间。' });
+      }
       for (const item of plan.planning.activities) {
         item.choice = lastPayload.choices?.[item.id] ?? item.choice;
         item.category = lastPayload.categories?.[item.id] ?? item.category;
@@ -64,11 +71,29 @@ try {
       if (path.endsWith('/draft')) plan.planning.stage = 'review';
       if (path.endsWith('/confirm')) plan.planning.stage = 'confirmed';
       if (path.endsWith('/edit_places')) plan.planning.stage = 'activities';
-      if (path.endsWith('/update_budget')) { plan.budget = lastPayload.budget; audit = { issues: [] }; }
+      if (path.endsWith('/review_changes')) {
+        const budgetChange = lastPayload.operations.find(edit => edit.action === 'update_budget');
+        if (budgetChange) { plan.budget = budgetChange.payload.budget; audit = { issues: [] }; }
+      }
       return reply({ plan, audit });
     }
     return reply({ message: 'unhandled fixture route' }, 404);
   });
+
+  plan = makePlan();
+  Object.assign(plan.planning, { stage: 'review', day_departures: { 1: '09:00' }, optimized_timetable: true });
+  plan.itinerary = [
+    { item_id: 'no-photo', reference_id: 'visit', day: 1, category: 'attraction', title: '西湖', location: '杭州', time_of_day: '09:00', duration_minutes: 60, place },
+    { item_id: 'with-photo', day: 1, category: 'attraction', title: '博物馆', location: '杭州', time_of_day: '11:00', duration_minutes: 60, place: { ...place, place_id: 'has-photo', name: '博物馆' } },
+  ];
+  await page.goto('http://127.0.0.1:4177/plans/ux/review');
+  await page.locator('#review-no-photo .place-photo-placeholder').getByText('具体位置').waitFor();
+  await page.waitForFunction(() => document.querySelector('#review-with-photo img.place-photo')?.naturalWidth > 0);
+  assert.equal(await page.locator('#review-with-photo time').textContent(), '11:00');
+  await page.getByRole('button', { name: '按高德耗时重排行程' }).click();
+  await page.getByText('已重排路线和时间。').waitFor();
+  assert.equal(lastPayload.plan_version, 'v1');
+  console.log('PASS missing photo fallback, real photo display and reorder request');
 
   plan = makePlan();
   await page.goto('http://127.0.0.1:4177/plans/ux/planning');
@@ -109,20 +134,21 @@ try {
 
   audit = { issues: [{ type: 'budget_overrun', severity: 'high', message: '当前预算不足', target: null }] };
   await page.reload();
-  await page.getByRole('heading', { name: '有 1 项需要处理' }).waitFor();
-  assert.equal(await page.getByRole('button', { name: '确认并生成行程单' }).isDisabled(), true);
-  await page.locator('.review-summary').getByRole('button', { name: '去处理' }).click();
+  await page.getByText('当前预算不足', { exact: true }).waitFor();
+  assert.equal(await page.getByRole('button', { name: '确认并生成行程单' }).isEnabled(), true);
+  await page.locator('.review-costs summary').click();
   await page.locator('#review-budget input').fill('6000');
-  await page.getByRole('button', { name: '保存预算并重新审核' }).click();
-  await page.waitForFunction(() => ![...document.querySelectorAll('button')].find(node => node.textContent === '确认并生成行程单')?.disabled);
+  await page.getByRole('button', { name: '保存所有修改' }).click();
+  await page.getByText('当前预算不足', { exact: true }).waitFor({ state: 'hidden' });
   await page.getByRole('button', { name: '重试当天地图' }).waitFor();
   assert.equal(plan.budget, 6000);
   console.log('PASS audit budget repair and map failure recovery');
 
+
   plan.planning.stage = 'confirmed';
   audit = { issues: [{ type: 'budget_overrun', severity: 'high', message: '实际支出超预算', target: null }] };
   await page.reload();
-  await page.locator('.review-summary').getByRole('button', { name: '去处理' }).click();
+  await page.getByText('实际支出超预算', { exact: true }).waitFor();
   await page.getByRole('button', { name: '返回编辑行程', exact: true }).click();
   await page.waitForURL('**/planning');
   await page.getByRole('heading', { name: '攻略与想去的地方' }).waitFor();

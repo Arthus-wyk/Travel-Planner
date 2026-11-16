@@ -74,7 +74,7 @@ def read_job(plan_id):
         return row
 
 
-def create_job(plan_id, payload):
+def create_job(plan_id, payload, *, retry=False):
     ensure_jobs()
     with transaction() as conn, conn.cursor() as cur:
         cur.execute("SELECT * FROM travel_plans WHERE plan_id=%s FOR UPDATE", (plan_id,))
@@ -89,7 +89,10 @@ def create_job(plan_id, payload):
             if previous["input_hash"] != digest:
                 raise ValueError("该行程正在生成，请等待当前任务结束后重新提交")
             return previous["job_id"], None
-        cur.execute("DELETE FROM planning_job_checkpoints WHERE plan_id=%s AND input_hash<>%s", (plan_id, digest))
+        if retry:
+            cur.execute("DELETE FROM planning_job_checkpoints WHERE plan_id=%s AND input_hash<>%s", (plan_id, digest))
+        else:
+            cur.execute("DELETE FROM planning_job_checkpoints WHERE plan_id=%s", (plan_id,))
         job_id = uuid4().hex
         cur.execute("""INSERT INTO planning_jobs VALUES (%s,%s,%s,'queued','queued','',UTC_TIMESTAMP())
             ON DUPLICATE KEY UPDATE job_id=VALUES(job_id), input_hash=VALUES(input_hash),
@@ -124,11 +127,14 @@ def commit_result(plan_id, job_id, original, result, *, needs_input=None):
 
 
 def save_review_changes(plan_id, original, result):
+    from service.travel.planning import itinerary_for_storage
+
     with transaction() as conn, conn.cursor() as cur:
         cur.execute('SELECT * FROM travel_plans WHERE plan_id=%s FOR UPDATE', (plan_id,))
         row = cur.fetchone()
         if not row or fingerprint(row_to_plan(row)) != fingerprint(original):
             raise PlanConflict('行程已在其他页面修改，请重新读取后保存')
         cur.execute('UPDATE travel_plans SET itinerary=%s,routes=%s,planning=%s,budget=%s,updated_at=UTC_TIMESTAMP() WHERE plan_id=%s',
-                    tuple(json.dumps(compact_routes(result[k]) if k == 'routes' else result[k], ensure_ascii=False)
-                          for k in ('itinerary', 'routes', 'planning')) + (result['budget'], plan_id))
+                    (json.dumps(itinerary_for_storage(result), ensure_ascii=False),
+                     json.dumps(compact_routes(result['routes']), ensure_ascii=False),
+                     json.dumps(result['planning'], ensure_ascii=False), result['budget'], plan_id))

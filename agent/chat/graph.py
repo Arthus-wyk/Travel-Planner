@@ -1,9 +1,9 @@
 """只定义工作流。节点实现、资源生命周期和结果持久化都不放在这里。"""
 
 from langgraph.graph import END, START, StateGraph
-from agent import nodes
-from agent.context import AgentContext
-from agent.state import AgentState
+from agent.chat import nodes
+from agent.chat.context import AgentContext
+from agent.chat.state import AgentState
 
 
 def after_model(state: AgentState) -> str:
