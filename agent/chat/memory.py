@@ -19,6 +19,7 @@ FORGET_WORDS = (
 )
 
 
+# ============判断记忆策略 ============
 def memory_policy(text: str) -> dict[str, Any]:
     enabled = not any(word in text.lower() for word in FORGET_WORDS)
     return {
@@ -28,6 +29,7 @@ def memory_policy(text: str) -> dict[str, Any]:
     }
 
 
+# ============读取记忆 ============
 def recall(text: str, enabled: bool) -> tuple[dict[str, Any], str]:
     policy = memory_policy(text)
     if not enabled or not policy["read_long_term"]:
@@ -43,6 +45,7 @@ def recall(text: str, enabled: bool) -> tuple[dict[str, Any], str]:
     return policy, "[Memory context]\n" + json.dumps(data, ensure_ascii=False)
 
 
+# ============提取并保存记忆 ============
 async def extract_and_store(
     context: AgentContext, text: str, answer: str, plan_id: str | None
 ) -> dict[str, Any]:

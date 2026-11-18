@@ -12,9 +12,11 @@ logger = logging.getLogger(__name__)
 
 
 class ToolExecutor:
+    # ============初始化 ============
     def __init__(self, registry: ToolRegistry) -> None:
         self.registry = registry
 
+    # ============执行 ============
     async def execute(
         self, name: str, arguments: dict, context: ToolContext, *, allowed: set[str]
     ) -> ToolResult:

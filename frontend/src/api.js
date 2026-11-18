@@ -1,18 +1,53 @@
 import { apiUrl } from './apiUrl.js';
 
+// ============读取审核助手的实时进度和最终结果 ============
+async function readProgress(response, onProgress, onActivity) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) throw new Error("路线助手连接已结束，未收到结果。");
+      onActivity();
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        if (event.type === "progress") onProgress(event.message);
+        if (event.type === "result") return event.data;
+        if (event.type === "error") throw Object.assign(new Error(event.message), { status: event.status });
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
 export function createApi(fetcher = (...args) => fetch(...args)) {
   return async (path, options = {}) => {
-    const { timeoutMs = (options.method && options.method !== 'GET' ? 180000 : 30000), signal, ...request } = options;
+    const { onProgress, timeoutMs = (options.method && options.method !== 'GET' ? 180000 : 30000), signal, ...request } = options;
     const controller = new AbortController();
     const abort = () => controller.abort(signal.reason);
     if (signal?.aborted) abort();
     else signal?.addEventListener('abort', abort, { once: true });
-    const timer = setTimeout(() => controller.abort(new DOMException('Timeout', 'TimeoutError')), timeoutMs);
-    const writing = request.method && request.method !== 'GET';
+    let timer;
+    const resetTimeout = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => controller.abort(new DOMException('Timeout', 'TimeoutError')), timeoutMs);
+    };
+    resetTimeout();
+    const writing = !onProgress && request.method && request.method !== 'GET';
     try {
       const headers = new Headers(request.headers);
       if (request.body != null && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
       const response = await fetcher(apiUrl(path), { ...request, signal: controller.signal, headers });
+      if (onProgress && response.ok && response.headers.get("Content-Type")?.includes("application/x-ndjson")) {
+        return await readProgress(response, onProgress, resetTimeout);
+      }
       const raw = await response.text();
       let data;
       try { data = JSON.parse(raw); } catch { throw Object.assign(new Error(writing ? `服务返回异常（HTTP ${response.status}），操作结果待核实，请重新读取当前状态。` : `服务返回异常（HTTP ${response.status}），请稍后重试`), { status: response.status, uncertain: Boolean(writing) }); }

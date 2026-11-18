@@ -638,6 +638,31 @@ def edit_review_place(plan: dict, payload: dict) -> dict:
     return _reflow_review(updated)
 
 
+def remove_review_activity(plan: dict, item_id: str) -> dict:
+    plan = deepcopy(plan)
+    item = next((x for x in plan['itinerary'] if x['item_id'] == item_id), None)
+    if not item or item['category'] not in MOVABLE_CATEGORIES or item.get('anchor_role'):
+        raise ValueError('请选择可移除的行程地点')
+    reference = item.get('reference_id')
+    if any(x['reference_id'] == reference for x in plan['planning'].get('purchases', [])):
+        raise ValueError('请在审核页处理已购项目')
+    plan['itinerary'].remove(item)
+    plan['routes'] = [r for r in plan.get('routes', [])
+                      if item['item_id'] not in (r['origin_item_id'], r['destination_item_id'])]
+    if reference and not any(x.get('reference_id') == reference for x in plan['itinerary']):
+        for activity in plan['planning']['activities']:
+            if activity['id'] == reference:
+                activity['choice'] = 'exclude'
+        plan['planning']['unscheduled_items'] = [
+            x for x in plan['planning'].get('unscheduled_items', []) if x.get('reference_id') != reference
+        ]
+        plan['planning']['unplaced_activities'] = [
+            x for x in plan['planning'].get('unplaced_activities', []) if x != reference
+        ]
+    plan['planning'].pop('optimized_timetable', None)
+    return _reflow_review(plan)
+
+
 def complete_review_lodging(plan: dict, activity_id: str) -> dict:
     updated = deepcopy(plan)
     items = updated["itinerary"]

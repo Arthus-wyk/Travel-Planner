@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import argparse
 import traceback
@@ -13,9 +14,11 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import WebSocket, WebSocketDisconnect, BackgroundTasks, Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from agent.planning.planning_graph import run_planning_action
+from agent.chat.review_execution import ReviewStepTimeout
 from agent.planning.roadbook import generate_roadbook, roadbook_signature, roadbook_snapshot
 from service.chat import handle_chat, public_message_items
 from service.runtime_logs import event_entries, list_runs, read_run
@@ -28,11 +31,15 @@ from service.travel.guide import split_guide_days
 from service.travel.planning import create_draft, itinerary_sheet
 from service.travel.map_planning import day_map, roadbook_map
 from service.storage import planning_jobs
+from service.travel.review import save_review_action
+from service.travel.review_interaction import ReviewInteractions
 from service.travel.generation_jobs import execute_job
 from service.integrations.travel_amap import place_photo_url, retry_amap_call
 from service.mcp.server import amap_search_places
 from service.storage.travel_db import read_map_cache
 from service.utils.model_client import AVAILABLE_MODELS, validate_model
+from service.utils.runtime_log import trace_run
+from service.utils.transcript_log import TranscriptLogger
 
 
 def _public_plan(plan):
@@ -77,13 +84,6 @@ def _require_local_log_request(request: Request) -> None:
 
 def create_app(server_file: Path, model: str = AVAILABLE_MODELS[0]) -> FastAPI:
     app = FastAPI(title="Travel Planner API", version="0.1")
-    try:
-        from service.api.xiaohongshu import router as xiaohongshu_router
-    except ModuleNotFoundError as exc:
-        if exc.name != "service.api.xiaohongshu":
-            raise
-    else:
-        app.include_router(xiaohongshu_router)
     from service.api.request_logging import RequestLoggingMiddleware
 
     @app.middleware("http")
@@ -181,6 +181,66 @@ def create_app(server_file: Path, model: str = AVAILABLE_MODELS[0]) -> FastAPI:
         if error or plan is None:
             raise HTTPException(status_code=404, detail="Plan not found")
         return day_map(plan, day, include_sheet=True) if sheet else day_map(plan, day)
+
+    review_interactions = ReviewInteractions()
+
+    async def run_review_request(plan_id, payload, on_progress=None):
+        """运行审核请求并关联诊断记录。"""
+        session_id = f"review-{uuid.uuid5(uuid.NAMESPACE_URL, plan_id).hex}"
+        transcript = TranscriptLogger(Path.cwd(), session_id=session_id)
+        message = payload.get("message")
+        diagnostic_input = message[:4000] if isinstance(message, str) else "继续路线审核交互"
+        try:
+            with trace_run(transcript, model=model, text=diagnostic_input) as run:
+                result = await review_interactions.run(plan_id, model, payload, on_progress=on_progress)
+                status = {"clarify": "needs_input", "proposal": "needs_input",
+                          "failed": "failed", "partial": "failed", "save_unknown": "failed"}.get(result["status"], "completed")
+                run.finish(status, result["message"])
+                return {**result, "run_id": run.run_id}
+        except planning_jobs.PlanConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ReviewStepTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+    @app.post("/api/plans/{plan_id}/planning/assistant")
+    async def review_assistant(plan_id: str, payload: dict = Body(...), stream: bool = False):
+        """返回审核结果，或按行实时传送步骤进度与最终结果。"""
+        if not stream:
+            return await run_review_request(plan_id, payload)
+        events = asyncio.Queue()
+
+        def publish(message):
+            """将当前步骤加入响应流。"""
+            events.put_nowait({"type": "progress", "message": message})
+
+        async def produce():
+            """把最终结果或异常放入队列。"""
+            try:
+                result = await run_review_request(plan_id, payload, publish)
+                events.put_nowait({"type": "result", "data": result})
+            except HTTPException as exc:
+                events.put_nowait({"type": "error", "status": exc.status_code, "message": exc.detail})
+            except ValueError as exc:
+                events.put_nowait({"type": "error", "status": 400, "message": str(exc)})
+            except Exception:
+                logging.getLogger(__name__).exception("路线助手流式请求失败")
+                events.put_nowait({"type": "error", "status": 500, "message": "路线助手请求失败，请重试。"})
+
+        async def stream_events():
+            """发送完整 JSON 行，连接关闭时停止剩余工作。"""
+            worker = asyncio.create_task(produce())
+            try:
+                while True:
+                    event = await events.get()
+                    yield json.dumps(jsonable_encoder(event), ensure_ascii=False) + "\n"
+                    if event["type"] != "progress":
+                        break
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+        return StreamingResponse(stream_events(), media_type="application/x-ndjson",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     def confirmed_roadbook_plan(plan_id):
         plan, error = get_plan(plan_id)
@@ -304,25 +364,15 @@ def create_app(server_file: Path, model: str = AVAILABLE_MODELS[0]) -> FastAPI:
         plan, error = get_plan(plan_id)
         if error or plan is None:
             raise HTTPException(status_code=404, detail=(error or {}).get("message", "Plan not found"))
-        if action in {'review_changes', 'optimize_routes'} and (
-            payload.get('plan_version') != planning_jobs.fingerprint(plan)
-            if 'plan_version' in payload else payload.get('base_plan') != plan
-        ):
-            raise HTTPException(status_code=409, detail='行程已在其他页面修改，请重新读取后保存')
-        outcome = run_planning_action(plan, action, payload)
         if action in {'review_changes', 'optimize_routes'}:
-            if outcome.get('optimization_applied', True):
-                try:
-                    planning_jobs.save_review_changes(plan_id, plan, outcome['plan'])
-                except planning_jobs.PlanConflict as exc:
-                    raise HTTPException(status_code=409, detail=str(exc)) from exc
-                saved, saved_error = get_plan(plan_id)
-                if saved_error or saved is None:
-                    raise HTTPException(status_code=500, detail='修改已保存，但读取结果失败，请重新读取核实')
-                outcome['plan'] = saved
-            else:
-                outcome['plan'] = plan
+            try:
+                outcome = save_review_action(plan, action, payload)
+            except planning_jobs.PlanConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except RuntimeError as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
         else:
+            outcome = run_planning_action(plan, action, payload)
             save_plan(outcome["plan"])
             if include_version:
                 saved, saved_error = get_plan(plan_id)

@@ -4,7 +4,6 @@ import { useEffect, useRef, useState } from "react";
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { Activity, ArrowLeft, CalendarDays, ChevronRight, Compass, Menu, MessageCircle, Plus, Send, Trash2, WalletCards, X } from "lucide-react";
 import RuntimeLogs from "./RuntimeLogs";
-import XiaohongshuTest from "./XiaohongshuTest";
 import { NewTripForm, PlanningPage, SheetPage } from "./GuidedPlanner";
 import ReviewPage from "./ReviewPage";
 import { api, refreshAfterCommit } from "./api";
@@ -36,7 +35,6 @@ function App() {
       <main className="main-area">
         <Routes>
           <Route path="/logs" element={<RuntimeLogs api={api} />} />
-          <Route path="/test/xiaohongshu" element={<XiaohongshuTest />} />
           <Route path="/" element={<WorkspacePage plans={plans} />} />
           <Route path="/plans/new" element={<NewTripForm api={api} refreshPlans={refresh} />} />
           <Route path="/plans/:planId/planning" element={<ScopedPage component={PlanningPage} api={api} refreshPlans={refresh} />} />
@@ -90,7 +88,6 @@ function Sidebar({ plans, error, loading, refresh }) {
         <nav aria-label="工作区">
           <Link className="new-chat" to="/plans/new" aria-current={location.pathname === "/plans/new" ? "page" : undefined}><Plus size={17} aria-hidden="true" /> 新建行程</Link>
           <Link className="plan-link" to="/logs" aria-current={location.pathname === "/logs" ? "page" : undefined}><Activity size={16} aria-hidden="true" /><span>运行日志</span></Link>
-          <Link className="plan-link" to="/test/xiaohongshu" aria-current={location.pathname === "/test/xiaohongshu" ? "page" : undefined}><span>小红书接口测试</span></Link>
         </nav>
         <div className="side-section-title">我的行程</div>
         <nav className="plan-nav" aria-label="我的行程">

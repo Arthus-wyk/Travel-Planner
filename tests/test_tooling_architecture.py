@@ -6,7 +6,6 @@ from tooling.context import ToolContext
 from tooling.mcp import build_registry
 from tooling.registry import ToolRegistry
 from tooling.spec import ToolSpec
-from agent.chat.router import select_tools
 from tools.catalog import tool_metadata
 
 
@@ -20,13 +19,13 @@ class ToolingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error_type, "validation_error")
         handler.assert_not_awaited()
 
-    def test_unknown_request_defaults_to_read_tools(self):
+    def test_registry_preserves_tools_for_runtime_scope(self):
         definitions = [
             SimpleNamespace(name=n, description=n, inputSchema={})
             for n in ["create_travel_plan", "get_travel_plan", "delete_travel_plan"]
         ]
         registry = build_registry(SimpleNamespace(), definitions, tool_metadata())
-        self.assertEqual(select_tools(registry, [], None), {"get_travel_plan"})
+        self.assertEqual(registry.names, {"create_travel_plan", "get_travel_plan", "delete_travel_plan"})
 
     async def test_real_executor_preserves_context_and_validates_schema(self):
         handler = AsyncMock(return_value={"success": True, "value": 7})

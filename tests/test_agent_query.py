@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from agent.chat.context import AgentContext, DEFAULT_MAX_ROUNDS
 from agent.chat.runner import run_turn
-from agent.chat.state import AgentRequest, AgentRunError
+from agent.chat.state import AgentRequest
 from tooling.registry import ToolRegistry
 from tooling.mcp import build_registry
 from tools.catalog import tool_metadata
@@ -73,25 +73,22 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
             registry,
             on_text=emit,
             transcript=self.logger,
-            memory_enabled=False,
+            memory_enabled=False, enable_rewrite=False,
         )
         with patch("infrastructure.llm.request_model_with_retry", side_effect=request):
-            try:
-                self.result = await run_turn(AgentRequest("安排活动"), context)
-            except AgentRunError as exc:
-                self.result = exc.partial_result
-                raise
-            finally:
-                self.messages = [*self.seen_messages[-1], *self.result.new_messages]
+            self.result = await run_turn(AgentRequest("安排活动"), context)
+            self.messages = [*self.seen_messages[-1], *self.result.new_messages]
         return self.result.answer
 
     async def test_direct_answer_preserves_history_and_only_emits_final(self):
         answer = await self.run_query([response("可以按两天安排")])
         self.assertEqual(answer, "可以按两天安排")
         self.assertEqual(self.emitted, [answer])
-        self.assertEqual(
-            [m["role"] for m in self.messages], ["system", "user", "assistant"]
-        )
+        self.assertEqual([m["role"] for m in self.messages], ["system", "user", "system", "assistant"])
+        task = json.loads(self.messages[1]["content"])
+        self.assertEqual(task["task"], "安排活动")
+        runtime = json.loads(self.messages[2]["content"])["runtime"]
+        self.assertEqual(runtime["remaining_tool_calls"], 8)
         self.assertEqual(
             self.result.new_messages, [{"role": "assistant", "content": answer}]
         )
@@ -103,10 +100,10 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
         tool_messages = [m for m in self.seen_messages[1] if m["role"] == "tool"]
         self.assertEqual(
             [m["tool_name"] for m in tool_messages],
-            ["add_itinerary_item", "verify_last_tool_result"],
+            ["add_itinerary_item"],
         )
         self.assertEqual(
-            json.loads(tool_messages[1]["content"])["verification"]["status"], "passed"
+            json.loads(tool_messages[0]["content"])["verification"]["status"], "passed"
         )
         self.assertEqual(self.emitted, ["完成"])
 
@@ -114,7 +111,7 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.run_query(
             [
                 response("", [tool_call(day=0)]),
-                response("", [tool_call(day=1, _retry_of="r1c0")]),
+                response("", [tool_call(day=1, _retry_of="op-1")]),
                 response(),
             ],
             tool_results=[
@@ -130,7 +127,7 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
         checks = [
             json.loads(m["content"])["verification"]["status"]
             for m in self.messages
-            if m.get("tool_name") == "verify_last_tool_result"
+            if m.get("tool_name") == "add_itinerary_item"
         ]
         self.assertEqual(checks, ["failed", "passed"])
         self.assertEqual(self.result.status, "completed")
@@ -144,7 +141,8 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
             [response("", [tool_call()]), response("查询失败")],
             tool_results=[RuntimeError("timeout")],
         )
-        result = json.loads(self.messages[-2]["content"])["verification"]
+        tool_message = next(message for message in self.messages if message.get("tool_name") == "add_itinerary_item")
+        result = json.loads(tool_message["content"])["verification"]
         self.assertEqual(result["status"], "failed")
         self.assertTrue(result["retryable"])
 
@@ -153,17 +151,20 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
             [response("", [tool_call("erase_all")]), response("工具不可用")]
         )
         self.mcp.call_tool.assert_not_awaited()
-        self.assertIn("unknown_tool", self.messages[3]["content"])
+        tool_message = next(message for message in self.messages if message.get("tool_name") == "erase_all")
+        self.assertEqual(json.loads(tool_message["content"])["error_type"], "unknown_tool")
 
     async def test_max_rounds_stops_even_if_model_keeps_calling_tools(self):
         answer = await self.run_query([response("", [tool_call()])] * MAX_TOOL_ROUNDS)
-        self.assertEqual(self.mcp.call_tool.await_count, MAX_TOOL_ROUNDS)
-        self.assertIn("maximum number", answer)
+        self.assertEqual(self.mcp.call_tool.await_count, 8)
+        self.assertEqual(self.result.status, "limit_reached")
+        self.assertTrue(answer)
         self.assertEqual(self.emitted, [answer])
 
     async def test_empty_promises_are_hidden_and_eventually_rejected(self):
         answer = await self.run_query([response("I will add this activity.")] * 3)
-        self.assertIn("执行失败", answer)
+        self.assertEqual(self.result.status, "failed")
+        self.assertNotIn("I will add", answer)
         self.assertEqual(self.emitted, [answer])
         self.assertEqual(len(self.seen_messages), 3)
         self.mcp.call_tool.assert_not_awaited()
@@ -222,7 +223,7 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
                     ToolRegistry(),
                     fallback_model="backup",
                     telemetry=telemetry,
-                    memory_enabled=False,
+                    memory_enabled=False, enable_rewrite=False,
                 ),
             )
         self.assertEqual(answer.answer, "备用模型完成")
@@ -247,7 +248,7 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
         ]
         answer = await run_turn(
             AgentRequest("继续", history=messages),
-            AgentContext(client, "test", ToolRegistry(), memory_enabled=False),
+            AgentContext(client, "test", ToolRegistry(), memory_enabled=False, enable_rewrite=False),
         )
         self.assertEqual(answer.answer, "完成")
         compressed = client.chat.await_args_list[-1].kwargs["messages"]
@@ -268,7 +269,7 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
                 ToolRegistry(),
                 streaming=True,
                 on_text=emit,
-                memory_enabled=False,
+                memory_enabled=False, enable_rewrite=False,
             ),
         )
         self.assertEqual(
@@ -277,16 +278,12 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
         emit.assert_awaited_once_with("完成")
 
     async def test_unexpected_failure_keeps_already_executed_tools_in_history(self):
-        # 意外异常仍需向上传播，但不能让调用方忘记本轮已经产生的副作用。
-        with self.assertRaisesRegex(AgentRunError, "unexpected") as error:
-            await self.run_query(
-                [response("", [tool_call(day=1)]), RuntimeError("unexpected")]
-            )
+        await self.run_query([response("", [tool_call(day=1)]), RuntimeError("unexpected")])
         self.mcp.call_tool.assert_awaited_once()
+        self.assertEqual(self.result.status, "partial")
         self.assertEqual(
-            [e["tool"] for e in error.exception.partial_result.tool_events],
-            [
-                "add_itinerary_item",
-                "verify_last_tool_result",
-            ],
+            [e["tool"] for e in self.result.tool_events], ["add_itinerary_item"],
         )
+        self.assertEqual(self.result.tool_events[0]["verification"]["status"], "passed")
+        self.assertEqual(self.result.new_messages, [{"role": "assistant", "content": self.result.answer}])
+        self.assertEqual(len(self.result.evidence), 1)

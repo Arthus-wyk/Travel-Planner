@@ -27,11 +27,11 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         }, handler)])
         client = SimpleNamespace(chat=AsyncMock(side_effect=[
             reply([call({"dietary_preferences": "不要辣"})]),
-            reply(text="工具失败，无法进行"),
-            reply([call({"constraints": ["不要辣"]})]),
+
+            reply([call({"constraints": ["不要辣"], "_retry_of": "op-1"})]),
             reply(text="已更新"),
         ]))
-        result = await run_turn(AgentRequest("不要辣"), AgentContext(client, "test", registry, max_rounds=2, memory_enabled=False))
+        result = await run_turn(AgentRequest("不要辣"), AgentContext(client, "test", registry, max_rounds=3, memory_enabled=False, enable_rewrite=False))
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.answer, "已更新")
         handler.assert_awaited_once()
@@ -48,7 +48,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         client = SimpleNamespace(chat=AsyncMock(side_effect=[
             reply([bad_call]), reply([bad_call]), reply([bad_call]), reply(text="需要更多信息"),
         ]))
-        result = await run_turn(AgentRequest("更新"), AgentContext(client, "test", registry, memory_enabled=False))
+        result = await run_turn(AgentRequest("更新"), AgentContext(client, "test", registry, memory_enabled=False, enable_rewrite=False))
         self.assertEqual(result.status, "failed")
         self.assertEqual(client.chat.await_count, 4)
         handler.assert_not_awaited()
@@ -56,8 +56,8 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_reported_validation_error_is_repaired(self):
         def reply(calls=None, text=""):
             return SimpleNamespace(message=SimpleNamespace(role="assistant", content=text, tool_calls=calls or []))
-        def call(day):
-            return {"function": {"name": "update", "arguments": {"day": day}}}
+        def call(day, retry_of=None):
+            return {"function": {"name": "update", "arguments": {"day": day, **({"_retry_of": retry_of} if retry_of else {})}}}
         handler = AsyncMock(side_effect=[
             {"success": False, "message": "day must be positive", "error_type": "validation_error"},
             {"success": True},
@@ -66,9 +66,9 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
             "type": "object", "properties": {"day": {"type": "integer"}}, "required": ["day"]
         }, handler)])
         client = SimpleNamespace(chat=AsyncMock(side_effect=[
-            reply([call(0)]), reply(text="工具失败"), reply([call(1)]), reply(text="完成"),
+            reply([call(0)]), reply([call(1, "op-1")]), reply(text="完成"),
         ]))
-        result = await run_turn(AgentRequest("改成第一天"), AgentContext(client, "test", registry, memory_enabled=False))
+        result = await run_turn(AgentRequest("改成第一天"), AgentContext(client, "test", registry, memory_enabled=False, enable_rewrite=False))
         self.assertEqual(result.status, "completed")
         self.assertEqual(handler.await_count, 2)
 
@@ -97,7 +97,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await run_turn(
             AgentRequest("添加两个相同活动"),
-            AgentContext(client, "test", registry, memory_enabled=False),
+            AgentContext(client, "test", registry, memory_enabled=False, enable_rewrite=False),
         )
         self.assertEqual(result.status, "failed")
 
@@ -111,10 +111,10 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await run_turn(
             AgentRequest("介绍旅行"),
-            AgentContext(client, "test", ToolRegistry(), memory_enabled=False),
+            AgentContext(client, "test", ToolRegistry(), memory_enabled=False, enable_rewrite=False),
         )
         self.assertEqual(result.status, "failed")
-        self.assertIn("empty response", result.answer)
+        self.assertIn("空响应", result.answer)
 
     async def test_explicit_retry_id_takes_precedence_over_matching_arguments(self):
         def reply(calls=None):
@@ -144,16 +144,17 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         client = SimpleNamespace(
             chat=AsyncMock(
                 side_effect=[
-                    reply([call("X"), call("Y")]),
-                    reply([call("X", "r1c1")]),
-                    reply([call("Z", "r1c0")]),
+                    reply([call("X")]),
+                    reply([call("Y")]),
+                    reply([call("X", "op-2")]),
+                    reply([call("Z", "op-1")]),
                     reply(),
                 ]
             )
         )
         result = await run_turn(
             AgentRequest("添加活动"),
-            AgentContext(client, "test", registry, memory_enabled=False),
+            AgentContext(client, "test", registry, memory_enabled=False, enable_rewrite=False),
         )
         self.assertEqual(result.status, "completed")
         self.assertEqual(handler.await_count, 4)
@@ -172,7 +173,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
             "不要参考历史，介绍杭州",
             history=[{"role": "assistant", "content": "以前的回复"}],
         )
-        result = await run_turn(request, AgentContext(client, "test", ToolRegistry()))
+        result = await run_turn(request, AgentContext(client, "test", ToolRegistry(), enable_rewrite=False))
         self.assertEqual(result.answer, "杭州适合慢游")
         self.assertEqual(result.status, "completed")
         self.assertEqual(
@@ -200,7 +201,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         history = [{"role": "user", "content": f"旧消息{i}"} for i in range(20)]
         result = await run_turn(
             AgentRequest("不要参考历史，继续", history=history),
-            AgentContext(client, "test", ToolRegistry()),
+            AgentContext(client, "test", ToolRegistry(), enable_rewrite=False),
         )
         self.assertEqual(result.new_messages[-1]["content"], "本轮回复")
         self.assertEqual(len(history), 20)
@@ -227,7 +228,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
                     ToolRegistry(),
                     allowed_tools=frozenset(),
                     max_rounds=1,
-                    memory_enabled=False,
+                    memory_enabled=False, enable_rewrite=False,
                 ),
             )
             return {"success": child.status == "completed", "answer": child.answer}
@@ -266,7 +267,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         parent_client = SimpleNamespace(chat=AsyncMock(side_effect=responses))
         result = await run_turn(
             AgentRequest("检查行程"),
-            AgentContext(parent_client, "coordinator", registry, memory_enabled=False),
+            AgentContext(parent_client, "coordinator", registry, memory_enabled=False, enable_rewrite=False),
         )
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.tool_events[0]["result"]["answer"], "审计通过")
@@ -276,7 +277,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         async def execute(text):
             async def chat(**kwargs):
                 await asyncio.sleep(0)
-                self.assertIn(text, kwargs["messages"][-1]["content"])
+                self.assertTrue(any(text in m.get("content", "") for m in kwargs["messages"]))
                 return SimpleNamespace(
                     message=SimpleNamespace(
                         role="assistant", content=text, tool_calls=[]
@@ -289,7 +290,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
                     SimpleNamespace(chat=chat),
                     "test",
                     ToolRegistry(),
-                    memory_enabled=False,
+                    memory_enabled=False, enable_rewrite=False,
                 ),
             )
 
@@ -312,13 +313,14 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AgentCancelledError) as error:
             await run_turn(
                 AgentRequest("执行任务"),
-                AgentContext(client, "test", registry, memory_enabled=False),
+                AgentContext(client, "test", registry, memory_enabled=False, enable_rewrite=False),
             )
         handler.assert_awaited_once()
         self.assertEqual(
             [e["tool"] for e in error.exception.partial_result.tool_events],
-            ["echo", "verify_last_tool_result"],
+            ["echo"],
         )
+        self.assertEqual(error.exception.partial_result.tool_events[0]["verification"]["status"], "passed")
 
     async def test_tool_scope_blocks_otherwise_valid_model_call(self):
         forbidden = AsyncMock()
@@ -350,7 +352,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
                 "test",
                 registry,
                 allowed_tools=frozenset(),
-                memory_enabled=False,
+                memory_enabled=False, enable_rewrite=False,
             ),
         )
         self.assertEqual(result.status, "failed")
@@ -382,13 +384,14 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await run_turn(
             AgentRequest("执行任务"),
-            AgentContext(client, "test", registry, memory_enabled=False),
+            AgentContext(client, "test", registry, memory_enabled=False, enable_rewrite=False),
         )
-        self.assertEqual(handler.await_count, 14)
+        self.assertEqual(handler.await_count, 8)
         self.assertEqual(
             [e["tool"] for e in result.tool_events],
-            ["echo", "verify_last_tool_result"] * 14,
+            ["echo"] * 14,
         )
+        self.assertEqual(sum(event["verification"]["status"] == "passed" for event in result.tool_events), 8)
 
     async def test_forget_policy_does_not_read_or_write_memory(self):
         with (
@@ -406,7 +409,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
             )
             await run_turn(
                 AgentRequest("不要参考历史，介绍杭州"),
-                AgentContext(client, "test", ToolRegistry()),
+                AgentContext(client, "test", ToolRegistry(), enable_rewrite=False),
             )
             read.assert_not_called()
             write.assert_not_awaited()
@@ -449,7 +452,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await run_turn(
             AgentRequest("添加活动"),
-            AgentContext(client, "test", registry, memory_enabled=False),
+            AgentContext(client, "test", registry, memory_enabled=False, enable_rewrite=False),
         )
         self.assertEqual(result.status, "failed")
 
@@ -487,7 +490,7 @@ class RunnerContractTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await run_turn(
             AgentRequest("查看行程"),
-            AgentContext(client, "test", registry, memory_enabled=False),
+            AgentContext(client, "test", registry, memory_enabled=False, enable_rewrite=False),
         )
         self.assertIn("已更新行程", result.answer)
         self.assertEqual(result.new_messages[0]["content"], result.answer)

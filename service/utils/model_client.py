@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import httpx
+from jsonschema import ValidationError, validate
 
 from service.config import get_env_or_dotenv as env
 from ollama import AsyncClient
@@ -66,7 +67,7 @@ def create_model_client():
 
 
 def openai_messages(messages):
-    """Rebuild call IDs because the Agent stores provider-neutral tool records."""
+    """Preserve native call pairing and add IDs for legacy tool records."""
     converted = []
     pending = []
     for index, message in enumerate(messages):
@@ -79,12 +80,14 @@ def openai_messages(messages):
                 function = dict(call["function"])
                 if not isinstance(function["arguments"], str):
                     function["arguments"] = json.dumps(function["arguments"], ensure_ascii=False)
-                call_id = f"call_{index}_{number}"
+                call_id = call.get("id") or f"call_{index}_{number}"
                 calls.append({"id": call_id, "type": "function", "function": function})
                 pending.append((function["name"], call_id))
             item["tool_calls"] = calls
         elif role == "tool":
-            match = next((p for p in pending if p[0] == message.get("tool_name")), None)
+            call_id = message.get("tool_call_id")
+            match = next((p for p in pending if p[1] == call_id), None) if call_id else next(
+                (p for p in pending if p[0] == message.get("tool_name")), None)
             if match:
                 item["tool_call_id"] = match[1]
                 pending.remove(match)
@@ -116,6 +119,28 @@ def response_chunk(message, usage=None):
     )
 
 
+def validate_tool_calls(calls: list[dict]) -> None:
+    """Reject the whole provider batch before any tool call reaches execution."""
+    if not isinstance(calls, list):
+        raise ValueError("模型工具调用必须是列表")
+    for call in calls:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict) or not isinstance(function.get("name"), str) or not function["name"].strip():
+            raise ValueError("模型工具调用缺少有效的函数名称")
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError as exc:
+                raise ValueError("模型工具参数不是有效 JSON") from exc
+        if not isinstance(arguments, dict):
+            raise ValueError("模型工具参数必须是 JSON 对象")
+        try:
+            json.dumps(arguments, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("模型工具参数不是有效 JSON") from exc
+
+
 class OpenAICompatibleClient:
     def __init__(self, base_url, api_key, *, transport=None):
         self.base_url = base_url.rstrip("/")
@@ -144,6 +169,18 @@ class OpenAICompatibleClient:
             response.raise_for_status()
             data = response.json()
             choice = data["choices"][0]
+            message = choice["message"]
+            if message.get("refusal"):
+                raise ValueError(f"模型拒绝生成结果：{message['refusal']}")
+            if choice.get("finish_reason") in {"length", "content_filter"}:
+                raise ValueError(f"模型响应未完整生成：{choice['finish_reason']}")
+            validate_tool_calls(message.get("tool_calls") or [])
+            if isinstance(format, dict) and not message.get("tool_calls"):
+                try:
+                    parsed = json.loads(message.get("content") or "")
+                    validate(parsed, format)
+                except (ValueError, ValidationError) as exc:
+                    raise ValueError(f"模型结构化结果不符合 JSON Schema：{exc}") from exc
             result = response_chunk(choice["message"], data.get("usage"))
             result.finish_reason = choice.get("finish_reason")
             result.message.reasoning_content = choice["message"].get("reasoning_content")
@@ -157,6 +194,7 @@ class OpenAICompatibleClient:
         calls = {}
         usage = {}
         complete = False
+        finish_reason = None
         async with self._client() as client:
             async with client.stream("POST", self.base_url + "/chat/completions", json=payload) as response:
                 if response.is_error:
@@ -171,20 +209,34 @@ class OpenAICompatibleClient:
                         break
                     data = json.loads(value)
                     if "error" in data:
-                        raise ValueError("Model stream returned an error")
+                        raise ValueError(f"Model stream returned an error: {data['error']}")
                     usage = data.get("usage") or usage
                     choices = data.get("choices") or []
                     if not choices:
                         continue
                     delta = choices[0].get("delta") or {}
+                    if delta.get("refusal"):
+                        raise ValueError(f"模型拒绝生成结果：{delta['refusal']}")
                     if choices[0].get("finish_reason"):
+                        finish_reason = choices[0]["finish_reason"]
+                        if finish_reason not in {"tool_calls", "stop"}:
+                            raise ValueError(f"模型响应未完整生成：{finish_reason}")
                         complete = True
                     for call in delta.get("tool_calls") or []:
+                        if not isinstance(call, dict) or not isinstance(call.get("index"), int) or call["index"] < 0:
+                            raise ValueError("模型流式工具调用缺少有效索引")
+                        fragment = call.get("function") or {}
+                        if not isinstance(fragment, dict) or any(not isinstance(fragment.get(key, ""), str) for key in ("name", "arguments")):
+                            raise ValueError("模型流式工具调用片段无效")
                         function = calls.setdefault(call["index"], {"name": "", "arguments": ""})
                         for key in ("name", "arguments"):
-                            function[key] += (call.get("function") or {}).get(key) or ""
+                            function[key] += fragment.get(key, "")
                     if delta.get("content"):
                         yield response_chunk({"content": delta["content"]})
         if not complete:
             raise ConnectionError("Model stream ended before completion")
-        yield response_chunk({"tool_calls": [{"function": calls[i]} for i in sorted(calls)]}, usage)
+        if calls and finish_reason not in {"tool_calls", "stop"}:
+            raise ConnectionError("Model tool stream ended before a successful finish_reason")
+        tool_calls = [{"function": calls[i]} for i in sorted(calls)]
+        validate_tool_calls(tool_calls)
+        yield response_chunk({"tool_calls": tool_calls}, usage)

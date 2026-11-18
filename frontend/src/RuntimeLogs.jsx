@@ -6,7 +6,9 @@ import "./runtime-logs.css";
 const statuses = { completed: "已完成", failed: "失败", needs_input: "待补充信息", cancelled: "已取消", interrupted: "已中断", limit_reached: "达到轮次上限", running: "运行中 / 未收尾", legacy: "历史日志" };
 const titles = {
   run_start: "开始运行", run_end: "运行结束", model_request: "模型请求", model_response: "模型响应", model_error: "模型请求失败",
-  message: "消息", tool_use: "调用工具", tool_result: "工具结果", intent_understanding: "意图分析",
+  model_cancelled: "模型调用已取消",
+  message: "消息", tool_use: "调用工具", tool_result: "工具结果", intent_understanding: "历史意图分析",
+  request_rewrite: "指代改写", agent_start: "Agent 启动", agent_end: "Agent 结束",
   no_tool_guard: "工具调用护栏", memory_extraction: "记忆提取", api_summary: "Token 汇总",
   tengu_api_query: "API 请求", tengu_api_success: "API 成功", tengu_api_error: "API 异常 / 重试",
   generation_progress: "生成进度", generation_error: "生成异常", api_request: "地图 / API 请求", api_response: "地图 / API 响应",
@@ -16,12 +18,16 @@ const dateTime = (value) => value ? new Date(value).toLocaleString("zh-CN", { ho
 const duration = (value) => value == null ? "—" : `${(value / 1000).toFixed(2)} 秒`;
 
 function preview(event) {
+  if (event.type === "request_rewrite") return event.rewritten_text || event.original_text || "";
+  if (event.type === "intent_understanding" && event.stage?.startsWith("review_intent")) {
+    return event.goal || event.semantic?.primary_intent || "";
+  }
   const value = event.input ?? event.content ?? event.answer ?? event.result ?? event.assistant_content ?? (typeof event.message === "object" ? event.message.content : event.message);
   return typeof value === "string" ? value : value == null ? "" : JSON.stringify(value);
 }
 
 function isError(event) {
-  return event.isError || event.type === "generation_error" || event.type === "model_error" || event.type === "tengu_api_error" ||
+  return event.isError || event.type === "generation_error" || event.type === "model_error" || event.type === "model_cancelled" || event.type === "tengu_api_error" ||
     (event.type === "run_end" && event.status !== "completed") ||
     (event.type === "tool_result" && /"success"\s*:\s*false|"status"\s*:\s*"failed"/.test(event.result || ""));
 }

@@ -19,4 +19,16 @@ frontend/dist/
 frontend/.idea/
 data
 /logs/
-tests
+/tests/*
+!/tests/test_review_agent_workflow.py
+!/tests/test_review_assistant_http.py
+!/tests/test_review_reliability.py
+!/tests/live_review_assistant.py
+!/tests/test_react_loop.py
+!/tests/test_request_rewrite.py
+!/tests/test_review_child_adapter.py
+!/tests/test_review_checkpoint_cancellation.py
+!/tests/test_review_native_delegation.py
+!/tests/test_review_candidate_groups.py
+
+!/tests/test_agent_compress.py

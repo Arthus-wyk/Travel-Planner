@@ -71,6 +71,20 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["role"] for m in converted], ["assistant", "tool", "tool", "user"])
         self.assertEqual([c["id"] for c in converted[0]["tool_calls"]], [m["tool_call_id"] for m in converted[1:3]])
 
+    def test_same_name_parallel_replies_preserve_native_call_ids(self):
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "first", "function": {"name": "lookup", "arguments": {"city": "杭州"}}},
+                {"id": "second", "function": {"name": "lookup", "arguments": {"city": "上海"}}},
+            ]},
+            {"role": "tool", "tool_name": "lookup", "tool_call_id": "second", "content": "Shanghai result"},
+            {"role": "tool", "tool_name": "lookup", "tool_call_id": "first", "content": "Hangzhou result"},
+        ]
+        converted = model_client.openai_messages(messages)
+        self.assertEqual([call["id"] for call in converted[0]["tool_calls"]], ["first", "second"])
+        self.assertEqual({reply["content"]: reply["tool_call_id"] for reply in converted[1:]},
+                         {"Shanghai result": "second", "Hangzhou result": "first"})
+
     async def test_truncated_stream_fails_instead_of_executing_partial_calls(self):
         client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(lambda _: httpx.Response(200, text='data: {"choices":[{"delta":{"content":"partial"}}]}\n\n')))
         stream = await client.chat(model="demo", messages=[], tools=[], stream=True)
@@ -182,6 +196,7 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
         chunks = [
             {"choices": [{"delta": {"content": "hello", "tool_calls": [{"index": 0, "function": {"name": "lookup", "arguments": '{"city":'}}]}}]},
             {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '"杭州"}'}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
             {"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 4}},
         ]
         body = "".join("data: " + json.dumps(c) + "\n\n" for c in chunks) + "data: [DONE]\n\n"
@@ -192,3 +207,91 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.message.content, "hello")
         self.assertEqual(json.loads(result.message.tool_calls[0]["function"]["arguments"]), {"city": "杭州"})
         self.assertEqual(result.usage["totalTokens"], 7)
+
+    async def test_stream_rejects_unsuccessful_tool_batches_atomically(self):
+        for reason in ("length", "content_filter", "refusal", None):
+            with self.subTest(reason=reason):
+                chunks = [
+                    {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {
+                        "name": "lookup", "arguments": '{"city":"杭州"}'}}]}}]},
+                    {"choices": [{"delta": {}, "finish_reason": reason}]},
+                ]
+                body = "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+                client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(lambda _: httpx.Response(200, text=body)))
+                stream = await client.chat(model="demo", messages=[], tools=[], stream=True)
+                released = []
+                with self.assertRaises((ValueError, ConnectionError)):
+                    async for chunk in stream:
+                        released.extend(chunk.message.tool_calls)
+                self.assertEqual(released, [])
+
+    async def test_stream_refusal_and_provider_error_preserve_details(self):
+        for chunk, detail in (
+            ({"choices": [{"delta": {"refusal": "cannot fulfill"}, "finish_reason": "stop"}]}, "cannot fulfill"),
+            ({"error": {"message": "maximum context length exceeded"}}, "maximum context length exceeded"),
+        ):
+            with self.subTest(detail=detail):
+                body = "data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n"
+                client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(lambda _: httpx.Response(200, text=body)))
+                stream = await client.chat(model="demo", messages=[], tools=[], stream=True)
+                with self.assertRaisesRegex(ValueError, detail):
+                    async for _ in stream:
+                        pass
+
+    async def test_invalid_call_rejects_entire_batch_before_release(self):
+        valid = {"function": {"name": "lookup", "arguments": '{"city":"杭州"}'}}
+        invalid_calls = [
+            {"function": {"name": "lookup", "arguments": '{"city":'}},
+            {"function": {"name": "lookup", "arguments": '[]'}},
+            {"function": {"name": "lookup", "arguments": '{"value":NaN}'}},
+            {"function": {"arguments": '{}'}},
+            {"function": {"name": "lookup"}},
+        ]
+        for streaming in (False, True):
+            for invalid in invalid_calls:
+                with self.subTest(streaming=streaming, invalid=invalid):
+                    calls = [valid, invalid]
+                    if streaming:
+                        chunks = [
+                            {"choices": [{"delta": {"tool_calls": [dict(call, index=i) for i, call in enumerate(calls)]}}]},
+                            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+                        ]
+                        body = "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+                        response = httpx.Response(200, text=body)
+                    else:
+                        response = httpx.Response(200, json={"choices": [{"message": {"tool_calls": calls}, "finish_reason": "tool_calls"}]})
+                    client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(lambda _: response))
+                    released = []
+                    with self.assertRaises(ValueError):
+                        result = await client.chat(model="demo", messages=[], tools=[], stream=streaming)
+                        if streaming:
+                            async for chunk in result:
+                                released.extend(chunk.message.tool_calls)
+                        else:
+                            released.extend(result.message.tool_calls)
+                    self.assertEqual(released, [])
+
+    async def test_text_only_stream_accepts_done_without_finish_reason(self):
+        body = 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n\n'
+        client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(lambda _: httpx.Response(200, text=body)))
+        stream = await client.chat(model="demo", messages=[], tools=[], stream=True)
+        chunks = [chunk async for chunk in stream]
+        self.assertEqual("".join(chunk.message.content for chunk in chunks), "hello")
+
+    async def test_successful_tool_stream_supports_stop_and_eof(self):
+        body = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]}}]}\n\n'
+        body += 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(lambda _: httpx.Response(200, text=body)))
+        stream = await client.chat(model="demo", messages=[], tools=[], stream=True)
+        chunks = [chunk async for chunk in stream]
+        self.assertEqual(chunks[-1].message.tool_calls, [{"function": {"name": "lookup", "arguments": "{}"}}])
+
+    async def test_truncated_tool_stream_releases_no_calls(self):
+        body = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup","arguments":"{}"}}]}}]}\n\n'
+        client = model_client.OpenAICompatibleClient("https://example.com/v1", "key", transport=httpx.MockTransport(lambda _: httpx.Response(200, text=body)))
+        stream = await client.chat(model="demo", messages=[], tools=[], stream=True)
+        released = []
+        with self.assertRaises(ConnectionError):
+            async for chunk in stream:
+                released.extend(chunk.message.tool_calls)
+        self.assertEqual(released, [])

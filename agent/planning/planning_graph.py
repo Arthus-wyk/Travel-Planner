@@ -36,7 +36,7 @@ from service.travel.planning import (
     move_activity, record_purchase, select_activities, select_candidates,
     update_activity_details,
     update_route_mode, apply_route_times, schedule_itinerary, update_transport_stops,
-    schedule_review, update_day_departure, edit_review_place, complete_review_lodging, MOVABLE_CATEGORIES,
+    schedule_review, update_day_departure, edit_review_place, complete_review_lodging, remove_review_activity, MOVABLE_CATEGORIES,
     build_hotel_activities, _selected, _positive_money,
 )
 from service.travel.map_planning import resolve_activity_place, locate_activities, has_coordinates
@@ -121,7 +121,7 @@ def coordinator(state: PlanningState) -> dict:
             return next((x['item_id'] for x in items if x.get('reference_id') == original['reference_id']
                          and x['category'] == original['category']), item_id)
         for operation in operations:
-            if not isinstance(operation, dict) or operation.get('action') not in {'move_activity', 'update_activity', 'route_mode', 'transport_stops', 'update_budget', 'acknowledge_purchase', 'day_departure', 'review_place', 'complete_lodging'} or not isinstance(operation.get('payload'), dict):
+            if not isinstance(operation, dict) or operation.get('action') not in {'move_activity', 'update_activity', 'route_mode', 'transport_stops', 'update_budget', 'acknowledge_purchase', 'day_departure', 'review_place', 'complete_lodging', 'remove_activity'} or not isinstance(operation.get('payload'), dict):
                 raise ValueError('不支持的行程修改')
             values = deepcopy(operation['payload'])
             for key in ('item_id', 'before_item_id', 'origin_item_id', 'destination_item_id'):
@@ -132,6 +132,8 @@ def coordinator(state: PlanningState) -> dict:
                 plan = edit_review_place(plan, values)
             elif name == 'complete_lodging':
                 plan = complete_review_lodging(plan, values.get('activity_id'))
+            elif name == 'remove_activity':
+                plan = remove_review_activity(plan, values.get('item_id'))
             else:
                 plan = coordinator({'plan': plan, 'action': name, 'payload': values})['plan']
             if name == 'review_place' and not values.get('replace'):

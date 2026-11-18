@@ -4,8 +4,10 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 from tooling.context import ToolContext
 from tooling.registry import ToolRegistry
+from agent.chat.state import AgentSession
+from agent.chat.review_execution import ReviewExecution
 
-DEFAULT_MAX_ROUNDS = 8
+DEFAULT_MAX_ROUNDS = 32
 
 
 @dataclass
@@ -24,3 +26,15 @@ class AgentContext:
     auth_recovery: Callable[[], Awaitable[None]] | None = None
     transcript: Any = None
     telemetry: Any = None
+    system_prompt: str | None = None
+    role: str = "chat"
+    response_format: dict | None = None
+    session: AgentSession | None = None
+    task_id: str | None = None
+    task_version: int = 1
+    timeout_seconds: float = 60
+    concurrency: int = 3
+    execution: ReviewExecution | None = None
+    enable_rewrite: bool = True
+    agent_id: str | None = None
+    parent_agent_id: str | None = None

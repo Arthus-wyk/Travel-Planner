@@ -10,6 +10,7 @@ from typing import Any
 
 from agent.chat.context import AgentContext
 from agent.chat.prompts import is_empty_execution_promise
+from agent.chat.rewrite import rewrite_request
 from agent.chat.runner import run_turn
 from agent.chat.state import AgentCancelledError, AgentRequest, AgentResult, AgentRunError
 from infrastructure.mcp import connect_tools
@@ -110,17 +111,20 @@ async def _handle_chat(
         {"role": m["role"], "content": m["content"]}
         for m in public_message_items(stored or [])
     ]
-    request = AgentRequest(user_message, history=history, current_plan=plan)
     telemetry = ApiTelemetryLogger(
         session_id=transcript.session_id, project_path=str(transcript.project_path)
     )
     await asyncio.to_thread(save_turn_message, conversation_id, "user", user_message)
+    client = create_model_client()
+    rewrite = await rewrite_request(client=client, model=model, text=user_message,
+                                    history=history, current_plan=plan)
+    request = AgentRequest(user_message, history=history, current_plan=plan, rewrite=rewrite)
     async with connect_tools(server_file) as registry:
         try:
             result = await run_turn(
                 request,
                 AgentContext(
-                    create_model_client(),
+                    client,
                     model,
                     registry,
                     transcript=transcript,
@@ -150,11 +154,14 @@ async def _handle_chat(
         }
         for event in result.tool_events[-8:]
     ]
+    run = current_run.get()
+    if run is not None:
+        run.finish(result.status, result.answer)
     return {
         "success": True,
         "conversation_id": conversation_id,
         "answer": result.answer,
-        "understanding": result.understanding,
+        "rewrite": rewrite,
         "tool_events": events,
         "plan": result.plan,
         "actions": actions,

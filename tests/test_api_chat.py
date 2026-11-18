@@ -69,6 +69,10 @@ class ApiChatTests(unittest.IsolatedAsyncioTestCase):
                 raise item
             return item, messages, None
 
+        async def rewrite(**kwargs):
+            return {"original_text": kwargs["text"], "rewritten_text": kwargs["text"],
+                    "references": [], "unresolved_references": []}
+
         with ExitStack() as stack:
             patches = {
                 "get_conversation": Mock(
@@ -95,6 +99,7 @@ class ApiChatTests(unittest.IsolatedAsyncioTestCase):
             }
             for name, value in patches.items():
                 stack.enter_context(patch.object(server, name, value))
+            self.transcript = patches["TranscriptLogger"].return_value
 
             @asynccontextmanager
             async def connection(_):
@@ -109,6 +114,8 @@ class ApiChatTests(unittest.IsolatedAsyncioTestCase):
                     yield registry
 
             stack.enter_context(patch.object(server, "connect_tools", connection))
+            self.rewriter = stack.enter_context(patch.object(
+                server, "rewrite_request", create=True, new=AsyncMock(side_effect=rewrite)))
             stack.enter_context(
                 patch(
                     "infrastructure.llm.request_model_with_retry", side_effect=request
@@ -143,7 +150,7 @@ class ApiChatTests(unittest.IsolatedAsyncioTestCase):
                 "run_id",
                 "conversation_id",
                 "answer",
-                "understanding",
+                "rewrite",
                 "tool_events",
                 "plan",
                 "actions",
@@ -153,9 +160,17 @@ class ApiChatTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn('"plan_id": "trip-1"', self.model_messages[0]["content"])
         self.assertEqual(self.model_messages[1]["content"], "已有建议")
-        self.assertIn("[User intent understanding]", self.model_messages[2]["content"])
+        self.assertEqual(result["rewrite"]["original_text"], "不要参考历史，推荐杭州景点")
+        self.assertTrue(any("不要参考历史，推荐杭州景点" in m["content"] for m in self.model_messages[2:]))
+        self.assertFalse(any("[User intent understanding]" in m["content"] for m in self.model_messages))
+        self.rewriter.assert_awaited_once()
+        self.assertEqual(self.rewriter.await_args.kwargs["history"], [{"role": "assistant", "content": "已有建议"}])
+        self.assertEqual(self.rewriter.await_args.kwargs["current_plan"], self.plan)
         users = [m for m in self.saved if m["role"] == "user"]
         self.assertRegex(result["run_id"], r"^[a-f0-9]{32}$")
+        ends = [call.args[1] for call in self.transcript.record.call_args_list if call.args[0] == "run_end"]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]["status"], "completed")
         self.assertTrue(all(m["metadata"]["run_id"] == result["run_id"] for m in self.saved))
         self.assertEqual([m["content"] for m in users], ["不要参考历史，推荐杭州景点"])
         self.memory.assert_not_awaited()
@@ -173,8 +188,9 @@ class ApiChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["actions"][0]["href"], "/plans/trip-1")
         self.assertEqual(
             [e["tool"] for e in result["tool_events"]],
-            ["get_travel_plan", "verify_last_tool_result"],
+            ["get_travel_plan"],
         )
+        self.assertEqual(result["tool_events"][0]["verification"]["status"], "passed")
         self.session.call_tool.assert_awaited_once_with(
             "get_travel_plan", {"plan_id": "trip-1"}
         )
@@ -188,8 +204,8 @@ class ApiChatTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_mcp_task_group_does_not_hide_partial_result_persistence(self):
-        with self.assertRaises(Exception):
-            await self.run_chat(tool_plan=True, crash=True, grouped=True)
+        result = await self.run_chat(tool_plan=True, crash=True, grouped=True)
+        self.assertIn("中断", result["answer"])
         assistant = [m for m in self.saved if m["role"] == "assistant"]
         self.assertEqual(len(assistant), 1)
         self.assertIn("中断", assistant[0]["content"])

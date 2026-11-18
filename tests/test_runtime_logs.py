@@ -150,7 +150,8 @@ class ChatRuntimeLogTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as folder, patch.object(log_paths, 'PROJECTS_DIR', Path(folder)), \
              patch.object(chat, 'get_conversation', return_value=({'conversation_id': 'broken-chat'}, None)), \
              patch.object(chat, 'list_messages', return_value=([], None)), \
-             patch.object(chat, 'save_turn_message'), patch.object(chat, 'connect_tools', broken_connection):
+             patch.object(chat, 'save_turn_message'), patch.object(chat, 'connect_tools', broken_connection), \
+             patch.object(chat, 'rewrite_request', return_value={'original_text': 'hello', 'rewritten_text': 'hello', 'references': [], 'unresolved_references': []}):
             with self.assertRaisesRegex(OSError, 'MCP unavailable'):
                 await chat.handle_chat(server_file=Path('mcp_server.py'), model='test', conversation_id='broken-chat', user_message='hello')
             runs = list_runs(Path.cwd(), conversation_id='broken-chat')['runs']

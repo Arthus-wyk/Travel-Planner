@@ -1,11 +1,11 @@
-"""模型工具调用解析；SDK 对象与嵌入 JSON 最终转换成同一种普通字典。"""
+"""解析原生工具调用及失败操作关联元数据。"""
 
 import json
-import re
 from copy import deepcopy
 from typing import Any
 
 
+# ============统一工具调用格式 ============
 def normalize_calls(calls: list[Any]) -> list[dict[str, Any]]:
     result = []
     for call in calls:
@@ -39,46 +39,7 @@ def normalize_calls(calls: list[Any]) -> list[dict[str, Any]]:
     return result
 
 
-def embedded_calls(content: str, available: set[str]) -> list[dict[str, Any]]:
-    blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, flags=re.I | re.S)
-    if content.strip().startswith("{"):
-        blocks.append(content.strip())
-    calls = []
-    seen = set()
-    for block in blocks:
-        try:
-            payload = json.loads(block)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        for call in normalize_calls([payload]):
-            key = (
-                call["name"],
-                json.dumps(call["arguments"], sort_keys=True, ensure_ascii=False),
-            )
-            if call["name"] in available and key not in seen:
-                calls.append(call)
-                seen.add(key)
-    return calls
-
-
-def message_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": call["name"],
-                "arguments": {
-                    **call["arguments"],
-                    **({"_retry_of": call["retry_of"]} if "retry_of" in call else {}),
-                },
-            },
-        }
-        for call in calls
-    ]
-
-
+# ============生成模型工具定义 ============
 def model_tools(registry, available: list[str]) -> list[dict[str, Any]]:
     """重试关系仅供 Agent 使用，不改变实际 MCP 工具参数或 handler 签名。"""
     schemas = [

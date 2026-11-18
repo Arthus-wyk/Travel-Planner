@@ -1,10 +1,12 @@
+> 实现入口和当前契约见 [Agent 说明](../agent/README.md)。下文保留角色职责与工具业务规则，实际 Prompt 以代码为准。
+
 # 聊天 AgentLoop 工具清单与系统 Prompt 草案
 
 本稿把 AgentLoop 理解为由应用控制的 ReAct 循环。模型每一步通过原生工具调用执行一个动作，读取工具结果后决定继续行动或结束。协调 Agent 可以通过受控委派调用专业 Agent。首版采用协调、路线审核、地点与推荐、行程操作四个角色。角色划分和下文的授权条件是接入建议。
 
 ## 当前工具清单
 
-默认 MCP 服务注册 26 个工具。服务运行时通过 `list_tools()` 发现工具，聊天图再按领域和允许列表向模型提供 schema。绑定行程时会补入 `plan` 领域，现有 `route` 领域同时包含只读工具和会写回数据的工具。`verify_last_tool_result` 已注册，但没有领域和默认可见标记。当前 `verify` 节点直接在应用内校验。
+默认 MCP 服务注册 26 个工具。服务运行时通过 `list_tools()` 发现工具，聊天图按角色 registry 与服务端 allowed_tools 的交集提供 schema，不做关键词领域路由。`verify_last_tool_result` 已注册，但没有领域和默认可见标记。当前 `verify` 节点直接在应用内校验。
 
 | 角色建议 | 工具 | 行为和副作用 |
 | --- | --- | --- |
@@ -20,11 +22,13 @@
 | 首版不暴露 | `delete_travel_plan` | 删除整个行程。 |
 | 运行时内部 | `verify_last_tool_result` | 校验工具输出。继续由运行时记录校验结果。 |
 
-来源可查阅 [MCP 入口](../mcp_server.py)、[工具注册和指导](../tools/catalog.py)、[MCP 业务实现](../service/mcp/server.py)、[工具可见性](../agent/chat/router.py) 和 [应用内校验](../agent/chat/nodes.py#L250)。
+来源可查阅 [MCP 入口](../mcp_server.py)、[工具注册和指导](../tools/catalog.py)、[MCP 业务实现](../service/mcp/server.py)、[角色工具范围](../agent/chat/runner.py) 和 [应用内校验](../agent/chat/nodes.py)。
 
 ## 装配方式
 
-每个角色使用下面的共享 Prompt 加上该角色自己的 Prompt。同时通过模型 API 传入该角色在本轮可用的原生工具 schema。表格描述职责上限。执行器根据角色、用户权限、绑定行程、来源版本及本轮授权进一步收窄。`delegate` 是草案中拟加入的应用内能力，现有 MCP 清单没有它。只有协调 Agent 可调用它，委派深度上限为一层。应用直接绑定可信的行程范围和执行授权。
+路线审核页工具层已提供 `tools.review.review_registry(plan_id, writable=False)`。默认工具为 `get_review_context`、`search_review_places`、`search_review_hotels` 和 `compare_review_route`。三个固定子 Agent 由 `run_review_turn` 默认装配，各自使用只读白名单。调用方授权保存时，Workflow 使用 `apply_review_changes` 或 `optimize_review_routes`，执行器校验 `review:write`。审核页 HTTP 保存和这两个写工具共用版本校验和业务保存入口。草稿预览与审核页聊天通过统一循环接入。
+
+每个角色使用下面的共享 Prompt 加上该角色自己的 Prompt。同时通过模型 API 传入该角色在本轮可用的原生工具 schema。表格描述职责上限。执行器根据角色、用户权限、绑定行程、来源版本及本轮授权进一步收窄。`delegate_task` 是已接入审核父角色的应用内工具，定义见 `tools/delegation.py`。只有协调 Agent 可调用它，委派深度上限为一层。应用直接绑定可信的行程范围和执行授权。
 
 ### 共享系统 Prompt
 
@@ -43,7 +47,7 @@
 ```text
 你负责用户对话和最终答复。先识别用户是在询问、请求建议、审核路线，还是明确要求保存修改。诸如“合理吗”“会不会来不及”“帮我看看怎么调”属于分析或建议。明确提出要应用的具体变更才进入写入路径。简单解释可以直接回答。
 
-使用 delegate 交给最相关的专业 Agent。路线、节奏、衔接、审核问题交给路线审核。找地点、酒店和替代候选交给地点与推荐。读取行程、核对计划对象和执行已获授权的修改交给行程操作。委派时只传当前任务所需的目标、问题范围和上下文引用，沿用运行时已绑定的行程和权限。需要前一步结果的委派按顺序进行。相同输入已经得到结论时，直接使用它。
+使用 delegate_task 交给最相关的专业 Agent。路线、节奏、衔接、审核问题交给路线审核。找地点、酒店和替代候选交给地点与推荐。读取行程、核对计划对象和执行已获授权的修改交给行程操作。委派时只传当前任务所需的目标、问题范围和上下文引用，沿用运行时已绑定的行程和权限。需要前一步结果的委派按顺序进行。相同输入已经得到结论时，直接使用它。
 
 把专业 Agent 的发现整理成用户能采取行动的答复。审核结论说明针对的版本、最重要的问题和相关日期或项目。建议修改时明确它是提案。只为当前任务询问一个最能解除阻塞的问题。
 ```

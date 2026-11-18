@@ -298,7 +298,8 @@ async def request_model_with_retry(
         Callable[[list[Any]], list[Any] | Awaitable[list[Any]]] | None
     ) = None,
     api_telemetry: Any | None = None,
-    response_format: str | None = None,
+    response_format: str | dict[str, Any] | None = None,
+    stage: str | None = None,
 ) -> tuple[NormalizedResponse | None, list[Any], str | None]:
     """
     Request the model with retry and recovery logic.
@@ -347,6 +348,7 @@ async def request_model_with_retry(
                 )
 
             record_event("model_request", {
+                "stage": stage,
                 "requestId": request_id, "model": current_model, "attempt": attempt,
                 "streamed": streaming_enabled, "messages": current_messages,
                 "tools": tools, "responseFormat": response_format,
@@ -394,6 +396,7 @@ async def request_model_with_retry(
                 )
 
             record_event("model_response", {
+                "stage": stage,
                 "requestId": request_id, "model": response.model, "attempt": attempt,
                 "durationMs": round((perf_counter() - request_started) * 1000, 2),
                 "content": response.message.content, "tool_calls": response.message.tool_calls,
@@ -401,9 +404,17 @@ async def request_model_with_retry(
             })
             return response, current_messages, None
 
+        except asyncio.CancelledError:
+            record_event("model_cancelled", {
+                "stage": stage, "requestId": request_id, "model": current_model, "attempt": attempt,
+                "durationMs": round((perf_counter() - request_started) * 1000, 2),
+                "status": "cancelled", "message": "模型调用被取消，未收到完整响应。",
+            })
+            raise
         except Exception as exc:
             last_exception = exc
             record_event("model_error", {
+                "stage": stage,
                 "requestId": request_id, "model": current_model, "attempt": attempt,
                 "durationMs": round((perf_counter() - request_started) * 1000, 2),
                 "errorType": type(exc).__name__, "message": str(exc),

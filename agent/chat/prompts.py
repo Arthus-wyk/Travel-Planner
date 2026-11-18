@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 
+# ============生成公开回复 ============
 def public_answer(answer: str, plan: dict[str, Any] | None) -> str:
     """已保存计划后模型偶尔只返回编号；统一生成可展示、可入库的完成说明。"""
     if plan is None:
@@ -57,10 +58,10 @@ TRIP-DAY ITINERARY ANCHOR RULES:
 - 工具报错时，根据错误修改参数后重试；不要原样重复同一个失败调用。
 - 工具结果未确认 success=true 时，不要声称已经完成修改。
 
-意图理解块规则：
-- 用户消息可能包含 "User intent understanding" 和 "Task plan"。
-- 把 "Rewritten" 当作解析后的用户请求，把 slots/domains/tool sequence 当作参考，不要机械服从明显错误的计划。
-- 如果 Task plan 建议 create_travel_plan，但当前上下文已有 plan_id，且用户是在规划/补全当前行程，应改用读取和更新当前行程的工具。
+用户请求规则：
+- original_text 是用户原文，rewrite 只补全指代，不增加数量、偏好或授权。
+- 指代未解决时结合公开上下文判断，必要时询问用户；不要擅自推测对象。
+- 当前已有 plan_id 时，优先使用读取和更新工具，只有用户明确要求新建时另建计划。
 
 行程质量规则：
 - 安排要符合真实旅行节奏，避免一天塞太满。
@@ -115,6 +116,7 @@ ACTION_VERBS = (
 )
 
 
+# ============判断是否只承诺执行 ============
 def is_empty_execution_promise(content: str) -> bool:
     normalized = content.strip()
     if not normalized:
@@ -125,6 +127,7 @@ def is_empty_execution_promise(content: str) -> bool:
     return has_promise and has_action
 
 
+# ============构建系统提示词 ============
 def build_system_prompt(plan: dict[str, Any] | None) -> str:
     if not plan:
         return SYSTEM_PROMPT
@@ -177,6 +180,7 @@ def build_system_prompt(plan: dict[str, Any] | None) -> str:
     )
 
 
+# ============汇总当前行程 ============
 def _current_plan_summary(plan: dict[str, Any], trip_days: int | None) -> str:
     date_text = _date_summary(plan, trip_days)
     itinerary_count = len(plan.get("itinerary") or [])
@@ -199,6 +203,7 @@ def _current_plan_summary(plan: dict[str, Any], trip_days: int | None) -> str:
     )
 
 
+# ============汇总日期 ============
 def _date_summary(plan: dict[str, Any], trip_days: int | None) -> str:
     start = plan.get("start_date")
     end = plan.get("end_date")
@@ -208,6 +213,7 @@ def _date_summary(plan: dict[str, Any], trip_days: int | None) -> str:
     return "not set; relative day planning is allowed"
 
 
+# ============计算行程天数 ============
 def _trip_day_count(plan: dict[str, Any]) -> int | None:
     start = str(plan.get("start_date") or "")
     end = str(plan.get("end_date") or "")

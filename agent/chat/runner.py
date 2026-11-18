@@ -1,99 +1,103 @@
-"""唯一 Agent 入口。调用者提供任务和资源，核心返回显式结果，不改写外部历史。"""
-
+"""Shared agent entry point; owns private session initialization and explicit results."""
 import asyncio
+import json
 from copy import deepcopy
-from service.utils.runtime_log import trace_run
+
+from service.utils.runtime_log import trace_run, record_event, current_run
 from agent.chat import memory
 from agent.chat.context import AgentContext
 from agent.chat.graph import build_graph
 from agent.chat.prompts import build_system_prompt
-from agent.chat.state import (
-    AgentCancelledError,
-    AgentRequest,
-    AgentResult,
-    AgentRunError,
-    AgentState,
-)
+from agent.chat.rewrite import rewrite_request
+from agent.chat.state import AgentCancelledError, AgentRequest, AgentResult, AgentSession, AgentState
 
-# 编译图不持有模型、MCP 或会话，多个调用共享结构，但不共享状态和 context。
 GRAPH = build_graph()
 
 
 def result_from_state(state: AgentState) -> AgentResult:
-    return AgentResult(
-        answer=state.get("answer", ""),
-        status=state.get("status", "failed"),
-        understanding=state.get("understanding", {}),
-        new_messages=state.get("new_messages", []),
-        tool_events=state.get("tool_events", []),
-        plan=state.get("plan"),
-    )
+    plan = state.get("plan")
+    if plan is None:
+        plan = next((event["result"]["plan"] for event in reversed(state.get("evidence", []))
+                     if isinstance(event.get("result"), dict) and isinstance(event["result"].get("plan"), dict)), None)
+    return AgentResult(answer=state.get("answer", ""), status=state.get("status", "failed"),
+        rewrite=state.get("rewrite", {}), output=state.get("output"), evidence=state.get("evidence", []),
+        new_messages=state.get("new_messages", []), tool_events=state.get("tool_events", []), plan=plan)
 
 
 async def run_turn(request: AgentRequest, context: AgentContext) -> AgentResult:
+    if not request.text.strip():
+        raise ValueError("User input must not be empty")
+    if context.max_rounds < 1:
+        raise ValueError("max_rounds must be positive")
+    owns_trace = current_run.get() is None
     with trace_run(context.transcript, model=context.model, text=request.text) as run:
         result = await _run_turn(request, context)
-        if run is not None:
+        if run is not None and owns_trace:
             run.finish(result.status, result.answer)
         return result
 
 
 async def _run_turn(request: AgentRequest, context: AgentContext) -> AgentResult:
-    """未来协调者可注册异步工具，使用独立 scope/context 调用同一个函数。
-
-    不替调用者创建或关闭连接，不在这里写业务数据库；因此 CLI、HTTP 和
-    专业 Agent 都能复用，而不用继承某个包含输入输出循环的大类。
-    """
-    if not request.text.strip():
-        raise ValueError("User input must not be empty")
-    if context.max_rounds < 1:
-        raise ValueError("max_rounds must be positive")
-    state: AgentState = {
-        "text": request.text,
-        "current_plan": deepcopy(request.current_plan),
-        "messages": [
-            {"role": "system", "content": build_system_prompt(request.current_plan)},
-            *deepcopy(request.history),
-        ],
-        "round_index": 0,
-        "guard_retries": 0,
-        "calls": [],
-        "call_index": 0,
-        "tool_events": [],
-        "failed_calls": [],
-        "answer": "",
-        "status": "failed",
-        "done": False,
-        "new_messages": [],
-        "plan": None,
-    }
+    session = context.session
+    if session is None:
+        session = AgentSession()
+        context.session = session
+    rewrite = request.rewrite or {"original_text": request.text, "rewritten_text": request.text,
+                                 "references": [], "unresolved_references": []}
+    if context.role == "chat" and context.system_prompt is None and context.enable_rewrite and request.rewrite is None:
+        rewrite = await rewrite_request(client=context.client, model=context.model, text=request.text,
+            history=request.history, current_plan=request.current_plan, selection=request.selection,
+            execution=context.execution)
+    policy, recall_context = memory.recall(request.text, context.memory_enabled)
+    if not session.messages:
+        session.messages.append({"role": "system", "content": context.system_prompt or build_system_prompt(request.current_plan)})
+        session.messages.extend(deepcopy(request.history))
+        if context.memory_enabled:
+            session.messages.append({"role": "user", "content": recall_context})
+    signature = json.dumps({"task": request.text, "extra_data": request.extra_data,
+                            "task_version": context.task_version}, ensure_ascii=False, sort_keys=True)
+    if context.task_id is None or session.task_signature != signature:
+        session.messages.append({"role": "user", "content": json.dumps({"task": request.text,
+            "extra_data": request.extra_data, "original_text": request.text, "rewrite": rewrite}, ensure_ascii=False)})
+        session.task_signature = signature
+    names = set(context.tools.names)
+    if context.allowed_tools is not None:
+        names &= set(context.allowed_tools)
+    state: AgentState = {"text": request.text, "current_plan": deepcopy(request.current_plan),
+        "messages": deepcopy(session.messages), "rewrite": rewrite, "round_index": 0,
+        "guard_retries": 0, "calls": [], "tool_events": [],
+        "failed_calls": list(session.failed_calls), "evidence": list(session.evidence),
+        "answer": "", "status": "failed", "done": False, "new_messages": [], "plan": None,
+        "output": None, "active_tools": sorted(names)}
+    record_event("agent_start", {"agent_id": context.agent_id or session.agent_id,
+                 "parent_agent_id": context.parent_agent_id, "role": context.role,
+                 "task_id": context.task_id, "task_version": context.task_version})
     try:
-        # 图步数还包含逐工具执行和校验，不能误用 8 轮模型限制。
-        # shortcut: 超过 10000 图步的大批量任务需拆分请求。
-        async for snapshot in GRAPH.astream(
-            state, {"recursion_limit": 10000}, context=context, stream_mode="values"
-        ):
+        async for snapshot in GRAPH.astream(state, {"recursion_limit": 10000}, context=context, stream_mode="values"):
             state.update(snapshot)
+            session.messages = deepcopy(state["messages"])
         result = result_from_state(state)
         if context.on_text is not None:
             await context.on_text(result.answer)
-        if (
-            context.memory_enabled
-            and state["memory_policy"]["read_long_term"]
-            and result.status == "completed"
-        ):
-            plan_id = (result.plan or request.current_plan or {}).get("plan_id")
+        if context.memory_enabled and policy["read_long_term"] and result.status == "completed":
             try:
-                result.memory = await memory.extract_and_store(
-                    context, request.text, result.answer, plan_id
-                )
+                result.memory = await memory.extract_and_store(context, request.text, result.answer,
+                    (result.plan or request.current_plan or {}).get("plan_id"))
             except OSError as exc:
-                # 记忆文件失败不抹掉本轮已完成的旅行操作。
                 result.memory = {"success": False, "message": str(exc)}
-            if context.transcript is not None:
-                context.transcript.record("memory_extraction", result.memory)
+        record_event("agent_end", {"agent_id": context.agent_id or session.agent_id,
+                     "parent_agent_id": context.parent_agent_id, "status": result.status,
+                     "task_id": context.task_id, "task_version": context.task_version})
         return result
     except asyncio.CancelledError as exc:
+        state["evidence"] = list(session.evidence)
         raise AgentCancelledError(result_from_state(state)) from exc
     except Exception as exc:
-        raise AgentRunError(str(exc), result_from_state(state)) from exc
+        state["evidence"] = list(session.evidence)
+        state["answer"] = "执行中断，已保留验证成果。"
+        state["status"] = "partial" if session.evidence else "failed"
+        state["new_messages"] = [{"role": "assistant", "content": state["answer"]}]
+        record_event("agent_end", {"agent_id": context.agent_id or session.agent_id,
+                     "parent_agent_id": context.parent_agent_id, "task_id": context.task_id,
+                     "task_version": context.task_version, "status": state["status"], "error_type": type(exc).__name__})
+        return result_from_state(state)

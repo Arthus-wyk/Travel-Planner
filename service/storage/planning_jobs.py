@@ -126,7 +126,8 @@ def commit_result(plan_id, job_id, original, result, *, needs_input=None):
         cur.execute("DELETE FROM planning_job_checkpoints WHERE plan_id=%s", (plan_id,))
 
 
-def save_review_changes(plan_id, original, result):
+def save_review_changes(plan_id, original, result, *, checkpoint_id=None, response=None):
+    """保存审核结果，续跑写入同时完成断点，避免重复提交。"""
     from service.travel.planning import itinerary_for_storage
 
     with transaction() as conn, conn.cursor() as cur:
@@ -138,3 +139,13 @@ def save_review_changes(plan_id, original, result):
                     (json.dumps(itinerary_for_storage(result), ensure_ascii=False),
                      json.dumps(compact_routes(result['routes']), ensure_ascii=False),
                      json.dumps(result['planning'], ensure_ascii=False), result['budget'], plan_id))
+        if checkpoint_id is not None:
+            cur.execute("SELECT * FROM travel_plans WHERE plan_id=%s", (plan_id,))
+            saved = row_to_plan(cur.fetchone())
+            response = {**response, "plan": saved, "plan_version": fingerprint(saved)}
+            cur.execute("""UPDATE review_checkpoints SET status='completed', state_json=%s
+                           WHERE checkpoint_id=%s AND status='running'""",
+                        (json.dumps(response, ensure_ascii=False, default=str), checkpoint_id))
+            if cur.rowcount != 1:
+                raise PlanConflict("本次选择已失效，请检查行程后重试")
+            return response

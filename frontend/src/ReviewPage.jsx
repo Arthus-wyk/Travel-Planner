@@ -1,5 +1,6 @@
 import { applyReviewEdit, canSetDeparture, lodgingCompletionOffer, overnightMismatch, previewSchedule, rebaseReviewAdditions } from './reviewDraft';
 import ReviewPlaceDialog from "./ReviewPlaceDialog";
+import ReviewAssistant from "./ReviewAssistant";
 import RouteMap from "./RouteMap";
 import PlacePhoto from "./PlacePhoto";
 import React, { useEffect, useRef, useState } from "react";
@@ -35,6 +36,7 @@ function LodgingCompletionDialog({ hotel, busy, error, onClose, onConfirm }) {
   </dialog>;
 }
 
+// ============管理审核页行程与待保存草稿 ============
 export default function ReviewPage({ api, refreshPlans }) {
   const { planId } = useParams();
   const navigate = useNavigate();
@@ -42,8 +44,13 @@ export default function ReviewPage({ api, refreshPlans }) {
   const [plan, setPlan] = useState(null);
   const [audit, setAudit] = useState(null);
   const [edits, setEdits] = useState([]);
+  const pendingEdits = useRef([]);
+  const queuedSave = useRef(null);
+  const failedBatch = useRef(null);
   const savedVersion = useRef(null);
   const savedPlan = useRef(null);
+  const draftRevision = useRef(0);
+  const [draftMaps, setDraftMaps] = useState(null);
   const [formDrafts, setFormDrafts] = useState({});
   const invalidDraft = Object.values(formDrafts).some(form => form.invalid);
   const [editorVersion, setEditorVersion] = useState(0);
@@ -77,6 +84,9 @@ export default function ReviewPage({ api, refreshPlans }) {
       if (!active) return;
       if (!["review", "confirmed"].includes(data.plan.planning?.stage)) { navigate(`/plans/${encode(planId)}/planning`, { replace: true }); return; }
       savedVersion.current = data.plan_version; savedPlan.current = data.plan;
+      draftRevision.current += 1; setDraftMaps(null);
+      pendingEdits.current = [];
+      failedBatch.current = null;
       setEdits([]); setFormDrafts({}); setEditorVersion(value => value + 1);
       setDismissedHotel(null); setPreferredHotelItem(null);
       setPlan(data.plan); setBudget(data.plan.budget); setAudit(check.audit); setDay(1); setUncertain(false);
@@ -92,20 +102,29 @@ export default function ReviewPage({ api, refreshPlans }) {
       .finally(() => { if (active) setMapBusy(false); });
     return () => { active = false; };
   }, [api, planId, day, mapRevision, editorVersion]);
-  async function action(name, payload = {}) {
-    if (requestBusy.current || uncertain) return null;
+  // ============编辑页面草稿或调用已有保存入口 ============
+  async function action(name, payload = {}, { quiet = false } = {}) {
+    if (uncertain) return null;
     setActiveIssue(null);
     if (["move_activity", "update_activity", "route_mode", "transport_stops", "update_budget", "acknowledge_purchase", "day_departure", "review_place"].includes(name)) {
       try {
-        setPlan(applyReviewEdit(plan, name, payload));
-        setEdits(current => [...current, { action: name, payload }]);
-        setNotice("有未保存的修改"); setError("");
+        const next = applyReviewEdit(plan, name, payload);
+        const serialized = JSON.stringify(next);
+        if (serialized === JSON.stringify(plan)) return { success: true };
+        setPlan(next);
+        pendingEdits.current = !requestBusy.current && serialized === JSON.stringify(savedPlan.current)
+          ? [] : [...pendingEdits.current, { action: name, payload }];
+        setEdits(pendingEdits.current);
+        draftRevision.current += 1; setDraftMaps(null);
+        setNotice(pendingEdits.current.length ? "有未保存的修改" : ""); setError("");
         return { success: true };
       } catch (cause) { setError(cause.message); return null; }
     }
+    if (requestBusy.current) return null;
     if ((edits.length || invalidDraft) && name !== "review_changes") { setError("请先保存所有修改"); return null; }
     requestBusy.current = true;
-    setBusy(true); setError("");
+    if (!quiet) setBusy(true);
+    setError("");
     const path = `/api/plans/${encode(planId)}`;
     function post(values) {
       const body = name === "review_changes" ? { ...values, operations: values.operations.map(edit => {
@@ -135,9 +154,10 @@ export default function ReviewPage({ api, refreshPlans }) {
         }
       }
       if (!mounted.current) return data;
-      setPlan(data.plan); setBudget(data.plan.budget); setAudit(data.audit || null);
-      savedVersion.current = data.plan_version; savedPlan.current = data.plan;
-      setEdits([]); setFormDrafts({}); setEditorVersion(value => value + 1);
+      const remainder = name === "review_changes" ? pendingEdits.current.slice(payload.operations.length) : [];
+      failedBatch.current = null;
+      applySavedPlan(data, remainder);
+      if (!quiet && !remainder.length) setFormDrafts({});
       setNotice(data.optimization_message || '修改已保存');
       void refreshAfterCommit(refreshPlans, setNotice);
       return data;
@@ -145,19 +165,96 @@ export default function ReviewPage({ api, refreshPlans }) {
       if (mounted.current) {
         setError(cause.message);
         setUncertain(Boolean(cause.uncertain || cause.status === 409));
+        if (name === "review_changes") failedBatch.current = payload.operations;
       }
       return null;
     }
     finally { requestBusy.current = false; if (mounted.current) setBusy(false); }
   }
-  async function saveChanges() {
-    if (!edits.length || requestBusy.current || uncertain) return;
-    if (invalidDraft) {
-      setError("请返回对应日期修正尚未填写完整的调整项");
-      return;
+
+  // ============应用已保存的新版本并重放在途期间的手动编辑 ============
+  function applySavedPlan(data, remaining) {
+    savedVersion.current = data.plan_version;
+    savedPlan.current = data.plan;
+    pendingEdits.current = remaining;
+    setEdits(remaining);
+    draftRevision.current += 1;
+    setDraftMaps(remaining.length ? null : (data.maps ?? null));
+    setAudit(data.audit || null);
+    setMapRevision(value => value + 1);
+    let displayed;
+    try {
+      displayed = remaining.reduce((current, edit) => applyReviewEdit(current, edit.action, edit.payload), data.plan);
+    } catch (cause) {
+      setUncertain(true);
+      setError("行程已更新，部分待保存编辑需要重新核对。");
+      displayed = data.plan;
     }
-    await action("review_changes", { operations: edits, plan_version: savedVersion.current });
+    setPlan(displayed);
+    setBudget(displayed.budget);
+    if (!remaining.length) setEditorVersion(value => value + 1);
   }
+
+  // ============先保存有效编辑，再发起路线助手请求 ============
+  async function assistantTurn(payload, onProgress) {
+    if (uncertain || invalidDraft) throw new Error("请先完成当前编辑");
+    if (queuedSave.current) await queuedSave.current;
+    if (pendingEdits.current.length) {
+      onProgress?.("正在同步页面修改…");
+      const saved = await saveChanges({ quiet: true });
+      if (!saved || pendingEdits.current.length) throw new Error("还有未保存的页面修改，请稍后重试");
+    }
+    if (requestBusy.current) throw new Error("请先完成当前编辑");
+    requestBusy.current = true;
+    const sentRevision = draftRevision.current;
+    try {
+      const result = await api(`/api/plans/${encode(planId)}/planning/assistant?stream=true`, {
+        method: "POST",
+        onProgress,
+        timeoutMs: 75000,
+        body: JSON.stringify({ ...payload, draft_revision: sentRevision }),
+      });
+      if (mounted.current && result.status === "saved") {
+        applySavedPlan(result, pendingEdits.current);
+        setNotice("行程已更新");
+        void refreshAfterCommit(refreshPlans, setNotice);
+      } else if (mounted.current && result.status === "save_unknown") {
+        setUncertain(true);
+      }
+      return result;
+    } catch (cause) {
+      if (mounted.current && payload.action_id && !cause.status) setUncertain(true);
+      throw cause;
+    } finally {
+      requestBusy.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  }
+  // ============保存当前队列中的一批操作 ============
+  async function saveChanges({ quiet = false } = {}) {
+    if (queuedSave.current) return await queuedSave.current;
+    if (!pendingEdits.current.length || requestBusy.current || uncertain) return null;
+    if (quiet && failedBatch.current === pendingEdits.current) return null;
+    if (invalidDraft) {
+      if (!quiet) setError("请返回对应日期修正尚未填写完整的调整项");
+      return null;
+    }
+    const saving = action("review_changes", { operations: pendingEdits.current, plan_version: savedVersion.current }, { quiet });
+    queuedSave.current = saving;
+    try {
+      return await saving;
+    } finally {
+      queuedSave.current = null;
+    }
+  }
+
+  // ============定时检查并静默保存有效编辑 ============
+  const saveOnTimer = useRef(saveChanges);
+  saveOnTimer.current = saveChanges;
+  useEffect(() => {
+    const timer = setInterval(() => { void saveOnTimer.current({ quiet: true }); }, 3000);
+    return () => clearInterval(timer);
+  }, []);
   async function move(id, targetDay, before = null) {
     setDragged(null); setTarget(null);
     if (formDrafts[id]?.invalid) { setError("请先修正该地点的停留信息"); return; }
@@ -183,7 +280,7 @@ export default function ReviewPage({ api, refreshPlans }) {
   const days = Math.round((new Date(`${plan.end_date}T00:00:00Z`) - new Date(`${plan.start_date}T00:00:00Z`)) / 86400000) + 1;
   const lodgingOffer = !placeEditor && !invalidDraft && !uncertain && lodgingCompletionOffer(plan, days, edits.length ? preferredHotelItem : null);
   const editsTimetable = edits.some(edit => !["update_budget", "acknowledge_purchase"].includes(edit.action));
-  const items = (editsTimetable || state.day_departures && !state.optimized_timetable) && plan.itinerary?.length
+  const items = !draftMaps && (editsTimetable || state.day_departures && !state.optimized_timetable) && plan.itinerary?.length
     ? previewSchedule(plan, day)
     : (plan.itinerary || []).filter((item) => item.day === day);
   const departureForm = `day-departure-${day}`;
@@ -332,8 +429,9 @@ export default function ReviewPage({ api, refreshPlans }) {
       <button type="button" className="active" aria-current="step">3 审核路线</button>
     </nav>
     <p role="status" className="guided-note">每日路线已生成，可调整地点顺序并核对费用。</p>
+    <ReviewAssistant key={planId} planId={planId} editable={editable} disabled={busy || uncertain || invalidDraft} onTurn={assistantTurn} />
     {issueHints(issue => !isOnRoute(issue) && issue.kind !== "pending" && (issue.kind !== "purchase" || !editable))}
-    {editable && <div className="guided-actions" role="status"><button id="review-save" className="primary-button" disabled={busy || uncertain || !edits.length} onClick={saveChanges}>保存所有修改</button><span>{edits.length || invalidDraft ? "修改暂存在此页面。请在刷新或离开前保存；路线地图和审核预算在保存后更新。" : "所有修改已保存"}</span></div>}
+    {editable && <div className="guided-actions" role="status"><button id="review-save" className="primary-button" disabled={busy || uncertain || !edits.length} onClick={() => saveChanges()}>立即保存</button><span>{edits.length || invalidDraft ? "有效修改会自动保存。" : "所有修改已保存"}</span></div>}
     {error && <p className="guided-error" role="alert">{error}</p>}
     {(state.activities || []).filter(item => item.choice !== "exclude" && item.place_error).map(item => <p key={item.id} className="guided-note" role="status">{item.name}：{item.place_error}</p>)}
     {Object.entries(state.lodging_search_errors || {}).map(([area, reason]) => <p key={area} className="guided-note" role="status">{area}住宿查询失败：{reason}</p>)}
@@ -363,7 +461,8 @@ export default function ReviewPage({ api, refreshPlans }) {
     {issueHints(issue => issue.kind === "day" && issue.day === day)}
     <section className="review-map-panel" aria-label={`第${day}天的路线地图`}>
         <div className="review-map-caption"><strong>第 {day} 天行程路线图</strong><span>高德地图，地点编号对应下方卡片</span></div>
-      {mapBusy ? <div className="review-map-placeholder" role="status">正在读取当天路线地图…</div> : map?.points && !mapError ? <RouteMap data={map} /> : <div className="review-map-placeholder" role="status">{mapError || "确认地点后显示路线地图"}</div>}
+      {draftMaps ? (draftMaps[day]?.points ? <RouteMap data={draftMaps[day]} /> : <div className="review-map-placeholder">当天草稿暂无可用地图</div>)
+        : mapBusy ? <div className="review-map-placeholder" role="status">正在读取当天路线地图…</div> : map?.points && !mapError ? <RouteMap data={map} /> : <div className="review-map-placeholder" role="status">{mapError || "确认地点后显示路线地图"}</div>}
       {mapHasDraftChanges && <p className="guided-note">当前地图显示已保存的路线。保存后更新。</p>}
       {mapError && <button disabled={mapBusy} onClick={() => setMapRevision(x => x + 1)}>重试当天地图</button>}
       {map?.warnings?.map((warning) => <p key={warning} className="guided-note">{warning}</p>)}

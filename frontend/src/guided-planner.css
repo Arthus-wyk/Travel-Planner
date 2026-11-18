@@ -597,3 +597,168 @@
   .review-day-toolbar .review-day-nav { flex-basis: 100%; }
   .review-page .review-pending { min-height: 0; }
 }
+/* 路线助手保留审核页配色，悬浮窗内只滚动消息和历史列表。 */
+.review-chat-dock {
+  position: fixed;
+  z-index: 50;
+  right: max(20px, env(safe-area-inset-right));
+  bottom: max(20px, env(safe-area-inset-bottom));
+  display: grid;
+  gap: 12px;
+  justify-items: end;
+}
+.review-chat-launcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 0 17px;
+  border: 1px solid var(--ink);
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--surface);
+  box-shadow: var(--shadow-overlay);
+  font-weight: var(--weight-semibold);
+}
+.review-assistant {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: min(460px, calc(100vw - 40px));
+  height: min(620px, calc(100dvh - 100px));
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 14px 54px -12px oklch(20% 0.009 60 / 36%);
+  font-size: var(--text-sm);
+}
+.review-chat-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.review-chat-heading { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+.review-chat-heading svg { color: var(--accent-line); }
+.review-chat-heading h2 { margin: 0; font-size: var(--text-base); }
+.review-chat-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--ink);
+}
+.review-chat-icon:hover, .review-chat-icon[aria-pressed="true"] { background: var(--surface-active); }
+.review-chat-messages, .review-chat-history {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 16px;
+}
+.review-chat-empty { margin: 18px 0; }
+.review-chat-empty h3, .review-chat-history h3 { margin: 0 0 6px; }
+.review-chat-empty p, .review-chat-history p { color: var(--ink-muted); }
+.review-chat-history button {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--ink);
+  text-align: start;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.review-chat-history button:hover, .review-chat-history button[aria-current] { background: var(--surface-muted); }
+.review-chat-message { max-width: 100%; margin-block: 10px 16px; overflow-wrap: anywhere; }
+.review-chat-message > p { margin: 0; white-space: pre-wrap; }
+.review-chat-message.is-user {
+  width: fit-content;
+  max-width: 85%;
+  margin-inline-start: auto;
+  padding: 8px 12px;
+  border-radius: 14px 14px 4px 14px;
+  background: var(--surface-muted);
+}
+.review-chat-message [role="alert"] { color: var(--danger); }
+.review-chat-status { margin: 6px 16px; color: var(--ink-muted); }
+.review-chat-choices {
+  flex: none;
+  max-height: 42%;
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin: 0 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-muted);
+}
+.review-chat-composer {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+  margin: 8px 12px 12px;
+  padding: 6px;
+  border: 1px solid var(--border-control);
+  border-radius: 14px;
+}
+.review-chat-composer textarea {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  background: transparent;
+  border: 0;
+  color: var(--ink);
+  padding: 6px;
+  font: inherit;
+}
+.review-chat-composer button {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border-radius: 50%;
+  border: 0;
+  background: var(--ink);
+  color: var(--surface);
+}
+.review-chat-composer button:disabled { background: var(--surface-muted); color: var(--ink-muted); }
+.review-assistant-options, .review-assistant-cards, .review-assistant-options form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-block-start: 8px;
+}
+.review-assistant-options > p, .review-assistant-options > details, .review-assistant-options form {
+  flex-basis: 100%;
+}
+.review-assistant-options > p { margin: 0; }
+.review-assistant-cards article {
+  flex: 1 1 140px;
+  min-width: 0;
+  max-width: 220px;
+  align-self: stretch;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+.review-assistant-cards article h3 { font-size: var(--text-sm); margin: 6px 0; }
+.review-assistant-cards article p { margin: 4px 0 8px; color: var(--ink-muted); }
+.review-assistant-cards .place-photo { width: 100%; height: 92px; object-fit: cover; }
+@media (max-width: 540px) {
+  .review-chat-dock { right: max(12px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); }
+  .review-assistant { width: calc(100vw - 24px); height: min(620px, calc(100dvh - 84px)); }
+}
