@@ -22,13 +22,13 @@
 | 首版不暴露 | `delete_travel_plan` | 删除整个行程。 |
 | 运行时内部 | `verify_last_tool_result` | 校验工具输出。继续由运行时记录校验结果。 |
 
-来源可查阅 [MCP 入口](../mcp_server.py)、[工具注册和指导](../tools/catalog.py)、[MCP 业务实现](../service/mcp/server.py)、[角色工具范围](../agent/chat/runner.py) 和 [应用内校验](../agent/chat/nodes.py)。
+来源可查阅 [MCP 入口](../mcp_server.py)、[工具注册和指导](../agent/tools/catalog.py)、[MCP 业务实现](../service/mcp/server.py)、[角色工具范围](../agent/chat/planner.py) 和 [应用内校验](../agent/chat/runtime/nodes.py)。
 
 ## 装配方式
 
-路线审核页工具层已提供 `tools.review.review_registry(plan_id, writable=False)`。默认工具为 `get_review_context`、`search_review_places`、`search_review_hotels` 和 `compare_review_route`。三个固定子 Agent 由 `run_review_turn` 默认装配，各自使用只读白名单。调用方授权保存时，Workflow 使用 `apply_review_changes` 或 `optimize_review_routes`，执行器校验 `review:write`。审核页 HTTP 保存和这两个写工具共用版本校验和业务保存入口。草稿预览与审核页聊天通过统一循环接入。
+路线审核页工具层已提供 `agent.tools.implementations.review.review_registry(plan_id, writable=False)`。默认工具为 `get_review_context`、`search_review_places`、`search_review_hotels` 和 `compare_review_route`。三个固定子 Agent 由 `run_review_turn` 默认装配，各自使用只读白名单。调用方授权保存时，Workflow 使用 `apply_review_changes` 或 `optimize_review_routes`，执行器校验 `review:write`。审核页 HTTP 保存和这两个写工具共用版本校验和业务保存入口。草稿预览与审核页聊天通过统一循环接入。
 
-每个角色使用下面的共享 Prompt 加上该角色自己的 Prompt。同时通过模型 API 传入该角色在本轮可用的原生工具 schema。表格描述职责上限。执行器根据角色、用户权限、绑定行程、来源版本及本轮授权进一步收窄。`delegate_task` 是已接入审核父角色的应用内工具，定义见 `tools/delegation.py`。只有协调 Agent 可调用它，委派深度上限为一层。应用直接绑定可信的行程范围和执行授权。
+每个角色使用下面的共享 Prompt 加上该角色自己的 Prompt。同时通过模型 API 传入该角色在本轮可用的原生工具 schema。表格描述职责上限。执行器根据角色、用户权限、绑定行程、来源版本及本轮授权进一步收窄。`delegate_task` 是已接入审核父角色的应用内工具，定义见 `agent/tools/implementations/delegation.py`。只有协调 Agent 可调用它，委派深度上限为一层。应用直接绑定可信的行程范围和执行授权。
 
 ### 共享系统 Prompt
 
@@ -87,4 +87,4 @@
 - 一轮对话共享模型步数、委派次数、工具次数与超时预算。运行时识别重复调用，校验写入结果，避免把传输失败直接当作写入未执行。原生工具调用优先，当前从回复正文提取工具 JSON 的兼容逻辑需要单独评估，首版建议关闭。
 - 长期偏好写入的授权需要覆盖工具和图外路径。当前聊天运行器会在满足条件时额外提取和保存记忆。接入时将它纳入相同的明确授权条件，或为审核页调用关闭这条路径。
 
-来源可查阅 [当前工具执行器](../agent/chat/executor.py)、[审核页保存](../frontend/src/ReviewPage.jsx#L159)、[版本校验与持久化](../service/api/server.py#L303)、[兼容工具解析](../agent/chat/tool_calls.py#L36) 与 [图外记忆](../agent/chat/runner.py#L80)。
+来源可查阅 [当前工具执行器](../agent/tools/dispatcher.py)、[审核页保存](../frontend/src/ReviewPage.jsx#L159)、[版本校验与持久化](../service/api/server.py#L303)、[兼容工具解析](../agent/tools/calls.py#L36) 与 [图外记忆](../agent/chat/planner.py#L80)。

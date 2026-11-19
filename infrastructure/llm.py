@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import httpx
 import uuid
 from service.utils.runtime_log import record_event
+from service.utils.model_client import StructuredOutputError, decode_structured_output
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Awaitable, Callable
@@ -59,6 +61,7 @@ class NormalizedResponse:
     model: str
     streamed: bool
     usage: dict[str, Any]
+    finish_reason: str | None = None
 
 
 # ============================================================
@@ -205,6 +208,7 @@ def normalize_non_stream_response(
         model=model,
         streamed=False,
         usage=extract_usage_summary(response, model),
+        finish_reason=getattr(response, "finish_reason", None) or getattr(response, "done_reason", None),
     )
 
 
@@ -249,6 +253,7 @@ async def collect_stream_response(
         model=model,
         streamed=True,
         usage=extract_usage_summary(usage_source, model),
+        finish_reason=getattr(usage_source, "finish_reason", None) or getattr(usage_source, "done_reason", None),
     )
 
 
@@ -300,6 +305,7 @@ async def request_model_with_retry(
     api_telemetry: Any | None = None,
     response_format: str | dict[str, Any] | None = None,
     stage: str | None = None,
+    max_output_tokens: int | None = None,
 ) -> tuple[NormalizedResponse | None, list[Any], str | None]:
     """
     Request the model with retry and recovery logic.
@@ -320,6 +326,9 @@ async def request_model_with_retry(
     current_model = model
     current_messages = list(messages)
     streaming_enabled = use_streaming
+    options = {"temperature": 0}
+    if max_output_tokens is not None:
+        options["num_predict"] = max_output_tokens
 
     consecutive_529 = 0
     context_compression_count = 0
@@ -352,6 +361,7 @@ async def request_model_with_retry(
                 "requestId": request_id, "model": current_model, "attempt": attempt,
                 "streamed": streaming_enabled, "messages": current_messages,
                 "tools": tools, "responseFormat": response_format,
+                "maxOutputTokens": max_output_tokens,
             })
             if streaming_enabled:
                 stream = await ollama.chat(
@@ -359,7 +369,7 @@ async def request_model_with_retry(
                     messages=current_messages,
                     tools=tools,
                     stream=True,
-                    options={"temperature": 0},
+                    options=options,
                     **({"format": response_format} if response_format else {}),
                 )
 
@@ -375,7 +385,7 @@ async def request_model_with_retry(
                     messages=current_messages,
                     tools=tools,
                     stream=False,
-                    options={"temperature": 0},
+                    options=options,
                     **({"format": response_format} if response_format else {}),
                 )
 
@@ -383,6 +393,16 @@ async def request_model_with_retry(
                     raw_response,
                     current_model,
                 )
+
+            if isinstance(response_format, dict) and response.finish_reason == "length":
+                if response.message.tool_calls:
+                    raise ValueError("模型工具调用被截断。")
+                raise StructuredOutputError("truncated_output", "模型结构化结果被截断。")
+
+            if isinstance(response_format, dict) and not response.message.tool_calls:
+                parsed, repaired = decode_structured_output(response.message.content, response_format)
+                if repaired:
+                    response.message.content = json.dumps(parsed, ensure_ascii=False)
 
             if api_telemetry is not None:
                 api_telemetry.record_success(
@@ -400,7 +420,7 @@ async def request_model_with_retry(
                 "requestId": request_id, "model": response.model, "attempt": attempt,
                 "durationMs": round((perf_counter() - request_started) * 1000, 2),
                 "content": response.message.content, "tool_calls": response.message.tool_calls,
-                "usage": response.usage,
+                "usage": response.usage, "finishReason": response.finish_reason,
             })
             return response, current_messages, None
 
@@ -410,6 +430,37 @@ async def request_model_with_retry(
                 "durationMs": round((perf_counter() - request_started) * 1000, 2),
                 "status": "cancelled", "message": "模型调用被取消，未收到完整响应。",
             })
+            raise
+        except StructuredOutputError as exc:
+            record_event("model_error", {
+                "stage": stage, "requestId": request_id, "model": current_model,
+                "attempt": attempt, "durationMs": round((perf_counter() - request_started) * 1000, 2),
+                "errorType": exc.code, "message": str(exc),
+            })
+            if api_telemetry is not None:
+                api_telemetry.record_error(
+                    model=current_model, message_count=len(current_messages), tool_count=len(tools),
+                    attempt=attempt, streamed=streaming_enabled, duration_seconds=perf_counter() - request_started,
+                    error=exc, status_code=None, will_retry=False,
+                )
+            if (config.max_attempts > 1 and isinstance(response_format, dict)
+                    and exc.code in {"invalid_schema", "invalid_json", "empty_output"}):
+                correction = [*current_messages]
+                if exc.content:
+                    correction.append({"role": "assistant", "content": exc.content})
+                correction.append({"role": "user", "content": (
+                    "上次最终输出格式错误：" + str(exc)
+                    + "。请只修正格式并返回完整 JSON，保留已验证事实，不调用业务工具、不新增事实。"
+                )})
+                corrected, _, error = await request_model_with_retry(
+                    ollama=ollama, model=current_model, messages=correction, tools=[],
+                    config=RetryConfig(max_attempts=1), use_streaming=False,
+                    response_format=response_format, stage=stage, max_output_tokens=max_output_tokens,
+                    api_telemetry=api_telemetry,
+                )
+                if corrected is None or corrected.message.tool_calls:
+                    raise StructuredOutputError(exc.code, "结构化输出纠正失败。") from None
+                return corrected, current_messages, error
             raise
         except Exception as exc:
             last_exception = exc

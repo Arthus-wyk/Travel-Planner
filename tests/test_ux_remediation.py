@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from service.travel.planning import create_draft, add_manual_activity, select_activities
-from agent.planning.planning_graph import run_planning_action
+from agent.planning.planner import run_planning_action
 
 
 class UxRemediationTests(unittest.TestCase):
@@ -44,14 +44,14 @@ class UxRemediationTests(unittest.TestCase):
     def test_recalculate_routes_does_not_regenerate_itinerary(self):
         plan = self.plan()
         plan['planning']['stage'] = 'review'
-        with patch('agent.planning.planning_graph.AMAP_API_KEY', ''), patch('agent.planning.planning_graph.generate_itinerary_proposal') as model:
+        with patch('service.config.AMAP_API_KEY', ''), patch('agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal') as model:
             result = run_planning_action(plan, 'recalculate_routes', {})
         self.assertIn('route_agent', result['trace'])
         model.assert_not_called()
 
     def test_transport_roundtrip_preserves_saved_unparsed_guide(self):
         plan = self.plan()
-        with patch('agent.planning.planning_graph.AMAP_API_KEY', ''), patch('agent.planning.planning_graph._hotel_places', return_value=[]), patch('service.travel.planning.analyze_guide', side_effect=lambda text: {'text': text, 'places': []}):
+        with patch('service.config.AMAP_API_KEY', ''), patch('agent.planning.implementations.candidates._hotel_places', return_value=[]), patch('service.travel.planning.analyze_guide', side_effect=lambda text: {'text': text, 'places': []}):
             plan = run_planning_action(plan, 'candidates', {})['plan']
             candidates = plan['planning']['transport_candidates']
             selection = {side: next(x['id'] for x in candidates if x['direction'] == side and x['kind'] == 'train') for side in ('outbound', 'return')}
@@ -68,7 +68,7 @@ class UxRemediationTests(unittest.TestCase):
             {'item_id': 'b', 'day': 1, 'time_of_day': '12:00', 'title': '乙', 'location': '终点', 'category': 'attraction', 'duration_minutes': 60},
         ]
         plan['routes'] = [{'origin_item_id': 'a', 'destination_item_id': 'b', 'origin': '旧起点', 'destination': '终点', 'legs': [{'polyline': 'old'}], 'duration_minutes': 30}]
-        with patch('agent.planning.planning_graph.AMAP_API_KEY', ''):
+        with patch('service.config.AMAP_API_KEY', ''):
             result = run_planning_action(plan, 'recalculate_routes', {})
         self.assertEqual(result['plan']['routes'][0]['legs'], [])
 

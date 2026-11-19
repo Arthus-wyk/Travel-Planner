@@ -65,6 +65,11 @@ def amap_error(exc: Exception) -> dict[str, Any]:
         return {"success": False, "message": message, "http_status": exc.status, "retry_after": exc.retry_after}
     if isinstance(exc, AmapRequestError):
         return {"success": False, "message": message, "infocode": exc.code}
+    cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(cause, TimeoutError):
+        return {"success": False, "message": "Amap request timed out.", "error_type": "upstream_timeout"}
+    if isinstance(exc, (ConnectionError, urllib.error.URLError)):
+        return {"success": False, "message": "Amap network request failed.", "error_type": "upstream_unavailable"}
     return {"success": False, "message": f"Amap API error: {type(exc).__name__}: {message}"}
 
 

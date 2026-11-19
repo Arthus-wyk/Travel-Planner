@@ -5,7 +5,7 @@ import threading
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from agent.chat.review_execution import ReviewExecution
+from agent.chat.runtime.execution import ReviewExecution
 from service.travel import review_interaction as review
 
 

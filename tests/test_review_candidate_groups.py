@@ -1,6 +1,6 @@
 import unittest
 
-from agent.chat.review_parent import _groups
+from agent.chat.review.parent import _groups
 from service.travel.review_interaction import _selected_places
 
 
@@ -31,6 +31,23 @@ class CandidateGroupsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _groups(groups, self.places)
 
+    def test_search_scope_rejects_mixed_sources_and_changed_counts(self):
+        scopes = (({"park"}, 1), ({"a", "b", "c"}, 2), ({"food"}, 1))
+        self.assertEqual(_groups(self.groups, self.places, scopes), self.groups)
+        for changed in ({"place_ids": ["a", "food"]}, {"selection_count": 1}):
+            groups = [{**self.groups[1], **changed}]
+            with self.assertRaisesRegex(ValueError, "同一搜索任务"):
+                _groups(groups, self.places, scopes)
+
     def test_duplicate_indexes_are_rejected(self):
         with self.assertRaises(ValueError):
             _selected_places({"option_indexes": [0, 1, 1, 4]}, self.state)
+
+    def test_complete_delivery_rejects_omitted_search_and_changed_null(self):
+        scopes = (({"park"}, 1), ({"a", "b", "c"}, 2), ({"food"}, 1))
+        with self.assertRaisesRegex(ValueError, "完整交付"):
+            _groups(self.groups[:1], self.places, scopes, require_complete=True)
+        with self.assertRaisesRegex(ValueError, "选择数量"):
+            _groups(self.groups[:1], self.places, (({"park"}, None),))
+        self.assertEqual(_groups(self.groups, self.places, scopes, require_complete=True), self.groups)
+        self.assertEqual(_groups(self.groups[:1], self.places, scopes), self.groups[:1])

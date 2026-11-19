@@ -8,8 +8,8 @@ from time import monotonic
 from uuid import uuid4
 from typing import Callable
 
-from agent.chat.review_execution import ReviewExecution, ReviewStepTimeout
-from agent.chat.review_workflow import ClarificationReply, ReviewContext, ReviewRequest, ReviewTurnResult, run_review_turn
+from agent.chat.runtime.execution import ReviewExecution, ReviewStepTimeout
+from agent.chat.review.workflow import ClarificationReply, ReviewContext, ReviewRequest, ReviewTurnResult, run_review_turn
 from service.storage.planning_jobs import PlanConflict, fingerprint
 from service.storage import planning_jobs, review_checkpoints
 from service.storage.travel_db import get_plan
@@ -217,6 +217,11 @@ class ReviewInteractions:
             return response, True
         if kind == "choice":
             answer = _checkpoint_answer(payload, state["prompt"])
+            previous = (request_context or {}).get("clarification")
+            if previous:
+                request_context = {**request_context, "clarification_answers": [
+                    *request_context.get("clarification_answers", []), previous,
+                ]}
             request_context = {**(request_context or {}), "clarification": {
                 "question": state["prompt"]["question"], "answer": answer,
             }}

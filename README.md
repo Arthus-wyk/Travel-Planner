@@ -6,7 +6,7 @@
 
 ## Agent 执行方式
 
-HTTP 对话调用 `agent.chat.runner.run_turn(AgentRequest, AgentContext)`，共用一张对话 LangGraph 和一条工具执行链。表单规划由另一张 LangGraph 的主 Agent 协调专业节点。旧 `service/agent/` 及双执行器已移出运行路径，不再使用临时切换环境变量。
+HTTP 对话调用 `agent.chat.planner.run_turn(AgentRequest, AgentContext)`，共用一张对话 LangGraph 和一条工具执行链。表单规划由另一张 LangGraph 的主 Agent 协调专业节点。旧 `service/agent/` 及双执行器已移出运行路径，不再使用临时切换环境变量。
 
 节点顺序：准备记忆 → 理解请求 → 筛选工具 → 模型 → 单个工具 → 结果校验 → 模型 → 公开回复。历史、模型工作上下文和本轮新消息分别管理，压缩不会导致回复漏存。
 
@@ -105,7 +105,7 @@ uv run python server.py
 
 ### 1. Agent 核心与执行护栏
 
-代码：[agent/runner.py](agent/runner.py)、[agent/graph.py](agent/graph.py)、[agent/nodes.py](agent/nodes.py)。
+代码：[agent/chat/planner.py](agent/chat/planner.py)、[agent/chat/runtime/agent_loop.py](agent/chat/runtime/agent_loop.py)、[agent/chat/runtime/nodes.py](agent/chat/runtime/nodes.py)。
 
 `run_turn` 接受明确请求和运行资源，返回 `AgentResult`。图控制步骤，模型选择具体工具；支持原生及嵌入 JSON 工具调用、最多 8 轮决策和空承诺护栏。异常携带已完成产物，取消仍保持取消语义，不自动重跑写入。
 
@@ -117,7 +117,7 @@ uv run python server.py
 
 ### 3. 旅行计划与需求管理
 
-代码：[tools/plan/](tools/plan/)、[service/mcp/server.py](service/mcp/server.py)。
+代码：[agent/tools/implementations/plan/](agent/tools/implementations/plan/)、[service/mcp/server.py](service/mcp/server.py)。
 
 - **做什么**：创建、修改、查询、汇总、列出和删除旅行计划，维护目的地、日期、人数、预算、兴趣、约束、节奏等信息。
 - **亮点**：将高层需求与具体日程分开保存；一个计划可关联多段网页对话，方便持续调整。
@@ -125,7 +125,7 @@ uv run python server.py
 
 ### 4. 日程安排、路线协调与确定性审计
 
-代码：[tools/itinerary/](tools/itinerary/)、[service/validation.py](service/validation.py)、[service/travel/itinerary_audit.py](service/travel/itinerary_audit.py)。
+代码：[agent/tools/implementations/itinerary/](agent/tools/implementations/itinerary/)、[service/validation.py](service/validation.py)、[service/travel/itinerary_audit.py](service/travel/itinerary_audit.py)。
 
 - **做什么**：增删改查日程、跨天移动活动、保存路线，并检查时间、强度、餐饮、预算和预订风险。
 - **亮点**：开始时间要求为 24 小时制 `HH:MM`，日程按时间排序；基于活动时长检查重叠。删除或移动日程会清理关联的旧路线。`reconcile_travel_plan` 可按受影响日期或活动重新计算相邻活动的交通，结合审计提示交通缓冲不足。
@@ -135,7 +135,7 @@ uv run python server.py
 
 ### 5. 高德地图：地点搜索、地理编码、静态地图与路线
 
-代码：[tools/maps/](tools/maps/)、[service/integrations/travel_amap.py](service/integrations/travel_amap.py)。
+代码：[agent/tools/implementations/maps/](agent/tools/implementations/maps/)、[service/integrations/travel_amap.py](service/integrations/travel_amap.py)。
 
 - **做什么**：搜索景点、餐厅、酒店，计算地点间的距离和交通时长。
 - **亮点**：酒店、景点、餐饮使用 POI 关键词搜索；传入中心坐标时使用周边搜索。路径规划自动解析起终点地址和公交城市编码，并转换成现有行程审核所需的米数与秒数。
@@ -157,7 +157,7 @@ uv run python server.py
 
 ### 6. 候选推荐、可解释评分与预算明细
 
-代码：[tools/recommendation/](tools/recommendation/)、[service/travel/recommendation_ranker.py](service/travel/recommendation_ranker.py)。
+代码：[agent/tools/implementations/recommendation/](agent/tools/implementations/recommendation/)、[service/travel/recommendation_ranker.py](service/travel/recommendation_ranker.py)。
 
 - **做什么**：保存尚未排入日程的候选酒店、餐厅、景点等，更新推荐，记录交通、住宿、餐饮等预算项。
 - **亮点**：`rank_recommendations` 使用规则综合评分、评价数量、价格档位、类别、营业状态及偏好关键词；返回分数、推荐理由 `reasons` 和取舍 `tradeoffs`，方便解释选择。
@@ -165,7 +165,7 @@ uv run python server.py
 
 ### 7. 长期偏好与中期记忆
 
-代码：[agent/memory.py](agent/memory.py)、[service/storage/memory_store.py](service/storage/memory_store.py)、[tools/memory/](tools/memory/)。
+代码：[agent/chat/runtime/memory.py](agent/chat/runtime/memory.py)、[service/storage/memory_store.py](service/storage/memory_store.py)、[agent/tools/implementations/memory/](agent/tools/implementations/memory/)。
 
 - **做什么**：在当前对话之外，保留稳定的旅行偏好和旅行中的明确要求，供后续理解需求时参考。
 - **亮点**：长期偏好使用可阅读的 Markdown，按兴趣、酒店、餐厅、节奏等类别去重追加；模型提取记忆时区分稳定偏好与单次旅行要求，并提示当前明确要求优先。
@@ -175,7 +175,7 @@ uv run python server.py
 
 ### 8. 工具契约、领域目录与执行策略
 
-代码：[tooling/](tooling/)、[tools/catalog.py](tools/catalog.py)、[agent/executor.py](agent/executor.py)。
+代码：[agent/tools/](agent/tools/)、[agent/tools/catalog.py](agent/tools/catalog.py)、[agent/tools/dispatcher.py](agent/tools/dispatcher.py)。
 
 只有一个 `ToolRegistry`。MCP 定义适配成 `ToolSpec`，所有调用经过 `ToolExecutor` 的工具范围、权限和 JSON Schema 校验。MCP `isError` 与业务失败都进入结构化 `ToolResult`，不能被外层传输成功覆盖。
 
@@ -212,7 +212,7 @@ uv run python server.py
 
 ### 11. 请求重试、上下文压缩与结果验证
 
-代码：[infrastructure/llm.py](infrastructure/llm.py)、[agent/compress.py](agent/compress.py)、[tooling/results.py](tooling/results.py)、[service/travel/tool_verification.py](service/travel/tool_verification.py)。
+代码：[infrastructure/llm.py](infrastructure/llm.py)、[agent/chat/runtime/compress.py](agent/chat/runtime/compress.py)、[agent/tools/schemas/outputs.py](agent/tools/schemas/outputs.py)、[service/travel/tool_verification.py](service/travel/tool_verification.py)。
 
 模型适配处理退避、备用模型、认证恢复、流式降级和遥测；Agent 提供上下文压缩策略。旅行规则负责审计数据完整性、空地图结果和路线刷新问题。
 
@@ -253,7 +253,7 @@ uv run python server.py
 
 ## MCP 工具一览
 
-工具统一由 [tools/catalog.py](tools/catalog.py) 注册，目前共 24 个。
+工具统一由 [agent/tools/catalog.py](agent/tools/catalog.py) 注册，目前共 24 个。
 
 | 业务领域 | 工具 |
 | --- | --- |
@@ -268,27 +268,21 @@ uv run python server.py
 ## 项目结构与阅读顺序
 
 ```text
-agent/                         # 唯一执行核心
-  runner.py                    # 公开请求入口与结果
-  state.py / context.py        # 数据契约 / 本轮资源和工具范围
-  graph.py / nodes.py          # 流程连接 / 节点实际逻辑
-  intent.py / prompts.py       # 意图 / 提示
-  router.py / executor.py      # 工具选择 / 唯一执行入口
-  memory.py / compress.py      # 记忆策略 / 压缩规则
-  tool_calls.py                # 模型工具调用和重试关联解析
+agent/
+  chat/                        # planner 入口、schemas、runtime、review
+  planning/                    # planner 入口、schemas、runtime、implementations
+  tools/                       # 共享 schemas、registry、dispatcher、retry、implementations
 service/
   chat.py                      # HTTP 聊天用例
   api/                         # HTTP 路由、JSON、状态码
-  travel/                      # 行程审计、推荐排序、领域校验
+  travel/                      # 旅行领域规则
   storage/                     # MySQL、Markdown、JSONL 存储
-  mcp/                         # 现有旅行工具业务实现
-infrastructure/                # 模型和 MCP 连接等外部适配
-tooling/                     # 工具契约、唯一注册表、结果规范
-tools/                       # 对外 MCP 工具目录
-tests/                       # 行为回归、协议快照和依赖边界
+  mcp/                         # 旅行工具业务服务
+infrastructure/                # 模型和 MCP 连接适配
+tests/                         # 行为回归、协议快照和依赖边界
 ```
 
-建议从 `agent/state.py` 和 `agent/runner.py` 开始，再看 `graph.py` 与 `nodes.py`，最后阅读工具适配和应用服务。旅行算法和数据存储不反向依赖 Agent。
+建议从 [Agent 目录说明](agent/README.md)、`agent/chat/planner.py` 与 `agent/planning/planner.py` 开始，再看各自的 runtime 和共享工具。
 
 历史迁移计划保留在 `docs/superpowers/plans/`。旧源码在忽略的 `data/` 中留有本地备份，运行时不会导入。
 

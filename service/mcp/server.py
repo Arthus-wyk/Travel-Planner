@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 """Mature travel operations retained during domain-by-domain migration.
 
@@ -994,6 +994,7 @@ def reconcile_travel_plan(
         if len(items) < 2:
             continue
         for origin, destination in zip(items, items[1:]):
+            endpoints = {"origin_item_id": origin["item_id"], "destination_item_id": destination["item_id"]}
             try:
                 payload, validation_error, _, _ = build_route_payload(
                     origin.get("location", ""),
@@ -1006,11 +1007,12 @@ def reconcile_travel_plan(
                     False,
                 )
                 if validation_error is not None:
-                    route_errors.append(validation_error)
+                    route_errors.append({**validation_error, **endpoints})
                     continue
                 routes = compute_route(payload or {})
                 if not routes:
                     route_errors.append({
+                        **endpoints,
                         "message": f"No route found from {origin.get('location')} to {destination.get('location')}."
                     })
                     continue
@@ -1019,7 +1021,7 @@ def reconcile_travel_plan(
                 refreshed_routes.append(record)
                 affected_route_item_ids.update((origin["item_id"], destination["item_id"]))
             except Exception as exc:
-                route_errors.append(amap_error(exc))
+                route_errors.append({**amap_error(exc), **endpoints})
 
     audit = audit_plan(plan)
     suggestions = list(audit.get("suggestions", []))

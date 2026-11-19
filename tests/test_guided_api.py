@@ -17,9 +17,9 @@ class GuidedApiTests(unittest.TestCase):
         self.patches = [
             patch.object(server, "save_plan", side_effect=lambda plan: self.plans.update({plan["plan_id"]: plan})),
             patch.object(server, "get_plan", side_effect=lambda plan_id: (self.plans.get(plan_id), None if plan_id in self.plans else {"message": "Travel plan not found."})),
-            patch("agent.planning.planning_graph._hotel_places", return_value=[]),
-            patch("agent.planning.planning_graph.AMAP_API_KEY", ""),
-            patch("agent.planning.planning_graph.generate_itinerary_proposal", side_effect=mock_itinerary_proposal),
+            patch("agent.planning.implementations.candidates._hotel_places", return_value=[]),
+            patch("service.config.AMAP_API_KEY", ""),
+            patch("agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal", side_effect=mock_itinerary_proposal),
         ]
         for item in self.patches:
             item.start()

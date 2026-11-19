@@ -62,7 +62,7 @@ def _events(project_path, conversation_id=""):
     return events, truncated
 
 
-def _summaries(events):
+def _turn_summaries(events):
     runs = {}
     for event in events:
         key = event["runId"]
@@ -80,6 +80,7 @@ def _summaries(events):
                 run["model"] = event["model"]
             if event.get("type") == "generation_error" and event.get("stage") == "generation_job":
                 run["status"] = "failed"
+        run["updatedAt"] = max(run.get("updatedAt", ""), event.get("timestamp", ""))
         run["eventCount"] += 1
         if event.get("type") == "run_start":
             run.update(model=event.get("model", ""), input=event.get("input", ""))
@@ -90,6 +91,25 @@ def _summaries(events):
             if event.get("source") == "generation":
                 run["durationMs"] = round((datetime.fromisoformat(event["timestamp"]) - datetime.fromisoformat(run["startedAt"])).total_seconds() * 1000, 2)
     return sorted(runs.values(), key=lambda item: (item["startedAt"], item["runId"]), reverse=True)
+
+
+def _summaries(events):
+    """Group chat turns by session while preserving original run IDs in events."""
+    groups = {}
+    for turn in reversed(_turn_summaries(events)):
+        key = (turn.get("source", "chat"), turn.get("jobId") or turn["sessionId"])
+        if key not in groups:
+            groups[key] = {**turn, "turnCount": 1}
+            continue
+        group = groups[key]
+        group["turnCount"] += 1
+        group["eventCount"] += turn["eventCount"]
+        group["durationMs"] = (group["durationMs"] or 0) + (turn["durationMs"] or 0)
+        group.update(status=turn["status"], model=turn["model"] or group["model"],
+                     updatedAt=max(group["updatedAt"], turn["updatedAt"]))
+    return sorted(groups.values(), key=lambda item: (
+        item["startedAt"] if item.get("source") == "generation" else item["updatedAt"], item["runId"]
+    ), reverse=True)
 
 
 def list_runs(project_path, *, conversation_id="", job_id="", status="", since="", until="", page=1, page_size=20):
@@ -111,7 +131,7 @@ def list_runs(project_path, *, conversation_id="", job_id="", status="", since="
         truncated |= limited
     runs = [item for item in _summaries(events)
             if (not status or item["status"] == status)
-            and (not since or item["startedAt"][:10] >= since)
+            and (not since or item["updatedAt"][:10] >= since)
             and (not until or item["startedAt"][:10] <= until)]
     total = len(runs)
     page_count = max(1, (total + page_size - 1) // page_size)
@@ -129,27 +149,38 @@ def read_run(project_path, run_id, *, conversation_id=""):
         generation, limited = generation_events(project_path, run_id)
         events.extend(generation)
         truncated |= limited
-    events = [event for event in events if event["runId"] == run_id]
-    if not events:
+    selected = next((event for event in events if event["runId"] == run_id), None)
+    if selected is None:
         return None
+    events = [event for event in events if (
+        event["runId"] == run_id if selected.get("source") == "generation"
+        else event.get("source") != "generation" and event["sessionId"] == selected["sessionId"]
+    )]
     return {"run": _summaries(events)[0], "events": events, "truncated": truncated}
 
 
 def event_entries(events, search=""):
     requests = {event.get("call_id") or event.get("requestId"): event for event in events
                 if event.get("type") in {"model_request", "api_request"} and (event.get("call_id") or event.get("requestId"))}
+    completed_models = {event.get("call_id") or event.get("requestId") for event in events
+                        if event.get("type") == "model_response"}
     occurrences = {}
     search = search.casefold()
     for event in events:
+        call_id = event.get("call_id") or event.get("requestId")
+        if event.get("type") == "model_request" and call_id and call_id in completed_models:
+            continue
+        paired_request = requests.get(call_id)
         identity = tuple(event.get(key) for key in ("type", "timestamp", "call_id", "requestId", "stage"))
         occurrence = occurrences.get(identity, 0)
         occurrences[identity] = occurrence + 1
-        if search and search not in json.dumps(event, ensure_ascii=False).casefold():
+        if search and search not in json.dumps([event, paired_request], ensure_ascii=False).casefold():
             continue
         event_id = hashlib.sha256(repr((identity, occurrence)).encode()).hexdigest()[:32]
         summary = {key: event[key] for key in ("type", "timestamp", "stage", "durationMs", "status",
                                                "tool", "attempt", "usage", "isError") if key in event}
         summary["eventId"] = event_id
+        summary["pairedRequest"] = event.get("type") == "model_response" and paired_request is not None
         if event.get("type") == "tool_result" and re.search(
             r'"success"\s*:\s*false|"status"\s*:\s*"failed"', str(event.get("result") or "")
         ):

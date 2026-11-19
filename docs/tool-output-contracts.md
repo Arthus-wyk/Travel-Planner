@@ -1,68 +1,54 @@
-# 工具输出结构清单
+# 工具结果契约
 
-按 2026-11-18 工作区源码整理。覆盖 26 个 MCP 工具与 7 个审核页本地工具，共 33 个不同名称。这里描述当前返回结构，尚未调整任何工具输出。
+各工具的处理器、输入模型与业务输出模型见[工具索引](tool-index.md)。索引也列出七类结构化模型调用的契约位置。
 
-## 1. 返回链路与通用包装
+公开 MCP 保留原有 26 个工具。审核页的 7 个工具和 `delegate_task` 由每次请求的私有 MCP 会话提供。每个工具的 Pydantic 输入、业务输出和处理器登记在 `ToolRegistry`，MCP 与 Agent 的 function call 定义都来自该注册表。
 
-业务函数返回 RawResult，经 MCP 传输或本地 ToolExecutor 执行后，统一成为下面的 AgentToolResult。后面工具表展示 RawResult，完整 Agent 输出的 data 等于该 RawResult。
+## 当前 MCP 协议
 
-```ts
-type AgentToolResult = {
-  tool: string;
-  success: boolean;
-  data: unknown;        // 原始业务返回对象整体，通常仍含 success
-  message: string;      // 业务 message/error，缺失时为 ""
-  error_type: string;   // 成功为 ""，业务失败缺失分类时为 "tool_error"
-};
-```
+`tools/list` 为每个工具返回 `inputSchema` 和 `outputSchema`。`tools/call` 的 `structuredContent` 返回 `ToolResult[T]`，其中 `T` 是该工具的业务输出。`content` 同时携带同一结果的 JSON 文本。
 
-例如地点搜索的实际 Agent 输出具有两层 success。
+| status | data | error | MCP isError |
+| --- | --- | --- | --- |
+| `success` | 完整的业务数据 | `null` | `false` |
+| `partial` | 已验证的业务数据 | `PARTIAL_FAILURE`，`details.missing` 说明缺项 | `false` |
+| `error` | `null` | 共享错误对象 | `true` |
+
+共享错误包含 `code`、`message`、`retryable`、`retry_after_seconds` 和 `details`。`retryable` 描述能否原样重试，改参数或换工具由模型判断。错误码及恢复方式如下。
+
+| code | 恢复方式 |
+| --- | --- |
+| `INVALID_ARGUMENT` | 结合字段路径修正参数 |
+| `UPSTREAM_TIMEOUT` | 对可安全重放的调用做有限重试 |
+| `RATE_LIMITED` | 在总时限内等待上游建议时间 |
+| `NOT_FOUND` | 更换搜索条件或说明资源不存在 |
+| `PERMISSION_DENIED` | 停止调用并提示授权 |
+| `INTERNAL_ERROR` | 记录故障；仅对已识别的临时上游异常重试 |
+| `PARTIAL_FAILURE` | 保留有效数据，补齐缺项 |
 
 ```json
 {
-  "tool": "amap_search_places",
-  "success": true,
-  "data": {"success": true, "query": "公园", "places": [], "raw_places": []},
-  "message": "",
-  "error_type": ""
+  "status": "error",
+  "data": null,
+  "error": {
+    "code": "INVALID_ARGUMENT",
+    "message": "Arguments do not match the tool schema.",
+    "retryable": false,
+    "retry_after_seconds": null,
+    "details": {"issues": [{"path": ["query"], "type": "string_type"}]}
+  }
 }
 ```
 
-普通聊天执行节点额外添加 `operation_id: string`。审核子 Agent 额外添加下面两项。
+Dispatcher 按同一个逻辑调用最多执行 3 次（含首次）。收到已完成的上游尝试返回的临时错误时，可以在总时限内退避重试。客户端时限耗尽时发送 MCP 取消通知并结束调用，避免原同步请求尚未退出时启动另一次请求。不安全重放、预算耗尽或等待超出总时限时，`error.details.recovery` 给出原因。写入、删除和委派默认不可自动重放。Agent 用同一个 `tool_call_id` 和 `role="tool"` 发送结果，另附 `operation_id` 与本轮工具预算。`_retry_of` 仅用于模型级恢复，不传给 MCP 工具。
 
-```ts
-type ReviewToolFeedback = AgentToolResult & {
-  arguments: Record<string, unknown>;
-  budget: {
-    remaining_tool_calls: number;
-    retry_remaining: Record<string, number>;
-    retry_exhausted: string[];
-  };
-};
-```
+写入结果未知时，Agent 会在本轮暂停该写工具，避免模型换一种等效参数重复提交。模型可以改用只读工具核实。外部 MCP 客户端需要将旧 `success` 判断改成 `status`，从 `data` 读取业务结果，从 `error.code` 和 `error.details` 读取错误与缺失信息。审核版本冲突与试算拒绝继续用 `error.details.reason` 区分。
 
-MCP 传输结果还可能包含 `content` 文本块、`structuredContent` 与 `isError`。适配器优先取 structuredContent，否则拼接文本，之后交给 normalize_result。旧的 `{status:"success",result:"JSON字符串"}` 也会解包。MCP 的 isError 优先于业务 success。
+契约源码位于 [schemas](../agent/tools/schemas/)，注册入口位于 [catalog](../agent/tools/catalog.py)，执行路径见 [MCP 适配](../agent/tools/mcp.py) 和 [Dispatcher](../agent/tools/dispatcher.py)。
 
-来源为 [统一结果](../tooling/results.py)、[MCP 适配](../tooling/mcp.py)、[执行器](../agent/chat/executor.py)、[普通聊天节点](../agent/chat/nodes.py)、[审核子 Agent](../agent/chat/review_children.py)。
+## 历史业务载荷参考
 
-### 通用失败结构
-
-```ts
-type BusinessFailure = {
-  success: false;
-  message: string;
-  error_type?: string;
-  // 各工具可能另加 valid_categories、conflicting_item_id 等字段
-};
-```
-
-- 工具不存在、参数校验和权限失败由执行器直接返回 `AgentToolResult`，通常 `data=null`，error_type 分别为 unknown_tool、validation_error、permission_denied。
-- handler 抛异常时执行器返回 `success=false,data=null,error_type=异常类名,message=异常说明`。
-- 数据库业务函数通常返回 `{success:false,message:"Database error..."}`，未单独指定 error_type。
-- 高德失败可能为 `{success:false,message,http_status,retry_after}`，或 `{success:false,message,infocode}`，或只有 `{success:false,message}`。http_status 是整数，retry_after 可以为空，infocode 为提供方错误码字符串。
-- 审核运行时还会返回 timeout、budget_exhausted、retry_parameters_required、decision_required、PlanConflict。这些属于执行边界错误。
-
-未声明的业务错误字段通常缺席，不能假设每个失败结果都有统一错误码、retryable 或 details。
+以下清单记录迁移前的领域函数返回形状。示例中的 `success`、`error_type`、原始地图字段和本地工具链路仅适用于历史记录或内部领域函数。对外契约以 `tools/list` 发布的 Schema 为准。
 
 ## 2. 26 个 MCP 工具
 
@@ -79,7 +65,7 @@ type BusinessFailure = {
 | list_travel_plans | `{success:true,plans:PlanListEntry[]}` | 数据库错误 |
 | delete_travel_plan | `{success:true,message:string}` | 计划不存在或数据库错误，成功不返回 plan 或 deleted_plan_id |
 
-注册来源为 [计划工具](../tools/plan/mcp_tools.py)，实际业务实现在 [service/mcp/server.py](../service/mcp/server.py)。
+注册来源为 [计划工具](../agent/tools/implementations/plan/mcp_tools.py)，实际业务实现在 [service/mcp/server.py](../service/mcp/server.py)。
 
 ### 日程、路线及审核工具，8 个
 
@@ -94,7 +80,7 @@ type BusinessFailure = {
 | reconcile_travel_plan | `{success:boolean,plan_id:string,affected_days:number[],affected_item_ids:string[],routes:StoredRoute[],route_errors:object[],audit:Audit,suggestions:string[]}` | 部分路线失败时 success=false，但已刷新的路线和审核仍存在；部分刷新结果可能已经保存 |
 | audit_travel_plan | `Audit` | 工具执行成功时始终 success=true，即使存在高风险问题；业务审核状态看 status 与 issues |
 
-注册来源为 [日程工具](../tools/itinerary/mcp_tools.py)，实际业务实现在 [service/mcp/server.py](../service/mcp/server.py)。
+注册来源为 [日程工具](../agent/tools/implementations/itinerary/mcp_tools.py)，实际业务实现在 [service/mcp/server.py](../service/mcp/server.py)。
 
 ### 高德工具，5 个
 
@@ -106,7 +92,7 @@ type BusinessFailure = {
 | amap_geocode | `{success:boolean,geocodes:CompactGeocode[],coordinate_system:"GCJ-02",message:string}` | 无匹配时 success=false，geocodes=[] |
 | amap_static_map | `{success:true,center:string,coordinate_system:"GCJ-02",image_cache_key:string,image_url:string}` | center 为 "经度,纬度"；image_url 为应用 API 的相对图片地址，验证与上游错误返回失败 |
 
-注册来源为 [地图工具](../tools/maps/mcp_tools.py)，工具返回值在 [地图工具服务](../tools/maps/service.py) 裁剪。内部 [地图业务接口](../service/mcp/server.py) 和 [高德适配](../service/integrations/travel_amap.py) 继续提供规划及画图使用的完整对象。
+注册来源为 [地图工具](../agent/tools/implementations/maps/mcp_tools.py)，工具返回值在 [地图工具服务](../agent/tools/implementations/maps/service.py) 裁剪。内部 [地图业务接口](../service/mcp/server.py) 和 [高德适配](../service/integrations/travel_amap.py) 继续提供规划及画图使用的完整对象。
 
 ### 推荐与费用工具，4 个
 
@@ -117,7 +103,7 @@ type BusinessFailure = {
 | rank_recommendations | `{success:true,ranked:RankedCandidate[],count:number,scoring_notes:string[]}` | count 是评分前候选总数，可能大于截断后的 ranked.length；candidate 原样嵌入 |
 | add_budget_item | `{success:true,budget_item:BudgetItem}` | 费用非法、计划不存在或数据库错误 |
 
-注册来源为 [推荐工具](../tools/recommendation/mcp_tools.py)，评分来源为 [排序器](../service/travel/recommendation_ranker.py)。
+注册来源为 [推荐工具](../agent/tools/implementations/recommendation/mcp_tools.py)，评分来源为 [排序器](../service/travel/recommendation_ranker.py)。
 
 ### 记忆与校验工具，3 个
 
@@ -127,11 +113,11 @@ type BusinessFailure = {
 | update_travel_preference_profile | `{success:true,path:string,changed:Partial<PreferenceProfile>,profile_markdown:string,profile:PreferenceProfile}` | 类别非法或 updates 非对象时 `{success:false,message,valid_categories:Record<string,string>}` |
 | verify_last_tool_result | `{success:true,verification:Verification}` | arguments 非对象时失败；外层 success=true 只代表校验器执行完成，verification.status 仍可能 failed |
 
-注册来源为 [记忆工具](../tools/memory/mcp_tools.py)，实现来源为 [记忆存储](../service/storage/memory_store.py) 和 [结果校验](../service/travel/tool_verification.py)。
+注册来源为 [记忆工具](../agent/tools/implementations/memory/mcp_tools.py)，实现来源为 [记忆存储](../service/storage/memory_store.py) 和 [结果校验](../service/travel/tool_verification.py)。
 
 ## 3. 审核页本地工具，7 个
 
-这组工具由 review_registry 装配，没有通过上述 26 个 MCP 工具注册。默认只读 registry 有 5 个，writable=true 且没有 draft 时再加入两个写工具。父 Agent 的子任务委派由 Scheduler 完成，目前没有另行注册名为 delegate 的工具。
+这组工具由 review_registry 装配，没有通过上述 26 个 MCP 工具注册。默认只读 registry 有 5 个，writable=true 且没有 draft 时再加入两个写工具。审核父 Agent 另外使用本轮专属的 `delegate_task`。
 
 | 工具 | 业务原始返回结构 | 说明 |
 |---|---|---|
@@ -145,7 +131,13 @@ type BusinessFailure = {
 
 Snapshot 类原始返回对象没有 success 字段。normalize_result 在没有显式失败信号时判定执行成功。preview 与两个保存工具的 audit 仍是完整 Audit。
 
-来源为 [审核 registry](../tools/review.py) 和 [试算与验收](../service/travel/review.py)。
+来源为 [审核 registry](../agent/tools/implementations/review.py) 和 [试算与验收](../service/travel/review.py)。
+
+### 父 Agent 委派
+
+`search_places` 委派必须提供 `search_scope`，包括单个 `category`、可空的正整数 `day` 和 `selection_count`。各类别通过独立的 `task_id` 同批委派。引用可用当前快照版本或本轮已完成任务返回的成果引用。
+
+模型回复包含 `success`、`operation_id`、`data` 和 `remaining`（预算反馈）。`data` 携带任务状态、版本、`artifact_ref` 和必要候选。失败时 `artifact_ref` 为 null，错误说明集中在外层的 `error_type`、`message`、`retryable`。仅支持修正的失败操作可用 `_retry_of` 引用。详细校验继续保留在内部工具事件中。
 
 ## 4. 共享嵌套结构
 
@@ -391,7 +383,7 @@ raw_result 是非 JSON 结果的最多 1000 字符摘录。valid_categories 的�
 6. 校验器。verify_last_tool_result 及应用内 verify_tool_result 直接读取业务 success、plan、places、issues、route_errors，调整返回路径需要同步修改。
 7. 测试夹具与前端。审核 HTTP、模型客户端和地图/规划用例都使用现有字段。前端的候选卡片、试算预览、地图和预算也沿用这些数据。
 
-来源为 [普通节点](../agent/chat/nodes.py)、[审核子循环](../agent/chat/review_children.py)、[审核 Workflow](../agent/chat/review_workflow.py)、[审核交互](../service/travel/review_interaction.py)、[地图工具](../tools/review.py)。
+来源为 [普通节点](../agent/chat/runtime/nodes.py)、[审核子循环](../agent/chat/review/children.py)、[审核 Workflow](../agent/chat/review/workflow.py)、[审核交互](../service/travel/review_interaction.py)、[地图工具](../agent/tools/implementations/review.py)。
 
 ## 6. 当前契约中值得重点决定的差异
 

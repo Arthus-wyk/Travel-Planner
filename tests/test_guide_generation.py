@@ -8,8 +8,9 @@ from unittest.mock import patch, MagicMock
 import httpx
 from fastapi.testclient import TestClient
 
-from agent.planning.planning_graph import run_planning_action, default_choices
-from agent.planning.planning_graph import _logged_node
+from agent.planning.planner import run_planning_action
+from agent.planning.implementations.candidates import default_choices
+from agent.planning.runtime.agent_loop import _logged_node
 from service.travel import planning
 from service.travel.generation_jobs import next_stage
 from service.travel.guide import GuideNeedsInput
@@ -81,7 +82,7 @@ class GenerationTests(TestCase):
         self.assertEqual(next_stage("audit_agent", {"action": "generate_from_guide", "attempts": 3, "audit": {"issues": []}}), "done")
 
     def test_unlocated_place_does_not_reinvoke_ordering_model(self):
-        from agent.planning.planning_graph import after_audit
+        from agent.planning.implementations.schedule import after_audit
         state = {"action": "generate_from_guide", "revision_attempts": 1,
                  "audit": {"issues": [{"type": "unplaced_activities", "severity": "high"}]}}
         self.assertEqual(after_audit(state), "done")
@@ -112,7 +113,7 @@ class GenerationTests(TestCase):
                   "trace": ["coordinator", "prepare_draft", "itinerary_agent", "route_agent"],
                   "attempts": 3, "resume_stage": "audit_agent"}
         progress = MagicMock()
-        with patch("agent.planning.planning_graph.audit_plan", return_value={"issues": [], "guide_constraints": []}), patch("agent.planning.planning_graph.generate_itinerary_proposal") as generate:
+        with patch("agent.planning.implementations.schedule.audit_plan", return_value={"issues": [], "guide_constraints": []}), patch("agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal") as generate:
             outcome = run_planning_action(plan, "generate_from_guide", {"text": "西湖"}, progress=progress, resume=resume)
         self.assertEqual(outcome["trace"][-1], "audit_agent")
         progress.assert_called_once()
@@ -120,7 +121,7 @@ class GenerationTests(TestCase):
         generate.assert_not_called()
 
     def test_graph_node_does_not_log_state(self):
-        with patch("agent.planning.planning_graph.logging.getLogger") as get_logger:
+        with patch("logging.getLogger") as get_logger:
             result = _logged_node("guide_agent", lambda state: {
                 "guide_text": "西湖", "trace": ["guide_agent"],
             })({"payload": {"image_base64": "large-image", "nested": {"api_key": "secret"}}})
@@ -152,7 +153,7 @@ class GenerationTests(TestCase):
                 {"day": 3, "visits": []}]})}
             return httpx.Response(200, json={"choices": [{"message": message}]})
         plan = base_plan()
-        with patch("service.utils.model_client.create_model_client", return_value=self.client(handler)), patch("service.utils.model_client.get_model", return_value="test"), patch("service.travel.planning.analyze_guide", return_value={"text": "西湖", "places": [{"id": "internal", "name": "西湖", "category": "attraction"}], "constraints": []}), patch("service.travel.place_matching.amap_search_places", return_value={"success": True, "places": [POINT, {**POINT, "place_id": "other", "name": "西湖公园", "types": ["风景名胜"]}]}) as search, patch("agent.planning.planning_graph.AMAP_API_KEY", ""):
+        with patch("service.utils.model_client.create_model_client", return_value=self.client(handler)), patch("service.utils.model_client.get_model", return_value="test"), patch("service.travel.planning.analyze_guide", return_value={"text": "西湖", "places": [{"id": "internal", "name": "西湖", "category": "attraction"}], "constraints": []}), patch("service.travel.place_matching.amap_search_places", return_value={"success": True, "places": [POINT, {**POINT, "place_id": "other", "name": "西湖公园", "types": ["风景名胜"]}]}) as search, patch("service.config.AMAP_API_KEY", ""):
             outcome = run_planning_action(plan, "generate_from_guide", {"text": "西湖"})
         search.assert_called_once_with("西湖", region_code="杭州", max_results=5)
         self.assertEqual(outcome["plan"]["planning"]["selected_transport"], plan["planning"]["selected_transport"])
@@ -193,7 +194,7 @@ class GenerationTests(TestCase):
         ]
         with patch("service.travel.map_planning.lookup_review_place", side_effect=lambda poi: {
                 **POINT, "place_id": poi, "name": poi, "address": f"杭州 {poi}"}), patch(
-                "agent.planning.planning_graph.AMAP_API_KEY", "test"), patch("agent.planning.planning_graph.amap_compute_route",
+                "service.config.AMAP_API_KEY", "test"), patch("agent.planning.implementations.routes.amap_compute_route",
                 side_effect=lambda *args, **kwargs: {"success": True, "duration": "300s", "legs": []}):
             result = run_planning_action(plan, "review_changes", {"operations": operations})["plan"]
         day_two = [x for x in result["itinerary"] if x["day"] == 2]
@@ -217,7 +218,7 @@ class GenerationTests(TestCase):
         addition = {"action": "review_place", "payload": {"item_id": f"guided-1-{meal_id}",
             "activity_id": hotel_id, "category": "hotel", "poi_id": "hotel"}}
         completion = {"action": "complete_lodging", "payload": {"activity_id": hotel_id}}
-        with patch("service.travel.map_planning.lookup_review_place", return_value=POINT), patch("agent.planning.planning_graph.AMAP_API_KEY", ""):
+        with patch("service.travel.map_planning.lookup_review_place", return_value=POINT), patch("service.config.AMAP_API_KEY", ""):
             result = run_planning_action(plan, "review_changes", {"operations": [meal, addition, completion]})["plan"]
             repeated = run_planning_action(result, "review_changes", {"operations": [completion]})["plan"]
         hotels = [x for x in result["itinerary"] if x.get("reference_id") == hotel_id]
@@ -250,7 +251,7 @@ class GenerationTests(TestCase):
         self.assertIsNone(default_choices({"plan": plan, "trace": []})["plan"]["planning"]["selected_hotel"])
 
     def test_image_text_is_not_replaced_by_stale_text_in_prepare(self):
-        with patch("agent.planning.planning_graph.recognize_guide", return_value="图片中的西湖"), patch("service.travel.planning.analyze_guide", return_value={"text": "图片中的西湖", "places": [{"id": "p", "name": "西湖"}], "constraints": []}) as analyze, patch("agent.planning.planning_graph.search_and_match", side_effect=lambda plan: plan), patch("agent.planning.planning_graph.generate_itinerary_proposal", return_value={"days": [{"day": day, "visits": []} for day in range(1, 4)], "unscheduled": [{"activity_id": "p", "reason": "位置待确认"}], "assumptions": [], "constraint_results": []}), patch("agent.planning.planning_graph.AMAP_API_KEY", ""):
+        with patch("agent.planning.implementations.candidates.recognize_guide", return_value="图片中的西湖"), patch("service.travel.planning.analyze_guide", return_value={"text": "图片中的西湖", "places": [{"id": "p", "name": "西湖"}], "constraints": []}) as analyze, patch("agent.planning.implementations.candidates.search_and_match", side_effect=lambda plan: plan), patch("agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal", return_value={"days": [{"day": day, "visits": []} for day in range(1, 4)], "unscheduled": [{"activity_id": "p", "reason": "位置待确认"}], "assumptions": [], "constraint_results": []}), patch("service.config.AMAP_API_KEY", ""):
             with self.assertRaises(GuideNeedsInput) as raised:
                 run_planning_action(base_plan(), "generate_from_guide", {"image_base64": "eA==", "text": "旧攻略"})
         analyze.assert_called_once_with("图片中的西湖")
@@ -346,7 +347,7 @@ class DegradationTests(TestCase):
         self.assertEqual(state["lodging_search_errors"], {"湖滨": failure["message"]})
 
     def test_ordering_exhaustion_preserves_every_located_place(self):
-        from agent.planning.planning_graph import prepare_draft, itinerary_agent
+        from agent.planning.implementations.itinerary_nodes import prepare_draft, itinerary_agent
         plan = base_plan()
         plan['planning']['guide_auto'] = True
         plan['planning']['activities'] = [
@@ -356,7 +357,7 @@ class DegradationTests(TestCase):
         state = {'plan': plan, 'action': 'generate_from_guide', 'trace': []}
         state.update(prepare_draft(state))
         state['format_attempts'] = 2
-        with patch('agent.planning.planning_graph.generate_itinerary_proposal', side_effect=ValueError('bad')):
+        with patch('agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal', side_effect=ValueError('bad')):
             result = itinerary_agent(state)
         planning_state = result['plan']['planning']
         days = planning_state['generation']['days']
@@ -381,14 +382,14 @@ class DegradationTests(TestCase):
 
 class RouteOptionsTests(TestCase):
     def test_generated_routes_include_all_modes_time_and_unknown_fares(self):
-        from agent.planning.planning_graph import route_agent
+        from agent.planning.implementations.routes import route_agent
         plan = {'itinerary': [
             {'item_id': 'a', 'category': 'attraction', 'location': 'A', 'place': POINT},
             {'item_id': 'b', 'category': 'attraction', 'location': 'B', 'place': POINT}],
             'routes': [{'origin_item_id': 'a', 'destination_item_id': 'b'}]}
         def compute(*args, travel_mode):
             return {'success': True, 'duration': '121s', 'fare': None if travel_mode != 'TRANSIT' else 2, 'legs': []}
-        with patch('agent.planning.planning_graph.AMAP_API_KEY', 'test'), patch('agent.planning.planning_graph.amap_compute_route', side_effect=compute) as compute_route:
+        with patch('service.config.AMAP_API_KEY', 'test'), patch('agent.planning.implementations.routes.amap_compute_route', side_effect=compute) as compute_route:
             result = route_agent({'plan': plan, 'action': 'generate_from_guide', 'trace': []})
         options = result['plan']['routes'][0]['route_options']
         self.assertEqual(set(options), {'WALK', 'TRANSIT', 'DRIVE'})
@@ -399,11 +400,11 @@ class RouteOptionsTests(TestCase):
         self.assertEqual(compute_route.call_count, 3)
 
     def test_batch_selection_uses_existing_route_options(self):
-        from agent.planning.planning_graph import coordinator
+        from agent.planning.implementations.coordinator import coordinator
         plan = base_plan()
         plan['planning']['stage'] = 'review'
         plan['routes'] = [{'origin_item_id': 'a', 'destination_item_id': 'b'}]
-        with patch('agent.planning.planning_graph.update_route_mode', return_value=plan) as update:
+        with patch('agent.planning.implementations.coordinator.update_route_mode', return_value=plan) as update:
             coordinator({'plan': plan, 'action': 'route_modes', 'payload': {'selections': [
                 {'origin_item_id': 'a', 'destination_item_id': 'b', 'travel_mode': 'WALK'}]}})
         update.assert_called_once_with(plan, 'a', 'b', 'WALK')
@@ -411,7 +412,7 @@ class RouteOptionsTests(TestCase):
 
 class ReviewBatchTests(TestCase):
     def test_repeated_moves_resolve_changed_item_ids_and_apply_details(self):
-        from agent.planning.planning_graph import coordinator
+        from agent.planning.implementations.coordinator import coordinator
         plan = base_plan()
         plan['planning']['guide_auto'] = True
         plan['planning']['activities'] = [{'id': 'a', 'name': 'A', 'category': 'attraction', 'choice': 'must', 'place': POINT}]

@@ -4,8 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from agent.chat import rewrite
-from agent.chat.review_execution import ReviewExecution
+from agent.chat.runtime import rewrite
+from agent.chat.runtime.execution import ReviewExecution
 
 
 def response(payload, tool_calls=None):
@@ -42,7 +42,7 @@ class RequestRewriteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, self.payload)
         self.assertEqual(call.await_count, 1)
         options = call.call_args.kwargs
-        self.assertEqual(options["config"].max_attempts, 1)
+        self.assertEqual(options["config"].max_attempts, 2)
         self.assertEqual(options["stage"], "request_rewrite")
         self.assertFalse(options["response_format"]["additionalProperties"])
         self.assertEqual(options["tools"], [])

@@ -2,7 +2,7 @@ import unittest
 from copy import deepcopy
 from unittest.mock import patch
 
-from agent.planning.itinerary import _validate_proposal
+from agent.planning.implementations.itinerary import _validate_proposal
 from service.travel import planning
 from service.travel.itinerary_audit import audit_plan
 from test_guide_workflow import prepared, POINT
@@ -79,10 +79,11 @@ class ReviewAlignmentTests(unittest.TestCase):
         self.assertEqual(result['planning']['guide_constraints'][0]['activity_ids'], ['a'])
 
     def test_invalid_revision_keeps_complete_draft_and_reports_risk(self):
-        from agent.planning.planning_graph import itinerary_agent, after_audit
+        from agent.planning.implementations.itinerary_nodes import itinerary_agent
+        from agent.planning.implementations.schedule import after_audit
         plan = self.visit_plan()
         plan['planning']['generation'] = {'contract_version': 3}
-        with patch('agent.planning.planning_graph.generate_itinerary_proposal', side_effect=ValueError('遗漏地点')):
+        with patch('agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal', side_effect=ValueError('遗漏地点')):
             result = itinerary_agent({'plan': plan, 'trace': [], 'format_attempts': 2, 'revision_attempts': 1})
         self.assertTrue(result['revision_failed'])
         self.assertEqual(result['plan']['planning']['generation_issues'][0]['type'], 'revision_failed')
@@ -125,7 +126,7 @@ class ReviewAlignmentTests(unittest.TestCase):
         self.assertEqual(result['lodging_areas'][0]['name'], '龙翔桥/湖滨')
 
     def test_unlocated_constraint_does_not_retry_ordering(self):
-        from agent.planning.planning_graph import after_audit
+        from agent.planning.implementations.schedule import after_audit
         plan = self.visit_plan()
         plan['planning']['activities'][0].pop('place')
         self.assertEqual(after_audit({'plan': plan, 'action': 'draft', 'revision_attempts': 1,

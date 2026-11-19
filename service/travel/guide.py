@@ -124,7 +124,7 @@ def _extract_with_model(text: str, feedback: str = "", *, history=()) -> str:
             model == "zai-org/GLM-5.3-Flash"
             and get_env_or_dotenv("LLM_PROVIDER").strip().lower() == "siliconflow"
         )
-        messages = [{"role": "system", "content": _skill_prompt()},
+        messages = [{"role": "system", "content": _skill_prompt() + "\nJSON Schema:\n" + json.dumps(GUIDE_SCHEMA, ensure_ascii=False)},
                     {"role": "user", "content": f"攻略原文：\n{text}"}]
         for output, reason in history:
             if output is not None:

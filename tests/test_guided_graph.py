@@ -1,7 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from agent.planning.planning_graph import _activity_places, run_planning_action
+from agent.planning.implementations.candidates import _activity_places
+from agent.planning.planner import run_planning_action
 from service.travel.planning import create_draft
 from planning_fixtures import located_plan, mock_itinerary_proposal
 
@@ -13,26 +14,26 @@ FORM = {"destination": "杭州", "departure_city": "上海", "home_location": "�
 
 class PlanningGraphTests(unittest.TestCase):
     def setUp(self):
-        key = patch("agent.planning.planning_graph.AMAP_API_KEY", "")
+        key = patch("service.config.AMAP_API_KEY", "")
         key.start()
         self.addCleanup(key.stop)
-        model = patch("agent.planning.planning_graph.generate_itinerary_proposal", side_effect=mock_itinerary_proposal)
+        model = patch("agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal", side_effect=mock_itinerary_proposal)
         self.model = model.start()
         self.addCleanup(model.stop)
-        hotels = patch("agent.planning.planning_graph._hotel_places", return_value=[])
+        hotels = patch("agent.planning.implementations.candidates._hotel_places", return_value=[])
         hotels.start()
         self.addCleanup(hotels.stop)
 
     def test_activity_agent_has_labeled_fallback_suggestions(self):
         plan = create_draft(FORM, "trip-1")
-        with patch("agent.planning.planning_graph.AMAP_API_KEY", ""):
+        with patch("service.config.AMAP_API_KEY", ""):
             places = _activity_places(plan)
         self.assertTrue(places)
         self.assertTrue(all(place["source"] == "simulated_suggestion" for place in places))
 
     def test_unresolved_theme_suggestion_is_a_warning(self):
         plan = create_draft(FORM, "trip-1")
-        with patch("agent.planning.planning_graph.AMAP_API_KEY", ""):
+        with patch("service.config.AMAP_API_KEY", ""):
             plan = run_planning_action(plan, "candidates", {})["plan"]
             transports = plan["planning"]["transport_candidates"]
             plan = run_planning_action(plan, "choose_candidates", {
@@ -54,7 +55,7 @@ class PlanningGraphTests(unittest.TestCase):
 
     def test_review_edit_actions_return_fresh_audit(self):
         plan = create_draft(FORM, "trip-1")
-        with patch("agent.planning.planning_graph.AMAP_API_KEY", ""):
+        with patch("service.config.AMAP_API_KEY", ""):
             plan = run_planning_action(plan, "candidates", {})["plan"]
             transport = plan["planning"]["transport_candidates"]
             plan = run_planning_action(plan, "choose_candidates", {
@@ -78,7 +79,7 @@ class PlanningGraphTests(unittest.TestCase):
 
     def test_coordinator_dispatches_scoped_specialists(self):
         plan = create_draft(FORM, "trip-1")
-        with patch("agent.planning.planning_graph._hotel_places", return_value=[]), patch("agent.planning.planning_graph._activity_places", return_value=[]):
+        with patch("agent.planning.implementations.candidates._hotel_places", return_value=[]), patch("agent.planning.implementations.candidates._activity_places", return_value=[]):
             result = run_planning_action(plan, "candidates", {})
             self.assertEqual(result["trace"], ["coordinator", "transport_agent"])
             plan = result["plan"]
@@ -99,10 +100,10 @@ class PlanningGraphTests(unittest.TestCase):
 
     def test_selecting_candidates_immediately_recommends_activities(self):
         plan = create_draft(FORM, "trip-1")
-        with patch("agent.planning.planning_graph._hotel_places", return_value=[]):
+        with patch("agent.planning.implementations.candidates._hotel_places", return_value=[]):
             plan = run_planning_action(plan, "candidates", {})["plan"]
         transports = plan["planning"]["transport_candidates"]
-        with patch("agent.planning.planning_graph._activity_places", return_value=[
+        with patch("agent.planning.implementations.candidates._activity_places", return_value=[
             {"place_id": "west-lake", "name": "西湖", "address": "杭州西湖区"}
         ]):
             result = run_planning_action(plan, "choose_candidates", {
@@ -115,7 +116,7 @@ class PlanningGraphTests(unittest.TestCase):
 
     def test_confirmation_preserves_audit_warnings(self):
         plan = create_draft({**FORM, "budget": 1}, "trip-1")
-        with patch("agent.planning.planning_graph._hotel_places", return_value=[]):
+        with patch("agent.planning.implementations.candidates._hotel_places", return_value=[]):
             plan = run_planning_action(plan, "candidates", {})["plan"]
         transport = plan["planning"]["transport_candidates"]
         plan = run_planning_action(plan, "choose_candidates", {
@@ -135,7 +136,7 @@ class PlanningGraphTests(unittest.TestCase):
 
     def test_route_agent_uses_available_map_duration_for_audit(self):
         plan = create_draft(FORM, "trip-1")
-        with patch("agent.planning.planning_graph._hotel_places", return_value=[]):
+        with patch("agent.planning.implementations.candidates._hotel_places", return_value=[]):
             plan = run_planning_action(plan, "candidates", {})["plan"]
         transport = plan["planning"]["transport_candidates"]
         plan = run_planning_action(plan, "choose_candidates", {
@@ -143,8 +144,8 @@ class PlanningGraphTests(unittest.TestCase):
             "return": next(x["id"] for x in transport if x["direction"] == "return"),
             "hotel": plan["planning"]["hotel_candidates"][0]["id"],
         })["plan"]
-        with patch("agent.planning.planning_graph.AMAP_API_KEY", "test"), patch(
-            "agent.planning.planning_graph.amap_compute_route",
+        with patch("service.config.AMAP_API_KEY", "test"), patch(
+            "agent.planning.implementations.routes.amap_compute_route",
             return_value={"success": True, "duration": "50000s", "distance_meters": 1000},
         ):
             result = run_planning_action(located_plan(plan), "draft", {})
@@ -153,7 +154,7 @@ class PlanningGraphTests(unittest.TestCase):
 
     def test_guide_agent_rejects_invalid_base64_as_user_error(self):
         plan = create_draft(FORM, "trip-1")
-        with patch("agent.planning.planning_graph._hotel_places", return_value=[]), patch("agent.planning.planning_graph._activity_places", return_value=[]):
+        with patch("agent.planning.implementations.candidates._hotel_places", return_value=[]), patch("agent.planning.implementations.candidates._activity_places", return_value=[]):
             plan = run_planning_action(plan, "candidates", {})["plan"]
             transports = plan["planning"]["transport_candidates"]
             plan = run_planning_action(plan, "choose_candidates", {

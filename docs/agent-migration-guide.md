@@ -4,12 +4,12 @@
 
 ## 推荐阅读顺序
 
-1. `agent/state.py`：先认识请求、状态、结果，以及携带部分结果的异常。
-2. `agent/context.py`：哪些是本轮连接、权限、工具范围和资源。
-3. `agent/runner.py`：核心唯一入口，怎样构造状态、运行图并返回结果。
-4. `agent/graph.py`：只看流程和分支。
-5. `agent/nodes.py`：逐个理解实际执行步骤。
-6. `tooling/`、`infrastructure/`：工具契约及外部服务适配。
+1. `agent/chat/schemas/state.py`：先认识请求、状态、结果，以及携带部分结果的异常。
+2. `agent/chat/runtime/context.py`：哪些是本轮连接、权限、工具范围和资源。
+3. `agent/chat/planner.py`：核心唯一入口，怎样构造状态、运行图并返回结果。
+4. `agent/chat/runtime/agent_loop.py`：只看流程和分支。
+5. `agent/chat/runtime/nodes.py`：逐个理解实际执行步骤。
+6. `agent/tools/`、`infrastructure/`：工具契约及外部服务适配。
 7. `service/chat.py`、`service/cli.py`：两个产品入口怎样使用同一个核心。
 
 ## 三类数据为什么分开
@@ -46,7 +46,7 @@ flowchart TD
 
 ## 工具注册和结果边界
 
-MCP 定义与 `tools/catalog.py` 的领域元数据转换成 `ToolSpec`，进入唯一 `ToolRegistry`。异步本地工具也注册为相同契约。MCP 适配器不维护另一个注册表。
+MCP 定义与 `agent/tools/catalog.py` 的领域元数据转换成 `ToolSpec`，进入唯一 `ToolRegistry`。异步本地工具也注册为相同契约。MCP 适配器不维护另一个注册表。
 
 `ToolExecutor` 校验范围、权限和完整 JSON Schema 后调用 handler。`ToolResult` 是核心唯一结果类型，保留数据、成功状态和错误原因。MCP 的 `isError`、文本错误、`success=false` 都在边界处理；旅行特定的空候选、审计问题等由 `service/travel/` 判断。
 

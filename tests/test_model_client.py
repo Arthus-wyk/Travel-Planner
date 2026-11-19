@@ -25,12 +25,13 @@ class ModelClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model_client.get_model(), "deepseek-ai/DeepSeek-V4.1-Flash")
 
     def test_planning_graph_propagates_model_to_nodes(self):
-        from agent.planning import planning_graph
+        from agent.planning import planner as planning_graph
+        from langgraph.graph import StateGraph, START, END
 
-        graph = planning_graph.StateGraph(dict)
+        graph = StateGraph(dict)
         graph.add_node("read_model", lambda _: {"model": model_client.get_model()})
-        graph.add_edge(planning_graph.START, "read_model")
-        graph.add_edge("read_model", planning_graph.END)
+        graph.add_edge(START, "read_model")
+        graph.add_edge("read_model", END)
         default, chosen = model_client.AVAILABLE_MODELS[:2]
         with patch.object(planning_graph, "GRAPH", graph.compile()):
             for progress in (None, lambda *_: None):

@@ -6,6 +6,14 @@ from typing import Any
 
 
 # ============生成公开回复 ============
+TOOL_ERROR_HANDLING_RULES = """【Tool Error Handling Rules】
+每次读取工具结果的 status。success 使用已验证数据。partial 保留有效 data，按 error.details 补齐缺失项，不能报告整项完成。
+error 查看 error.code 与 error.retryable。INVALID_ARGUMENT 修改参数后再调用；NOT_FOUND 换搜索目标或工具；PERMISSION_DENIED 停止该能力并提示授权。
+UPSTREAM_TIMEOUT 与 RATE_LIMITED 的有限等待和重试由执行器处理。预算耗尽就换方案。INTERNAL_ERROR 尝试备选方案；写入结果未知时先核实，避免重复提交。
+retryable=false 表示不应原样重试，仍可纠正参数或改用其他工具。纠错时用 _retry_of 关联失败操作。不得编造结果；恢复失败时说明限制和已验证成果。
+"""
+
+
 def public_answer(answer: str, plan: dict[str, Any] | None) -> str:
     """已保存计划后模型偶尔只返回编号；统一生成可展示、可入库的完成说明。"""
     if plan is None:

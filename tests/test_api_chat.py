@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from service import chat as server
 from test_agent_query import response, tool_call
-from tooling.mcp import build_registry
-from tools.catalog import tool_metadata
+from agent.tools.mcp import build_registry
+from agent.tools.catalog import tool_metadata
 
 
 @asynccontextmanager
@@ -123,7 +123,7 @@ class ApiChatTests(unittest.IsolatedAsyncioTestCase):
             )
             self.memory = stack.enter_context(
                 patch(
-                    "agent.chat.memory.extract_and_store",
+                    "agent.chat.runtime.memory.extract_and_store",
                     new_callable=AsyncMock,
                     return_value={"success": True},
                 )

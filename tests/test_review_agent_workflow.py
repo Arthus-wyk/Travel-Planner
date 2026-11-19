@@ -5,15 +5,15 @@ from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.chat.review_tasks import TaskResult
-from agent.chat.review_workflow import ClarificationReply, ReviewContext, ReviewRequest, run_review_turn
-from tooling.context import ToolContext
-from tooling.registry import ToolRegistry
-from tooling.spec import ToolSpec
+from agent.chat.schemas.tasks import TaskResult
+from agent.chat.review.workflow import ClarificationReply, ReviewContext, ReviewRequest, run_review_turn
+from agent.tools.context import ToolContext
+from agent.tools.registry import ToolRegistry
+from agent.tools.schemas.inputs import ToolSpec
 from service.travel.review import save_review_action
 from service.storage.planning_jobs import PlanConflict
 from service.travel.review_interaction import ReviewInteractions
-from tools.review import _best_place_insertion
+from agent.tools.implementations.review import _best_place_insertion
 
 
 class ReviewWorkflowTest(unittest.IsolatedAsyncioTestCase):
@@ -30,6 +30,15 @@ class ReviewWorkflowTest(unittest.IsolatedAsyncioTestCase):
             if decision is None:
                 await asyncio.Event().wait()
             calls = decision.get("calls", [])
+            references = {}
+            for message in kwargs["messages"]:
+                if message["role"] == "tool":
+                    data = json.loads(message["content"]).get("data") or {}
+                    if data.get("artifact_ref"):
+                        references[f"{data['task_id']}:v{data['task_version']}"] = data["artifact_ref"]
+            for call in calls:
+                extra = call["function"]["arguments"].get("extra_data", {})
+                extra["artifact_refs"] = [references.get(ref, ref) for ref in extra.get("artifact_refs", [])]
             content = {"kind": "answer", "message": "审核结果", "question": None,
                        "options": [], "candidate_groups": [], **decision}
             response = SimpleNamespace(message=SimpleNamespace(
@@ -62,15 +71,17 @@ class ReviewWorkflowTest(unittest.IsolatedAsyncioTestCase):
         context = ReviewContext("plan", version, None, "mock", save_requested=save,
             tool_context=ToolContext(permissions=frozenset({"review:write"} if allowed else ())),
             handlers=handlers or {}, timeout_seconds=timeout)
-        with patch("agent.chat.review_workflow.review_registry", registry), patch(
-            "agent.chat.nodes.llm.request_model_with_retry", fake_model
-        ), patch("agent.chat.review_workflow.rewrite_request", rewrite):
+        with patch("agent.chat.review.workflow.review_registry", registry), patch(
+            "agent.chat.runtime.nodes.llm.request_model_with_retry", fake_model
+        ), patch("agent.chat.review.workflow.rewrite_request", rewrite):
             return await run_review_turn(request or ReviewRequest("审核当前路线"), context)
 
     @staticmethod
     def delegate(key="edit", role="build_edits", task="调整行程", refs=(), retry=None):
         args = {"task_id": key, "role": role, "task": task,
                 "extra_data": {"facts": "", "artifact_refs": list(refs)}}
+        if role == "search_places":
+            args["search_scope"] = {"category": "attraction", "day": None, "selection_count": None}
         if retry:
             args["_retry_of"] = retry
         return {"calls": [{"function": {"name": "delegate_task", "arguments": args}}]}
@@ -84,10 +95,14 @@ class ReviewWorkflowTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.writes)
         for reply, answer in ((ClarificationReply(option_index=0), "延后一小时"),
                               (ClarificationReply(custom_text="当天 16:00"), "当天 16:00")):
-            resumed = await self.run_turn([{}], request=ReviewRequest(message, result.clarification, reply))
+            async def audit(*args):
+                return TaskResult("completed", {"context": {"checked": True}})
+            resumed = await self.run_turn([self.delegate("audit", "audit_route"), {}],
+                handlers={"audit_route": audit}, request=ReviewRequest(message, result.clarification, reply))
             self.assertEqual(resumed.status, "answer")
             evidence = self.model_inputs[0]["extra_data"]["request_context"]
-            self.assertEqual(evidence["rewrite"]["original_text"], message)
+            self.assertEqual(evidence["original_text"], message)
+            self.assertNotIn("original_text", evidence["rewrite"])
             self.assertEqual(evidence["clarification_answers"], [{"question": question, "answer": answer}])
             self.assertNotIn("semantic", evidence)
 
@@ -101,8 +116,8 @@ class ReviewWorkflowTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.status, expected)
             self.assertEqual(len(self.writes), int(expected == "saved"))
             self.assertNotIn("apply_review_changes", self.visible)
-        result = await self.run_turn([{}])
-        self.assertEqual(result.status, "answer")
+        result = await self.run_turn([{}, {}])
+        self.assertEqual(result.status, "failed")
         self.assertFalse(self.writes)
 
     async def test_unverified_parent_operations_never_save(self):
@@ -218,8 +233,8 @@ class ReviewInteractionTest(unittest.IsolatedAsyncioTestCase):
             minutes = {"A": 20, "B": 10, "C": 2}[key]
             return {"plan": {"routes": [{"duration_minutes": minutes}]}, "accepted": key != "C"}
 
-        with patch("tools.review.preview_review_action", side_effect=trial), patch(
-            "tools.review.review_acceptance", side_effect=lambda original, result: result
+        with patch("agent.tools.implementations.review.preview_review_action", side_effect=trial), patch(
+            "agent.tools.implementations.review.review_acceptance", side_effect=lambda original, result: result
         ):
             _, selected = _best_place_insertion(plan, payload, "poi")
         self.assertEqual(selected["operations"][0]["payload"]["item_id"], "B")

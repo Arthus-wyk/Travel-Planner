@@ -442,12 +442,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "json-repair" },
     { name = "jsonschema" },
     { name = "langgraph" },
     { name = "mcp", extra = ["cli"] },
     { name = "ollama" },
     { name = "onnxruntime" },
     { name = "ortools" },
+    { name = "pydantic" },
     { name = "pymysql" },
     { name = "rapidocr-onnxruntime" },
     { name = "uvicorn" },
@@ -457,12 +459,14 @@ dependencies = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", specifier = ">=0.27,<1" },
+    { name = "json-repair", specifier = ">=0.50,<1" },
     { name = "jsonschema", specifier = ">=4,<5" },
     { name = "langgraph", specifier = ">=1,<2" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.27,<2" },
     { name = "ollama", specifier = ">=0.6.2" },
     { name = "onnxruntime", specifier = "<1.24" },
     { name = "ortools", specifier = ">=9.11,<9.15" },
+    { name = "pydantic", specifier = ">=2,<3" },
     { name = "pymysql", specifier = ">=1.1.1,<2" },
     { name = "rapidocr-onnxruntime", specifier = ">=1.4.4" },
     { name = "uvicorn", specifier = ">=0.30,<1" },
@@ -627,6 +631,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/1d/e6/718471048fea0366c3e3d1df3acfd914ca66d571cdffcf6d37bbcd725708/immutabledict-4.3.1.tar.gz", hash = "sha256:f844a669106cfdc73f47b1a9da003782fb17dc955a54c80972e0d93d1c63c514", size = 7806, upload-time = "2026-02-15T10:32:34.668Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a3/ce/f9018bf69ae91b273b6391a095e7c93fa5e1617f25b6ba81ad4b20c9df10/immutabledict-4.3.1-py3-none-any.whl", hash = "sha256:c9facdc0ff30fdb8e35bd16532026cac472a549e182c94fa201b51b25e4bf7bf", size = 5000, upload-time = "2026-02-15T10:32:33.672Z" },
+]
+
+[[package]]
+name = "json-repair"
+version = "0.64.9"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/78/2b/537bf1dab1c058bfb2287662bf6c10de0c3907570781ccc0fc56878e39a7/json_repair-0.64.9.tar.gz", hash = "sha256:0e7e02e1c04d14b3677f97d13a8ff6b473cacb07b7111857c4202721b14efdc2", size = 56686, upload-time = "2026-11-10T04:29:13.966Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/40/1c/b38f71c1b4e859e10568336d8fbb271170150033c3a9d02b3e126b500828/json_repair-0.64.9-py3-none-any.whl", hash = "sha256:531c7d429db82731f3c9811157c025599a2ef620823c56d9143bab0b5ad97930", size = 54891, upload-time = "2026-11-10T04:29:12.575Z" },
 ]
 
 [[package]]

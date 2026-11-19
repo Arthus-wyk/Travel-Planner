@@ -4,11 +4,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from agent.chat.context import AgentContext
-from agent.chat.runner import run_turn
-from agent.chat.state import AgentCancelledError, AgentRequest, AgentSession
-from tooling.registry import ToolRegistry
-from tooling.spec import ToolSpec
+from agent.chat.runtime.context import AgentContext
+from agent.chat.planner import run_turn
+from agent.chat.schemas.state import AgentCancelledError, AgentRequest, AgentSession
+from agent.tools.registry import ToolRegistry
+from agent.tools.schemas.inputs import ToolSpec
 
 
 def reply(text="", calls=()):
@@ -20,6 +20,53 @@ def call(name, arguments):
 
 
 class ReactLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_write_is_not_repeated_by_adding_an_explicit_default(self):
+        from pydantic import BaseModel
+        from agent.tools.mcp import private_tool_session
+        from agent.tools.schemas.inputs import ToolInput
+
+        class WriteInput(ToolInput):
+            title: str
+            notes: str = ""
+            tags: list[str] | None = None
+
+        class WriteOutput(BaseModel):
+            item_id: str
+
+        handler = AsyncMock(side_effect=TimeoutError)
+        spec = ToolSpec("write", "Create item", WriteInput, handler, output_model=WriteOutput)
+        client = SimpleNamespace(chat=AsyncMock(side_effect=[
+            reply(calls=[call("write", {"title": "博物馆"})]),
+            reply(calls=[call("write", {"title": "博物馆", "notes": ""})]),
+            reply(calls=[call("write", {"title": "博物馆", "tags": []})]),
+            reply("保存结果待核实"),
+        ]))
+        async with private_tool_session(ToolRegistry([spec])) as bound:
+            result = await run_turn(AgentRequest("添加博物馆"), AgentContext(
+                client, "mock", bound, memory_enabled=False, enable_rewrite=False,
+            ))
+        handler.assert_awaited_once()
+        self.assertEqual([event["error"]["details"]["recovery"] for event in result.tool_events],
+                         ["REPLAY_UNSAFE", "REPLAY_UNSAFE", "REPLAY_UNSAFE"])
+
+    async def test_partial_tool_data_reaches_model_with_original_call_id(self):
+        from agent.tools.schemas.errors import ErrorCode, ToolError
+        from agent.tools.schemas.outputs import ToolResult
+
+        partial = ToolResult(status="partial", data={"routes": ["a-b"]}, error=ToolError(
+            code=ErrorCode.PARTIAL_FAILURE, message="Missing one route", details={"missing": ["b-c"]},
+        ))
+        registry = ToolRegistry([ToolSpec("routes", "Route results", {}, AsyncMock(return_value=partial))])
+        model_call = {"id": "route-call", **call("routes", {})}
+        client = SimpleNamespace(chat=AsyncMock(side_effect=[reply(calls=[model_call]), reply("一段路线已核实")]))
+        result = await run_turn(AgentRequest("路线"), AgentContext(client, "mock", registry,
+            memory_enabled=False, enable_rewrite=False))
+        messages = client.chat.call_args.kwargs["messages"]
+        tool = next(message for message in messages if message["role"] == "tool")
+        self.assertEqual(tool["tool_call_id"], "route-call")
+        self.assertEqual(json.loads(tool["content"])["status"], "partial")
+        self.assertEqual(result.evidence[0]["result"]["routes"], ["a-b"])
+
     async def test_delegation_has_no_parent_total_step_timeout(self):
         async def child(arguments, context):
             await asyncio.sleep(0.03)
@@ -79,7 +126,7 @@ class ReactLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.budget.remaining, 6)
         self.assertEqual(result.status, "failed")
         messages = [json.loads(m["content"]) for m in session.messages if m["role"] == "tool"]
-        self.assertEqual(messages[-1]["error_type"], "decision_required")
+        self.assertEqual(messages[-1]["error"]["details"]["reason"], "decision_required")
 
     async def test_same_task_does_not_duplicate_initial_messages(self):
         client = SimpleNamespace(chat=AsyncMock(return_value=reply("done")))

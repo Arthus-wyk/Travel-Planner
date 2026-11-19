@@ -4,20 +4,21 @@ import inspect
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from agent.chat.review_children import create_review_handlers
-from agent.chat.review_execution import ReviewExecution, ToolBudget
-from agent.chat.review_contracts import PARENT_SCHEMA, child_schema, read_operations
-from agent.chat.review_parent import ReviewDelegations, run_parent
-from agent.chat.review_tasks import TaskContext, TaskResult, TaskSpec
+from agent.chat.review.children import create_review_handlers
+from agent.chat.runtime.execution import ReviewExecution
+from agent.tools.retry import ToolBudget
+from agent.chat.schemas.review import PARENT_SCHEMA, child_schema, read_operations
+from agent.chat.review.parent import ReviewDelegations, run_parent
+from agent.chat.schemas.tasks import TaskContext, TaskResult, TaskSpec
 from service.utils.model_client import OpenAICompatibleClient
 from service.travel.review_public_reply import format_review_reply
-from tooling.results import ToolResult
-from tools.review import review_context_for_day
-from tools.maps import service as map_tools
+from agent.tools.schemas.outputs import ToolResult, legacy_result
+from agent.tools.implementations.review import review_context_for_day
+from agent.tools.implementations.maps import service as map_tools
 from service.mcp import server as map_business
 
 
@@ -182,6 +183,26 @@ class ToolBudgetTest(unittest.TestCase):
 
 
 class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_unvalidated_route_does_not_enter_review_evidence(self):
+        responses = iter([
+            SimpleNamespace(content="", tool_calls=[{"function": {"name": "compare_review_route",
+                "arguments": {"origin_item_id": "a", "destination_item_id": "b", "travel_mode": "WALK"}}}]),
+            SimpleNamespace(content=json.dumps({"status": "needs_replan", "reason": "路线不可用",
+                                                "data": {"message": "", "remaining": ["补查路线"]}}), tool_calls=[]),
+        ])
+
+        async def model(**kwargs):
+            return SimpleNamespace(message=next(responses)), kwargs["messages"], None
+
+        read = AsyncMock(return_value=legacy_result("compare_review_route", True, {}))
+        tools = [{"function": {"name": "compare_review_route", "parameters": {"type": "object"}}}]
+        with patch("agent.chat.runtime.nodes.llm.request_model_with_retry", model):
+            handlers = create_review_handlers(None, "mock", tools, {}, ReviewExecution(1))
+            result = await handlers["audit_route"](TaskSpec("route", "audit_route", {}), {}, TaskContext({}, read))
+        read.assert_awaited_once()
+        self.assertEqual(result.data["routes"], [])
+        self.assertEqual(result.data["remaining"], ["补查路线"])
+
     async def run_child(self, decisions, read, *, limit=8, steps=32):
         self.requests = []
         replies = iter(decisions)
@@ -199,9 +220,9 @@ class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
             return response, kwargs["messages"], None
 
         tools = [{"type": "function", "function": {"name": "search_review_places", "parameters": {"type": "object"}}}]
-        with patch("agent.chat.nodes.llm.request_model_with_retry", model):
+        with patch("agent.chat.runtime.nodes.llm.request_model_with_retry", model):
             handler = create_review_handlers(None, "mock", tools, {"type": "array"},
-                                             ReviewExecution(0.03), max_tools=limit, max_steps=steps)
+                                             ReviewExecution(0.2), max_tools=limit, max_steps=steps)
             return await handler["search_places"](TaskSpec("s", "search_places", {}), {}, TaskContext({}, read))
 
     @staticmethod
@@ -222,8 +243,8 @@ class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
 
         async def read(name, args):
             seen.append(args["query"])
-            return (ToolResult(name, False, message="城市不明确", error_type="validation_error")
-                    if len(seen) == 1 else ToolResult(name, True, {"places": [PLACE]}))
+            return (legacy_result(name, False, message="城市不明确", error_type="validation_error")
+                    if len(seen) == 1 else legacy_result(name, True, {"places": [PLACE]}))
 
         result = await self.run_child([self.call("公园"), self.call("杭州公园", retry_of="op-1"), self.call("杭州博物馆"),
                                      {"result": {"status": "completed", "data": {"place_ids": ["park"]}, "reason": ""}}],
@@ -235,7 +256,7 @@ class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_and_step_limit_preserve_verified_places(self):
         async def read(name, args):
-            return ToolResult(name, True, {"places": [PLACE]})
+            return legacy_result(name, True, {"places": [PLACE]})
 
         for decisions, steps in (([self.call("公园"), "timeout"], 32),
                                  ([self.call("公园"), "context_error"], 32),
@@ -250,8 +271,8 @@ class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
 
         async def read(name, args):
             calls.append(args)
-            return (ToolResult(name, False, message="需补充搜索区域", error_type="validation_error")
-                    if len(calls) < 4 else ToolResult(name, True, {"places": [PLACE]}))
+            return (legacy_result(name, False, message="需补充搜索区域", error_type="validation_error")
+                    if len(calls) < 4 else legacy_result(name, True, {"places": [PLACE]}))
 
         result = await self.run_child([*(self.call(f"区域{i}公园", retry_of="op-1" if i else None) for i in range(4)),
             {"result": {"status": "needs_replan", "data": {}, "reason": "仍需餐厅"}}], read, limit=1)
@@ -262,7 +283,7 @@ class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
     async def test_route_results_survive_model_context_failure(self):
         responses = iter([
             SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[{"function": {
-                "name": "compare_review_route", "arguments": {"origin_item_id": "a", "destination_item_id": "b"}}}])),
+                "name": "compare_review_route", "arguments": {"origin_item_id": "a", "destination_item_id": "b", "travel_mode": "WALK"}}}])),
             ValueError("context too long"),
         ])
 
@@ -273,14 +294,17 @@ class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
             return reply, kwargs["messages"], None
 
         async def read(name, arguments):
-            return ToolResult(name, True, {"duration": "600s"})
+            return legacy_result(name, True, {"origin": "西湖", "destination": "灵隐寺",
+                                              "travel_mode": "WALK", "duration": "600s"})
 
         tools = [{"type": "function", "function": {"name": "compare_review_route", "parameters": {"type": "object"}}}]
-        with patch("agent.chat.nodes.llm.request_model_with_retry", model):
+        with patch("agent.chat.runtime.nodes.llm.request_model_with_retry", model):
             handlers = create_review_handlers(None, "mock", tools, {}, ReviewExecution(1))
             result = await handlers["audit_route"](TaskSpec("route", "audit_route", {}), {}, TaskContext({}, read))
         self.assertEqual(result.status, "failed")
-        self.assertEqual(result.data["routes"][0]["result"], {"duration": "600s"})
+        self.assertEqual(result.data["routes"][0]["result"], {
+            "origin": "西湖", "destination": "灵隐寺", "travel_mode": "WALK", "duration": "600s",
+        })
         self.assertTrue(result.data["remaining"])
 
     async def test_concurrent_children_have_independent_budgets(self):
@@ -288,7 +312,7 @@ class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
 
         async def read(name, args):
             calls.append(args)
-            return ToolResult(name, True, {"places": [PLACE]})
+            return legacy_result(name, True, {"places": [PLACE]})
 
         async def model(**kwargs):
             queried = any(message["role"] == "tool" for message in kwargs["messages"])
@@ -299,7 +323,7 @@ class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
             return response, kwargs["messages"], None
 
         tools = [{"type": "function", "function": {"name": "search_review_places", "parameters": {"type": "object"}}}]
-        with patch("agent.chat.nodes.llm.request_model_with_retry", model):
+        with patch("agent.chat.runtime.nodes.llm.request_model_with_retry", model):
             handler = create_review_handlers(None, "mock", tools, {"type": "array"}, ReviewExecution(1), max_tools=1)
             results = await asyncio.gather(*(handler["search_places"](
                 TaskSpec(str(i), "search_places", {}), {}, TaskContext({}, read)) for i in range(2)))
@@ -309,12 +333,14 @@ class ChildRecoveryTest(unittest.IsolatedAsyncioTestCase):
 
 class StructuredTransportTest(unittest.IsolatedAsyncioTestCase):
     async def test_map_mcp_registration_preserves_all_input_schemas(self):
-        from mcp.server.fastmcp import FastMCP
-        from tools.maps.mcp_tools import register
+        from mcp.server.lowlevel import Server
+        from mcp.shared.memory import create_connected_server_and_client_session
+        from agent.tools.catalog import register_all
 
-        mcp = FastMCP("compact-map-test")
-        register(mcp)
-        definitions = await mcp.list_tools()
+        mcp = Server("compact-map-test")
+        register_all(mcp)
+        async with create_connected_server_and_client_session(mcp) as session:
+            definitions = [tool for tool in (await session.list_tools()).tools if tool.name.startswith("amap_")]
         self.assertEqual(len(definitions), 5)
         for definition in definitions:
             expected = set(inspect.signature(getattr(map_business, definition.name)).parameters)
@@ -339,7 +365,7 @@ class StructuredTransportTest(unittest.IsolatedAsyncioTestCase):
                 await client.chat(model="test", messages=[], tools=[], format=schema)
 
     def test_review_schemas_close_every_object_and_require_all_properties(self):
-        from tools.review import _BATCH
+        from agent.tools.schemas.review import _BATCH
 
         def check(schema):
             if isinstance(schema, list):
@@ -359,7 +385,7 @@ class StructuredTransportTest(unittest.IsolatedAsyncioTestCase):
             check(schema)
 
     def test_operation_optional_nulls_restore_existing_business_contract(self):
-        from tools.review import _BATCH
+        from agent.tools.schemas.review import _BATCH
 
         operations = [{"action": "review_place", "payload": {
             "item_id": "a", "poi_id": "p", "category": "attraction", "duration_minutes": None,
@@ -373,6 +399,7 @@ class ParentRecoveryTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def delegate(task_id, task, retry_of=None):
         arguments = {"task_id": task_id, "role": "search_places", "task": task,
+                     "search_scope": {"category": "attraction", "day": None, "selection_count": None},
                      "extra_data": {"facts": "", "artifact_refs": []}}
         if retry_of:
             arguments["_retry_of"] = retry_of
@@ -402,7 +429,7 @@ class ParentRecoveryTest(unittest.IsolatedAsyncioTestCase):
                                     "options": [], "candidate_groups": []}), tool_calls=next(decisions)))
             return response, kwargs["messages"], None
 
-        with patch("agent.chat.nodes.llm.request_model_with_retry", model):
+        with patch("agent.chat.runtime.nodes.llm.request_model_with_retry", model):
             await run_parent(client=None, model="mock", request_context={}, snapshot={}, delegations=delegations,
                              max_steps=12, max_tools=1, execution=ReviewExecution(1))
         self.assertEqual(delegations.results["search"].status, "completed")
@@ -428,7 +455,7 @@ class ParentRecoveryTest(unittest.IsolatedAsyncioTestCase):
             response = SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[self.delegate("search", "搜索")]))
             return response, kwargs["messages"], None
 
-        with patch("agent.chat.nodes.llm.request_model_with_retry", model):
+        with patch("agent.chat.runtime.nodes.llm.request_model_with_retry", model):
             decision = await run_parent(client=None, model="mock", request_context={}, snapshot={}, delegations=delegations,
                                         max_steps=4, execution=ReviewExecution(0.03))
         self.assertEqual(decision.kind, "partial")

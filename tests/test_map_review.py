@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from agent.planning.planning_graph import run_planning_action
+from agent.planning.planner import run_planning_action
 from service.api import server
 from service.travel import planning
 from service.travel.map_planning import day_map, resolve_activity_place
@@ -45,7 +45,7 @@ class MapReviewTests(unittest.TestCase):
     def test_station_transfers_use_arrival_station_and_persist_on_redraft(self):
         plan = planning.draft_itinerary(prepared_plan())
         station = next(x for x in plan["itinerary"] if x["category"] == "intercity_transport")
-        with patch("agent.planning.planning_graph.AMAP_API_KEY", "test"), patch("agent.planning.planning_graph.amap_compute_route", return_value={"success": True, "duration": "1200s", "distance_meters": 1000, "legs": [{"polyline": "120,30;120.1,30.1"}]}) as compute:
+        with patch("service.config.AMAP_API_KEY", "test"), patch("agent.planning.implementations.routes.amap_compute_route", return_value={"success": True, "duration": "1200s", "distance_meters": 1000, "legs": [{"polyline": "120,30;120.1,30.1"}]}) as compute:
             changed = run_planning_action(plan, "transport_stops", {"item_id": station["item_id"], "departure_location": "上海虹桥站", "arrival_location": "杭州东站"})["plan"]
         self.assertTrue(any(c.args[0] == "杭州东站" for c in compute.call_args_list))
         incoming = next(r for r in changed["routes"] if r["destination_item_id"] == station["item_id"])
@@ -79,14 +79,14 @@ class MapReviewTests(unittest.TestCase):
         def route_result(origin, destination, travel_mode):
             return {"success": True, "duration": {"WALK": "7200s", "TRANSIT": "1800s", "DRIVE": "600s"}[travel_mode],
                     "distance_meters": 1000, "legs": [{"polyline": "120,30;120.1,30.1"}]}
-        with patch("agent.planning.planning_graph.AMAP_API_KEY", "test"), patch("agent.planning.planning_graph.amap_compute_route", side_effect=route_result) as compute:
+        with patch("service.config.AMAP_API_KEY", "test"), patch("agent.planning.implementations.routes.amap_compute_route", side_effect=route_result) as compute:
             result = run_planning_action(plan, "route_mode", {**route, "travel_mode": "WALK"})
         changed = result["plan"]
         visit = next(x for x in changed["itinerary"] if x["item_id"] == route["destination_item_id"])
         self.assertEqual(visit["time_of_day"], "10:00")
         self.assertTrue(any(call.kwargs["travel_mode"] == "WALK" for call in compute.call_args_list))
         self.assertEqual(set(next(r for r in changed["routes"] if r["origin_item_id"] == route["origin_item_id"])["route_options"]), {"WALK", "TRANSIT", "DRIVE"})
-        with patch("agent.planning.planning_graph.AMAP_API_KEY", "test"), patch("agent.planning.planning_graph.amap_compute_route") as api:
+        with patch("service.config.AMAP_API_KEY", "test"), patch("agent.planning.implementations.routes.amap_compute_route") as api:
             faster = run_planning_action(changed, "route_mode", {**route, "travel_mode": "DRIVE"})["plan"]
         api.assert_not_called()
         self.assertEqual(next(x for x in faster["itinerary"] if x["item_id"] == visit["item_id"])["time_of_day"], "09:30")
@@ -100,7 +100,7 @@ class MapReviewTests(unittest.TestCase):
     def test_failed_route_clears_old_geometry_and_flags_estimate(self):
         plan = planning.draft_itinerary(prepared_plan())
         route = plan["routes"][0]
-        with patch("agent.planning.planning_graph.AMAP_API_KEY", "test"), patch("agent.planning.planning_graph.amap_compute_route", return_value={"success": False, "message": "No route"}):
+        with patch("service.config.AMAP_API_KEY", "test"), patch("agent.planning.implementations.routes.amap_compute_route", return_value={"success": False, "message": "No route"}):
             changed = run_planning_action(plan, "route_mode", {**route, "travel_mode": "WALK"})["plan"]
         failed = next(r for r in changed["routes"] if not r["intercity"])
         self.assertEqual(failed["legs"], [])
@@ -166,7 +166,7 @@ class MapReviewTests(unittest.TestCase):
     def test_http_search_image_and_move_persist_without_image_payload_in_plan(self):
         plan = planning.draft_itinerary(prepared_plan())
         plans = {plan["plan_id"]: plan}
-        with patch.object(server, "get_plan", side_effect=lambda key: (deepcopy(plans.get(key)), None)), patch.object(server, "save_plan", side_effect=lambda p: plans.update({p["plan_id"]: p})), patch.object(server, "amap_search_places", return_value={"success": True, "places": [{"place_id": "B1"}]}), patch.object(server, "read_map_cache", return_value="data:image/png;base64," + base64.b64encode(b"image").decode()), patch("agent.planning.planning_graph.AMAP_API_KEY", ""):
+        with patch.object(server, "get_plan", side_effect=lambda key: (deepcopy(plans.get(key)), None)), patch.object(server, "save_plan", side_effect=lambda p: plans.update({p["plan_id"]: p})), patch.object(server, "amap_search_places", return_value={"success": True, "places": [{"place_id": "B1"}]}), patch.object(server, "read_map_cache", return_value="data:image/png;base64," + base64.b64encode(b"image").decode()), patch("service.config.AMAP_API_KEY", ""):
             with TestClient(server.create_app(Path("mcp_server.py"), "test")) as client:
                 result = client.post("/api/plans/map-test/planning/places/search", json={"query": "西湖"})
                 self.assertEqual(result.json()["places"][0]["place_id"], "B1")

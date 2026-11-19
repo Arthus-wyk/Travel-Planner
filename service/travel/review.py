@@ -1,6 +1,6 @@
 from copy import deepcopy
 
-from agent.planning.planning_graph import run_planning_action
+from agent.planning.planner import run_planning_action
 from service.storage import planning_jobs
 from service.storage.travel_db import get_plan
 from service.travel.itinerary_audit import audit_plan

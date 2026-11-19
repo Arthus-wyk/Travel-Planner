@@ -2,15 +2,71 @@
 
 import json
 from contextvars import ContextVar
+import logging
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import httpx
+from json_repair import loads as repair_json
 from jsonschema import ValidationError, validate
 
 from service.config import get_env_or_dotenv as env
 from ollama import AsyncClient
 from service.utils.request_log import instrument_client
+
+logger = logging.getLogger(__name__)
+
+
+class StructuredOutputError(ValueError):
+    def __init__(self, code: str, message: str, *, content: str = ""):
+        super().__init__(message)
+        self.code = code
+        self.content = content
+
+
+def structured_messages(messages: list, schema: dict) -> list:
+    """Give every provider the same final-answer contract without changing caller history."""
+    instruction = (
+        "工具调用仍按工具协议执行。最终答案只返回符合以下 JSON Schema 的完整 JSON 对象。"
+        "严格使用字段名，所有 required 字段必须存在，无内容的数组填 []，不要输出 Markdown。"
+        "不得为了通过校验编造地点、ID、工具结果或完成状态。JSON Schema:\n"
+        + json.dumps(schema, ensure_ascii=False)
+    )
+    schema_text = json.dumps(schema, ensure_ascii=False)
+    if any(message.get("role") == "system" and schema_text in str(message.get("content", ""))
+           for message in messages):
+        return list(messages)
+    return [*messages, {"role": "system", "content": instruction}]
+
+
+def decode_structured_output(content: str | None, schema: dict) -> tuple[dict, bool]:
+    """Decode final JSON and report syntax recovery after validating the original schema."""
+    if not isinstance(content, str) or not content.strip():
+        raise StructuredOutputError("empty_output", "模型返回了空的结构化结果。")
+    repaired = False
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        try:
+            payload = repair_json(content, skip_json_loads=True)
+        except (ValueError, TypeError, RecursionError):
+            raise StructuredOutputError("invalid_json", "模型返回的 JSON 无法解析。", content=content) from None
+        if not isinstance(payload, dict) or not payload:
+            raise StructuredOutputError("invalid_json", "模型返回的 JSON 无法解析。", content=content)
+        repaired = True
+    try:
+        if not isinstance(payload, dict):
+            raise ValidationError("expected object")
+        validate(payload, schema)
+    except ValidationError as exc:
+        path = "$" + "".join(f"[{part}]" if isinstance(part, int) else f".{part}" for part in exc.absolute_path)
+        detail = f"{path}: {exc.validator}"
+        if exc.validator == "required":
+            missing = [key for key in exc.validator_value if key not in exc.instance]
+            detail += " 缺少字段 " + ", ".join(missing)
+        raise StructuredOutputError("invalid_schema", "模型结果不符合 JSON Schema。" + detail,
+                                    content=content) from None
+    return payload, repaired
 
 
 class OllamaClient(AsyncClient):
@@ -20,7 +76,40 @@ class OllamaClient(AsyncClient):
 
     async def chat(self, *, tool_choice=None, parallel_tool_calls=None, **kwargs):
         # Ollama lacks tool_choice; the caller must validate the returned invocation.
-        return await super().chat(**kwargs)
+        schema = kwargs.get("format")
+        if isinstance(schema, dict):
+            kwargs["messages"] = structured_messages(kwargs["messages"], schema)
+        response = await super().chat(**kwargs)
+        if not isinstance(schema, dict):
+            return response
+        if kwargs.get("stream"):
+            return self._structured_stream(response, schema)
+        self._validate_final(response, schema)
+        return response
+
+    @staticmethod
+    def _validate_final(response, schema):
+        reason = getattr(response, "done_reason", None)
+        if reason in {"length", "max_tokens"}:
+            raise StructuredOutputError("truncated_output", "模型结构化结果被截断。")
+        if not response.message.tool_calls:
+            parsed, repaired = decode_structured_output(response.message.content, schema)
+            if repaired:
+                response.message.content = json.dumps(parsed, ensure_ascii=False)
+
+    async def _structured_stream(self, stream, schema):
+        chunks = []
+        async for chunk in stream:
+            chunks.append(chunk)
+        content = "".join(chunk.message.content or "" for chunk in chunks)
+        if chunks:
+            final = chunks[-1].model_copy(deep=True)
+            final.message.content = content
+            final.message.tool_calls = [call for chunk in chunks for call in (chunk.message.tool_calls or [])]
+            self._validate_final(final, schema)
+            yield final
+        else:
+            raise StructuredOutputError("empty_output", "模型返回了空的结构化结果。")
 
 
 AVAILABLE_MODELS = (
@@ -63,7 +152,7 @@ def create_model_client():
         return client
     if not key:
         raise ValueError(f"{key_name} is required")
-    return OpenAICompatibleClient(url, key)
+    return OpenAICompatibleClient(url, key, json_object_only=provider == "deepseek")
 
 
 def openai_messages(messages):
@@ -142,13 +231,18 @@ def validate_tool_calls(calls: list[dict]) -> None:
 
 
 class OpenAICompatibleClient:
-    def __init__(self, base_url, api_key, *, transport=None):
+    def __init__(self, base_url, api_key, *, transport=None, json_object_only=False):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.transport = transport
+        self.json_object_only = json_object_only
 
     async def chat(self, *, model, messages, tools, stream=False, options=None, format=None, tool_choice=None, parallel_tool_calls=None):
+        if isinstance(format, dict):
+            messages = structured_messages(messages, format)
         payload = {"model": model, "messages": openai_messages(messages), "stream": stream, "temperature": (options or {}).get("temperature", 0)}
+        if (options or {}).get("num_predict") is not None:
+            payload["max_tokens"] = options["num_predict"]
         if tools:
             payload["tools"] = tools
         if tool_choice is not None:
@@ -159,11 +253,11 @@ class OpenAICompatibleClient:
             payload["response_format"] = (
                 {"type": "json_schema", "json_schema": {
                     "name": "structured_result", "strict": True, "schema": format
-                }} if isinstance(format, dict) else {"type": "json_object"}
+                }} if isinstance(format, dict) and not self.json_object_only else {"type": "json_object"}
             )
         if stream:
             payload["stream_options"] = {"include_usage": True}
-            return self._stream(payload)
+            return self._stream(payload, format if isinstance(format, dict) else None)
         async with self._client() as client:
             response = await client.post(self.base_url + "/chat/completions", json=payload)
             response.raise_for_status()
@@ -172,17 +266,23 @@ class OpenAICompatibleClient:
             message = choice["message"]
             if message.get("refusal"):
                 raise ValueError(f"模型拒绝生成结果：{message['refusal']}")
-            if choice.get("finish_reason") in {"length", "content_filter"}:
-                raise ValueError(f"模型响应未完整生成：{choice['finish_reason']}")
+            finish_reason = choice.get("finish_reason")
+            if finish_reason == "tool_calls" and not message.get("tool_calls"):
+                raise StructuredOutputError("invalid_tool_response", "模型声明工具调用但未返回调用内容。")
+            if finish_reason == "length" and isinstance(format, dict) and not message.get("tool_calls"):
+                logger.info("Structured output truncated model=%s usage=%s", model, data.get("usage"))
+                raise StructuredOutputError("truncated_output", "模型结构化结果被截断。")
+            if finish_reason in {"length", "content_filter"}:
+                raise ValueError(f"模型响应未完整生成：{finish_reason}")
             validate_tool_calls(message.get("tool_calls") or [])
             if isinstance(format, dict) and not message.get("tool_calls"):
-                try:
-                    parsed = json.loads(message.get("content") or "")
-                    validate(parsed, format)
-                except (ValueError, ValidationError) as exc:
-                    raise ValueError(f"模型结构化结果不符合 JSON Schema：{exc}") from exc
-            result = response_chunk(choice["message"], data.get("usage"))
-            result.finish_reason = choice.get("finish_reason")
+                parsed, repaired = decode_structured_output(message.get("content"), format)
+                if repaired:
+                    logger.info("Repaired structured output model=%s finish_reason=%s usage=%s",
+                                model, finish_reason, data.get("usage"))
+                    message = {**message, "content": json.dumps(parsed, ensure_ascii=False)}
+            result = response_chunk(message, data.get("usage"))
+            result.finish_reason = finish_reason
             result.message.reasoning_content = choice["message"].get("reasoning_content")
             return result
 
@@ -190,9 +290,10 @@ class OpenAICompatibleClient:
         return instrument_client(httpx.AsyncClient(headers={"Authorization": f"Bearer {self.api_key}"},
                                                     timeout=120, transport=self.transport))
 
-    async def _stream(self, payload):
+    async def _stream(self, payload, schema: dict | None = None):
         calls = {}
         usage = {}
+        content_parts = []
         complete = False
         finish_reason = None
         async with self._client() as client:
@@ -219,6 +320,8 @@ class OpenAICompatibleClient:
                         raise ValueError(f"模型拒绝生成结果：{delta['refusal']}")
                     if choices[0].get("finish_reason"):
                         finish_reason = choices[0]["finish_reason"]
+                        if finish_reason == "length" and schema is not None and not (calls or delta.get("tool_calls")):
+                            raise StructuredOutputError("truncated_output", "模型结构化结果被截断。")
                         if finish_reason not in {"tool_calls", "stop"}:
                             raise ValueError(f"模型响应未完整生成：{finish_reason}")
                         complete = True
@@ -232,11 +335,25 @@ class OpenAICompatibleClient:
                         for key in ("name", "arguments"):
                             function[key] += fragment.get(key, "")
                     if delta.get("content"):
-                        yield response_chunk({"content": delta["content"]})
+                        if schema is None:
+                            yield response_chunk({"content": delta["content"]})
+                        else:
+                            content_parts.append(delta["content"])
         if not complete:
             raise ConnectionError("Model stream ended before completion")
+        if finish_reason == "tool_calls" and not calls:
+            raise StructuredOutputError("invalid_tool_response", "模型声明工具调用但未返回调用内容。")
         if calls and finish_reason not in {"tool_calls", "stop"}:
             raise ConnectionError("Model tool stream ended before a successful finish_reason")
         tool_calls = [{"function": calls[i]} for i in sorted(calls)]
         validate_tool_calls(tool_calls)
-        yield response_chunk({"tool_calls": tool_calls}, usage)
+        content = "".join(content_parts)
+        if schema is not None and not tool_calls:
+            parsed, repaired = decode_structured_output(content, schema)
+            if repaired:
+                logger.info("Repaired structured output model=%s finish_reason=%s usage=%s",
+                            payload["model"], finish_reason, usage)
+                content = json.dumps(parsed, ensure_ascii=False)
+        result = response_chunk({"content": content, "tool_calls": tool_calls}, usage)
+        result.finish_reason = finish_reason
+        yield result

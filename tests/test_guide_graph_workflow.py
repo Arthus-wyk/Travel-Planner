@@ -4,7 +4,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from agent.planning.planning_graph import run_planning_action
+from agent.planning.planner import run_planning_action
 from service.travel import planning
 from test_guide_workflow import prepared, POINT
 
@@ -25,13 +25,13 @@ def proposal(plan, feedback=None):
 
 class GuideGraphWorkflowTests(unittest.TestCase):
     def setUp(self):
-        patcher = patch("agent.planning.planning_graph.AMAP_API_KEY", "")
+        patcher = patch("service.config.AMAP_API_KEY", "")
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def test_draft_reuses_parsed_locations_without_searching_again(self):
         plan = ready()
-        with patch("agent.planning.planning_graph.generate_itinerary_proposal", side_effect=proposal) as model, patch(
+        with patch("agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal", side_effect=proposal) as model, patch(
             "service.travel.guide._extract_with_model"
         ) as parse, patch("service.travel.map_planning.amap_search_places") as search:
             result = run_planning_action(plan, "draft", {"text": "", "choices": {}})
@@ -47,7 +47,7 @@ class GuideGraphWorkflowTests(unittest.TestCase):
         text = "第二天中午12点去知味观"
         parsed = {"places": [{"name": "知味观", "category": "food", "day": 2, "note": "中午12点"}]}
         with patch("service.travel.guide._extract_with_model", return_value=json.dumps(parsed, ensure_ascii=False)), patch(
-            "agent.planning.planning_graph.generate_itinerary_proposal", side_effect=proposal
+            "agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal", side_effect=proposal
         ) as model, patch("service.travel.map_planning.amap_search_places") as search:
             result = run_planning_action(plan, "draft", {"text": text, "choices": {"manual-1": "must"}})
         self.assertEqual(model.call_args.args[0]["planning"]["guide_text"], text)
@@ -59,18 +59,18 @@ class GuideGraphWorkflowTests(unittest.TestCase):
         plan = ready()
         plan["planning"]["activities"][-1].pop("place")
         before = deepcopy(plan)
-        with patch("agent.planning.planning_graph.generate_itinerary_proposal", side_effect=proposal) as model:
+        with patch("agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal", side_effect=proposal) as model:
             result = run_planning_action(plan, "draft", {})
         self.assertEqual(result["plan"]["planning"]["unscheduled_items"], [])
         self.assertEqual(model.call_args.args[0]["planning"]["activities"][-1]["choice"], "exclude")
         self.assertEqual(plan, before)
 
     def test_invalid_input_is_not_retried(self):
-        from agent.planning import itinerary
+        from agent.planning.implementations import itinerary
         plan = ready()
         activity = plan["planning"]["activities"][-1]
         plan["planning"]["activities"].append(deepcopy(activity))
-        with patch("agent.planning.planning_graph.generate_itinerary_proposal", wraps=itinerary.generate_itinerary_proposal) as model:
+        with patch("agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal", wraps=itinerary.generate_itinerary_proposal) as model:
             with self.assertRaisesRegex(ValueError, "activity_id"):
                 run_planning_action(plan, "draft", {})
         self.assertEqual(model.call_count, 1)
@@ -78,7 +78,7 @@ class GuideGraphWorkflowTests(unittest.TestCase):
     def test_model_format_retry_is_bounded_and_does_not_mutate_old_plan(self):
         plan = ready()
         before = deepcopy(plan)
-        with patch("agent.planning.planning_graph.generate_itinerary_proposal", side_effect=ValueError("invalid JSON")) as model:
+        with patch("agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal", side_effect=ValueError("invalid JSON")) as model:
             with self.assertRaisesRegex(ValueError, "invalid JSON"):
                 run_planning_action(plan, "draft", {})
         self.assertEqual(model.call_count, 3)
@@ -87,7 +87,7 @@ class GuideGraphWorkflowTests(unittest.TestCase):
     def test_hard_guide_day_constraint_is_checked_by_program(self):
         plan = ready()
         plan["planning"]["activities"][-1]["day"] = 3
-        with patch("agent.planning.planning_graph.generate_itinerary_proposal", side_effect=proposal) as model:
+        with patch("agent.planning.implementations.itinerary_nodes.generate_itinerary_proposal", side_effect=proposal) as model:
             result = run_planning_action(plan, "draft", {})
         self.assertEqual(model.call_count, 3)
         self.assertIn("guide_constraint", {x["type"] for x in result["audit"]["issues"]})
@@ -95,7 +95,7 @@ class GuideGraphWorkflowTests(unittest.TestCase):
 
     def test_transport_candidates_do_not_search_hotels_until_step_two(self):
         plan = planning.create_draft({"destination": "杭州", "departure_city": "上海", "start_date": "2026-11-06", "trip_days": 2, "travelers": 1, "budget": 5000}, "steps")
-        with patch("agent.planning.planning_graph._hotel_places", return_value=[]) as hotels, patch("agent.planning.planning_graph._activity_places", return_value=[]):
+        with patch("agent.planning.implementations.candidates._hotel_places", return_value=[]) as hotels, patch("agent.planning.implementations.candidates._activity_places", return_value=[]):
             result = run_planning_action(plan, "candidates", {})
             hotels.assert_not_called()
             transports = result["plan"]["planning"]["transport_candidates"]

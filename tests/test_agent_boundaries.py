@@ -12,7 +12,7 @@ class ArchitectureTests(unittest.TestCase):
         self.assertFalse((ROOT / "service/agent").exists())
         for folder in [
             "agent",
-            "tooling",
+            "agent/tools",
             "infrastructure",
             "service/storage",
             "service/travel",
@@ -36,13 +36,34 @@ class ArchitectureTests(unittest.TestCase):
                     str(path),
                 )
                 if folder in {
-                    "tooling",
+                    "agent/tools",
                     "infrastructure",
                     "service/storage",
                     "service/travel",
                     "service/mcp",
                 } and path.name not in {"generation_jobs.py", "generation_model_log.py"}:
                     self.assertFalse(
-                        any((name or "").split(".")[0] == "agent" for name in imports),
+                        any(
+                            (name or "").split(".")[0] == "agent"
+                            and not (name or "").startswith("agent.tools")
+                            for name in imports
+                        ),
+                        str(path),
+                    )
+
+    def test_grouped_agent_modules_and_shared_tool_boundaries(self):
+        for name in (
+            "agent/chat/planner.py", "agent/chat/runtime/agent_loop.py",
+            "agent/planning/planner.py", "agent/planning/runtime/agent_loop.py",
+            "agent/tools/registry.py", "agent/tools/dispatcher.py", "agent/tools/retry.py",
+            "agent/tools/schemas/inputs.py", "agent/tools/schemas/outputs.py",
+            "agent/tools/schemas/errors.py",
+        ):
+            self.assertTrue((ROOT / name).is_file(), name)
+        for path in (ROOT / "agent/tools").rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.ImportFrom):
+                    self.assertFalse(
+                        (node.module or "").startswith(("agent.chat", "agent.planning")),
                         str(path),
                     )

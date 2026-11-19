@@ -3,7 +3,7 @@
 import json
 import re
 
-from agent.chat.review_execution import ReviewExecution, ReviewStepTimeout
+from agent.chat.runtime.execution import ReviewExecution, ReviewStepTimeout
 from infrastructure.llm import RetryConfig, request_model_with_retry
 
 INTERNAL_TEXT = re.compile(
@@ -25,6 +25,9 @@ def public_text(text: str, fallback: str, identifiers: set[str]) -> str:
 async def format_review_reply(client, model: str, execution: ReviewExecution,
                               facts: dict, fallback: str, identifiers: set[str]) -> str:
     """用独立提示词整理公开回复，异常时返回确定性模板。"""
+    if facts["状态"] == "clarify":
+        # The choice component renders the original options bound to the checkpoint.
+        return fallback
     try:
         response, _, _ = await execution.run(request_model_with_retry(
             ollama=client, model=model, tools=[], config=RetryConfig(max_attempts=1), stage="review_public_reply",

@@ -1,6 +1,6 @@
 import unittest
 
-from agent.chat.compress import compress_messages
+from agent.chat.runtime.compress import compress_messages
 
 
 class CompressionTests(unittest.TestCase):

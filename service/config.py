@@ -44,3 +44,6 @@ VALID_DB_CHARSETS = {"utf8", "utf8mb4"}
 
 AMAP_API_KEY = get_env_or_dotenv("AMAP_API_KEY", "")
 AMAP_TIMEOUT_SECONDS = int(get_env_or_dotenv("AMAP_TIMEOUT_SECONDS", "10"))
+REVIEW_CHILD_MAX_TOKENS = int(get_env_or_dotenv("REVIEW_CHILD_MAX_TOKENS", "0") or "0")
+if REVIEW_CHILD_MAX_TOKENS < 0:
+    raise ValueError("REVIEW_CHILD_MAX_TOKENS must be a positive integer or 0 for the provider default")

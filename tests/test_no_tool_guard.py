@@ -1,8 +1,8 @@
 import unittest
 from agent.chat.prompts import is_empty_execution_promise
 from service.chat import public_message_items
-from tooling.registry import ToolRegistry
-from tooling.spec import ToolSpec
+from agent.tools.registry import ToolRegistry
+from agent.tools.schemas.inputs import ToolSpec
 
 
 class InputAndGuardTests(unittest.TestCase):

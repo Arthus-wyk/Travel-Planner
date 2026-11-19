@@ -30,5 +30,11 @@ data
 !/tests/test_review_checkpoint_cancellation.py
 !/tests/test_review_native_delegation.py
 !/tests/test_review_candidate_groups.py
+!/tests/test_review_recovery.py
+!/tests/test_review_protocol_recovery.py
+!/tests/test_tool_compatibility_recovery.py
+!/tests/test_structured_contracts.py
+!/tests/test_review_execution_recovery.py
 
 !/tests/test_agent_compress.py
+!/tests/travel_e2e.py

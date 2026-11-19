@@ -13,12 +13,24 @@ def verify_tool_result(
 ) -> dict[str, Any]:
     """检查成功标志、关键 payload 和可重试性，生成内部校验结论。"""
     parsed = parse_json(result_text)
+    if isinstance(parsed, dict) and {"status", "data", "error"} <= parsed.keys():
+        status, error = parsed["status"], parsed["error"]
+        if status in {"partial", "error"} and isinstance(error, dict):
+            return {
+                "status": "warning" if status == "partial" else "failed",
+                "tool": tool_name,
+                "message": error.get("message", "Tool reported an incomplete result."),
+                "retryable": error.get("retryable") is True,
+                "checks": ["Keep verified data." if status == "partial" else "Do not claim completion."],
+            }
+        if status == "success" and error is None:
+            parsed = parsed["data"]
     if not isinstance(parsed, dict):
         return {
             "status": "warning",
             "tool": tool_name,
             "message": "Tool result is not JSON; inspect the raw text before claiming completion.",
-            "raw_result": result_text[:1000],
+            "raw_result": str(result_text)[:1000],
         }
 
     if parsed.get("status") == "success" and isinstance(parsed.get("result"), str):

@@ -65,12 +65,12 @@ class ReviewAssistantHttpTest(unittest.TestCase):
                                              side_effect=self._save_plan))
         stack.enter_context(patch("service.travel.review_interaction.create_model_client"))
         stack.enter_context(patch("infrastructure.llm.request_model_with_retry", self._model))
-        stack.enter_context(patch("agent.chat.review_workflow.rewrite_request", self._rewrite))
-        stack.enter_context(patch("tools.review.amap_search_places", return_value={
+        stack.enter_context(patch("agent.chat.review.workflow.rewrite_request", self._rewrite))
+        stack.enter_context(patch("agent.tools.implementations.review.amap_search_places", return_value={
             "success": True, "places": [PLACE, SECOND_PLACE],
         }))
         stack.enter_context(patch("service.travel.map_planning.request_amap", side_effect=AssertionError("意外地图网络调用")))
-        stack.enter_context(patch("agent.planning.planning_graph.amap_compute_route", side_effect=self._route))
+        stack.enter_context(patch("agent.planning.implementations.routes.amap_compute_route", side_effect=self._route))
         stack.enter_context(patch("service.travel.map_planning.lookup_review_place",
                                   side_effect=lambda poi: {"museum": PLACE, "gallery": SECOND_PLACE}[poi]))
         stack.enter_context(patch("service.storage.review_checkpoints.offer", side_effect=self._offer))
@@ -135,10 +135,17 @@ class ReviewAssistantHttpTest(unittest.TestCase):
         reply = self.responses.popleft()
         while reply.get("kind") == "ready":
             reply = self.responses.popleft()
+        if (kwargs.get("stage") == "review_parent" and reply.get("kind") == "answer"
+                and not any(entry.get("tool_name") == "delegate_task" for entry in kwargs["messages"])):
+            self.responses.appendleft(reply)
+            self.responses.appendleft({"status": "completed", "data": {"message": "已核对当前行程", "remaining": []}})
+            reply = {"kind": "tasks", "tasks": [{"id": "audit", "kind": "audit_route", "input": {}}]}
         if reply.get("kind") == "tasks":
             reply = {"calls": [{"function": {"name": "delegate_task", "arguments": {
                 "task_id": task["id"], "role": task["kind"],
                 "task": task["input"].get("question", "处理当前审核任务"),
+                **({"search_scope": {"category": "attraction", "day": None, "selection_count": task["input"].get("selection_count", 1)}}
+                   if task["kind"] == "search_places" else {}),
                 "extra_data": {"facts": json.dumps(task["input"], ensure_ascii=False), "artifact_refs": []},
             }}} for task in reply["tasks"]]}
         if (kwargs.get("stage") == "build_edits" and reply.get("status") == "completed"
@@ -207,7 +214,7 @@ class ReviewAssistantHttpTest(unittest.TestCase):
         self.fail(f"没有可点击的交互内容：{reply}")
 
     def test_partial_candidates_and_routes_survive_both_http_entry_modes(self):
-        from agent.chat.review_workflow import ReviewTurnResult
+        from agent.chat.review.workflow import ReviewTurnResult
         from service.runtime_logs import read_run
 
         for extra in ({}, {"conversation_id": "partial-chat"}):
@@ -293,8 +300,8 @@ class ReviewAssistantHttpTest(unittest.TestCase):
     def test_run_id_links_to_model_transcript(self):
         """审核回复和模型输出归到同一运行记录。"""
         from service.runtime_logs import read_run
-        from agent.chat.review_workflow import ReviewContext
-        from agent.chat.rewrite import rewrite_request
+        from agent.chat.review.workflow import ReviewContext
+        from agent.chat.runtime.rewrite import rewrite_request
 
         class Model:
             """模拟传输对象，保留真实模型日志记录逻辑。"""
@@ -309,20 +316,31 @@ class ReviewAssistantHttpTest(unittest.TestCase):
                 if self.slow and not is_rewrite:
                     await asyncio.Event().wait()
                 text = json.loads(kwargs["messages"][-1]["content"])["original_text"] if is_rewrite else ""
+                has_tools = any(message["role"] == "tool" for message in kwargs["messages"])
+                is_child = "status" in kwargs.get("format", {}).get("properties", {})
+                if not is_rewrite and not has_tools:
+                    name = "get_review_context" if is_child else "delegate_task"
+                    arguments = {} if is_child else {"task_id": "audit", "role": "audit_route",
+                        "task": "核对当前路线", "extra_data": {"facts": "", "artifact_refs": []}}
+                    return SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[{
+                        "function": {"name": name, "arguments": arguments}}]))
                 value = ({"original_text": text, "rewritten_text": text, "references": [], "unresolved_references": []}
-                         if is_rewrite else {"kind": "answer", "message": "路线已审核", "question": None,
+                         if is_rewrite else {"status": "completed", "reason": "", "data": {
+                             "message": "已核对当前路线", "remaining": []}} if is_child else
+                         {"kind": "answer", "message": "路线已审核", "question": None,
                                              "options": [], "candidate_groups": []})
                 content = json.dumps(value, ensure_ascii=False)
                 return SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=[]))
 
         with patch("service.travel.review_interaction.create_model_client", return_value=Model()), patch(
             "infrastructure.llm.request_model_with_retry", real_model_request
-        ), patch("agent.chat.review_workflow.rewrite_request", rewrite_request):
+        ), patch("agent.chat.review.workflow.rewrite_request", rewrite_request):
             reply = self._turn(message="第一天想看看路线")
         log = read_run(Path.cwd(), reply["run_id"])
         self.assertEqual(log["run"]["status"], "completed")
         responses = [event for event in log["events"] if event["type"] == "model_response"]
-        self.assertEqual([event["stage"] for event in responses], ["request_rewrite", "review_parent"])
+        self.assertEqual([event["stage"] for event in responses],
+                         ["request_rewrite", "review_parent", "audit_route", "audit_route", "review_parent"])
         self.assertEqual(json.loads(responses[-1]["content"])["message"], "路线已审核")
         rewrites = [event for event in log["events"] if event["type"] == "request_rewrite"]
         self.assertEqual(rewrites[0]["original_text"], "第一天想看看路线")
@@ -331,11 +349,11 @@ class ReviewAssistantHttpTest(unittest.TestCase):
                         and event["stage"] == "review_parent")
         payload = json.loads(planning["messages"][1]["content"])["extra_data"]["request_context"]
         self.assertEqual(payload["original_text"], "第一天想看看路线")
-        self.assertEqual(payload["rewrite"]["rewritten_text"], "第一天想看看路线")
+        self.assertNotIn("rewritten_text", payload["rewrite"])
 
         with patch("service.travel.review_interaction.create_model_client", return_value=Model(slow=True)), patch(
             "infrastructure.llm.request_model_with_retry", real_model_request
-        ), patch("agent.chat.review_workflow.rewrite_request", rewrite_request), patch("service.travel.review_interaction.ReviewContext",
+        ), patch("agent.chat.review.workflow.rewrite_request", rewrite_request), patch("service.travel.review_interaction.ReviewContext",
                  side_effect=lambda *args, **kwargs: ReviewContext(*args, timeout_seconds=0.2, **kwargs)):
             timed_out = self._turn(message="再检查一次路线")
         log = read_run(Path.cwd(), timed_out["run_id"])
@@ -345,7 +363,7 @@ class ReviewAssistantHttpTest(unittest.TestCase):
 
     def test_stream_reports_steps_without_combining_model_deadlines(self):
         """两个模型调用各自未超时，即使累计超过单次上限也能返回。"""
-        from agent.chat.review_workflow import ReviewContext
+        from agent.chat.review.workflow import ReviewContext
 
         async def delayed_model(**kwargs):
             """让两次模型调用累计超过任一次的时限。"""
@@ -360,7 +378,7 @@ class ReviewAssistantHttpTest(unittest.TestCase):
 
         self.responses.extend([{"kind": "ready"}, {"kind": "answer", "message": "审核完成"}])
         with patch("infrastructure.llm.request_model_with_retry", delayed_model), patch(
-            "agent.chat.review_workflow.rewrite_request", delayed_rewrite), patch(
+            "agent.chat.review.workflow.rewrite_request", delayed_rewrite), patch(
             "service.travel.review_interaction.ReviewContext",
             side_effect=lambda *args, **kwargs: ReviewContext(*args, timeout_seconds=0.25, **kwargs),
         ):
@@ -445,7 +463,7 @@ class ReviewAssistantHttpTest(unittest.TestCase):
         result = self._turn(message="第一天会不会太赶？草稿总预算是多少？", history=history)
         self.assertEqual(result["status"], "answer")
         self.assertIn("900 元", result["message"])
-        self.assertTrue(self.tool_results["get_review_context"]["success"])
+        self.assertEqual(self.tool_results["get_review_context"]["status"], "success")
         scoped = self.tool_results["get_review_context"]["data"]
         self.assertEqual(scoped["day"], 1)
         self.assertEqual([item["item_id"] for item in scoped["itinerary"]], [ANCHOR["item_id"]])
@@ -504,7 +522,7 @@ class ReviewAssistantHttpTest(unittest.TestCase):
         """选择两个地点后无需再搜索，两项经联合试算一次写入。"""
         self.responses.extend([
             {"kind": "ready"},
-            {"kind": "tasks", "tasks": [{"id": "search", "kind": "search_places", "input": {}, "depends_on": []}]},
+            {"kind": "tasks", "tasks": [{"id": "search", "kind": "search_places", "input": {"selection_count": 2}, "depends_on": []}]},
             {"calls": [{"function": {"name": "search_review_places", "arguments": {"query": "景点"}}}]},
             {"status": "completed", "data": {"place_ids": ["museum", "gallery"]}},
             {"kind": "answer", "message": "请选择地点", "candidate_groups": [{
@@ -565,25 +583,48 @@ class ReviewAssistantHttpTest(unittest.TestCase):
             {"id": "attractions", "label": "景点", "place_ids": ["museum", "gallery"], "selection_count": 2},
             {"id": "dining", "label": "餐饮", "place_ids": ["restaurant", "noodles"], "selection_count": 1},
         ]
+        candidates = {"park": [park, other_park], "attraction": [PLACE, SECOND_PLACE],
+                      "food": [restaurant, other_restaurant]}
+
+        async def model(**kwargs):
+            if kwargs["stage"] != "search_places":
+                return await self._model(**kwargs)
+            messages = kwargs["messages"]
+            scope = json.loads(messages[1]["content"])["extra_data"]["task_input"]["search_scope"]
+            category = scope["category"]
+            if not any(message["role"] == "tool" for message in messages):
+                calls = [{"function": {"name": "search_review_places", "arguments": {"query": category}}}]
+                content = ""
+            else:
+                calls = []
+                content = json.dumps({"status": "completed", "reason": "", "data": {
+                    "message": "已查到候选", "remaining": [],
+                    "place_ids": [place["place_id"] for place in candidates[category]],
+                }})
+            return SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=calls)), messages, None
+
         self.responses.extend([
             {"calls": [{"function": {"name": "delegate_task", "arguments": {
-                "task_id": "search-mixed", "role": "search_places", "task": "寻找一处公园、两处景点和一处餐饮",
+                "task_id": f"search-{category}", "role": "search_places", "task": f"寻找{group['label']}",
+                "search_scope": {"category": category, "day": 1, "selection_count": group["selection_count"]},
                 "extra_data": {"facts": "", "artifact_refs": []},
-            }}}]},
-            {"calls": [{"function": {"name": "search_review_places", "arguments": {"query": "公园 景点 餐饮"}}}]},
-            {"status": "completed", "data": {"place_ids": [place["place_id"] for place in places]}},
+            }}} for category, group in zip(candidates, groups)]},
             {"kind": "answer", "message": "请按分组选择地点。", "candidate_groups": groups},
         ])
-        with patch("tools.review.amap_search_places", return_value={"success": True, "places": places}), patch(
+        with patch("infrastructure.llm.request_model_with_retry", model), patch(
+            "agent.tools.implementations.review.amap_search_places",
+            side_effect=lambda query, **_: {"success": True, "places": candidates[query]},
+        ) as search, patch(
             "service.travel.map_planning.lookup_review_place", side_effect={place["place_id"]: place for place in places}.get
         ), patch("httpx.HTTPTransport.handle_request", side_effect=AssertionError("禁止真实网络")), patch(
             "httpx.AsyncHTTPTransport.handle_async_request", side_effect=AssertionError("禁止真实网络")
-        ), patch("agent.chat.review_workflow.rewrite_request", side_effect=self._rewrite) as rewrite, patch(
+        ), patch("agent.chat.review.workflow.rewrite_request", side_effect=self._rewrite) as rewrite, patch(
             "service.travel.review_public_reply.request_model_with_retry", side_effect=self._public_model
         ) as public_reply:
             reply = self._turn(conversation_id="mixed-chat", message="添加1个公园、2个景点和1处餐饮")
             block = reply["blocks"][0]
             self.assertEqual(block["groups"], groups)
+            self.assertCountEqual([call.args[0] for call in search.call_args_list], candidates)
             calls_before = (len(self.inputs), rewrite.await_count, public_reply.await_count)
             for indexes in ([0, 2, 3], [0, 1, 2, 3, 4], [0, 2, 4], [0, 2, 3, 4, 5]):
                 with self.subTest(indexes=indexes):
@@ -615,13 +656,51 @@ class ReviewAssistantHttpTest(unittest.TestCase):
         self.save.assert_called_once()
         self.assertFalse(self.responses)
 
+    def test_dependent_food_search_waits_for_park_clarification(self):
+        park = {**PLACE, "place_id": "park-a", "name": "测试公园甲"}
+        other = {**PLACE, "place_id": "park-b", "name": "测试公园乙"}
+        food = {**PLACE, "place_id": "food-a", "name": "测试餐厅"}
+
+        def search_call(category, task):
+            return {"calls": [{"function": {"name": "delegate_task", "arguments": {
+                "task_id": f"search-{category}", "role": "search_places", "task": task,
+                "search_scope": {"category": category, "day": 1, "selection_count": 1},
+                "extra_data": {"facts": "", "artifact_refs": []},
+            }}}]}
+
+        self.responses.extend([
+            search_call("park", "找公园"),
+            {"calls": [{"function": {"name": "search_review_places", "arguments": {"query": "公园"}}}]},
+            {"status": "completed", "data": {"place_ids": ["park-a", "park-b"]}},
+            {"kind": "clarify", "message": "先确认公园", "question": "选哪座公园作为锚点？",
+             "options": [park["name"], other["name"]]},
+        ])
+        with patch("agent.tools.implementations.review.amap_search_places", side_effect=[
+            {"success": True, "places": [park, other]}, {"success": True, "places": [food]},
+        ]) as search:
+            clarification = self._turn(conversation_id="dependent", message="选好第一天的公园再找附近餐厅")
+            self.assertEqual(clarification["status"], "clarify")
+            search.assert_called_once()
+            self.responses.extend([
+                search_call("food", "找测试公园甲附近餐厅"),
+                {"calls": [{"function": {"name": "search_review_places", "arguments": {"query": "测试公园甲 餐厅"}}}]},
+                {"status": "completed", "data": {"place_ids": ["food-a"]}},
+                {"kind": "answer", "message": "已查到附近餐厅"},
+            ])
+            answer = self._turn(conversation_id="dependent", action_id=clarification["blocks"][0]["action_id"],
+                                option_index=0)
+            self.assertEqual(answer["status"], "answer")
+            self.assertEqual(answer["blocks"][0]["places"][0]["place_id"], "food-a")
+            self.assertEqual([call.args[0] for call in search.call_args_list], ["公园", "测试公园甲 餐厅"])
+            self.assertEqual(self.inputs[-1]["request_context"]["clarification"]["answer"], park["name"])
+
     def test_followup_references_receive_prior_public_history_at_rewrite_entry(self):
         """离线核对多轮公开上下文传入 rewrite；不测试真实模型消歧质量。"""
         self.responses.extend([
             {"kind": "answer", "message": "第一天可考虑测试博物馆、测试美术馆。"},
             {"kind": "answer", "message": "请确认要加入的地点和日期。"},
         ])
-        with patch("agent.chat.review_workflow.rewrite_request", side_effect=self._rewrite) as rewrite:
+        with patch("agent.chat.review.workflow.rewrite_request", side_effect=self._rewrite) as rewrite:
             first = self._turn(conversation_id="references-chat", message="第一天有哪些景点？")
             history = [{"role": "user", "content": "第一天有哪些景点？"},
                        {"role": "assistant", "content": first["message"]}]
@@ -632,6 +711,21 @@ class ReviewAssistantHttpTest(unittest.TestCase):
         context = self.inputs[-1]["request_context"]
         self.assertEqual(context["original_text"], "把第二个加到那天")
         self.assertEqual(context["conversation_history"], history)
-        self.assertEqual(context["rewrite"]["original_text"], "把第二个加到那天")
+        self.assertNotIn("original_text", context["rewrite"])
         self.save.assert_not_called()
 
+
+    def test_partial_candidates_without_valid_groups_are_read_only_in_both_modes(self):
+        result = SimpleNamespace(status="partial", message="候选分组尚未完整交付", places=[PLACE],
+                                 candidate_groups=[], clarification=None, progress={}, snapshot=None,
+                                 continuation={}, operations=[])
+        with patch("service.travel.review_interaction.run_review_turn", return_value=result):
+            for fields in ({}, {"conversation_id": "missing-groups"}):
+                with self.subTest(fields=fields):
+                    response = self._turn(message="搜索公园与餐饮", **fields)
+                    self.assertEqual(response["status"], "partial")
+                    block = next(block for block in response["blocks"] if block["type"] == "place_candidates")
+                    self.assertNotIn("action_id", block)
+                    self.assertNotIn("selection_mode", block)
+            self.assertFalse(self.checkpoints)
+            self.save.assert_not_called()

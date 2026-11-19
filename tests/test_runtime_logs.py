@@ -50,7 +50,7 @@ class RuntimeLogTests(unittest.TestCase):
         self.assertNotIn('secret-value', raw)
         self.assertIn('answer', raw)
 
-    def test_failed_run_records_traceback_and_next_run_is_independent(self):
+    def test_failed_turn_is_retained_in_merged_conversation(self):
         from service.utils.runtime_log import trace_run
         from service.runtime_logs import list_runs, read_run
         transcript = TranscriptLogger(self.project, session_id='chat-1')
@@ -59,11 +59,13 @@ class RuntimeLogTests(unittest.TestCase):
                 raise RuntimeError('broken')
         with trace_run(transcript, model='test', text='second') as run:
             run.finish('completed', 'ok')
-        failed = list_runs(self.project, status='failed')['runs']
+        failed = list_runs(self.project)['runs']
         self.assertEqual(len(failed), 1)
         events = read_run(self.project, failed[0]['runId'])['events']
-        self.assertIn('RuntimeError: broken', events[-1]['traceback'])
-        self.assertEqual(len(list_runs(self.project)['runs']), 2)
+        self.assertIn('RuntimeError: broken', next(e for e in events if e.get('traceback'))['traceback'])
+        self.assertEqual(failed[0]['status'], 'completed')
+        self.assertEqual(failed[0]['turnCount'], 2)
+        self.assertEqual(len(list_runs(self.project)['runs']), 1)
         with self.assertRaises(ValueError):
             list_runs(self.project, conversation_id='../elsewhere')
         with self.assertRaises(ValueError):
@@ -81,6 +83,33 @@ class RuntimeLogTests(unittest.TestCase):
         self.assertEqual(runs[0]['status'], 'legacy')
         self.assertEqual(len(read_run(self.project, runs[0]['runId'])['events']), 1)
         self.assertEqual(list_runs(self.project, conversation_id='missing')['runs'], [])
+
+class ConversationGroupingTests(unittest.TestCase):
+    def test_recent_activity_sort_filter_and_old_links_include_all_turns(self):
+        from service.runtime_logs import list_runs, read_run
+        with tempfile.TemporaryDirectory() as folder, patch.object(log_paths, 'PROJECTS_DIR', Path(folder)):
+            project = Path(folder) / 'project'
+            transcript = TranscriptLogger(project, session_id='active-old')
+            for run_id, day, kind, fields in [
+                ('a' * 32, '01', 'run_start', {'input': 'first'}),
+                ('a' * 32, '01', 'run_end', {'status': 'needs_input', 'durationMs': 10}),
+                ('b' * 32, '19', 'run_start', {'input': 'second'}),
+                ('b' * 32, '19', 'run_end', {'status': 'completed', 'durationMs': 20}),
+            ]:
+                transcript.record(kind, {'timestamp': f'2026-11-{day}T12:00:00+00:00', 'runId': run_id, **fields})
+            other = TranscriptLogger(project, session_id='other')
+            other.record('run_start', {'timestamp': '2026-11-18T12:00:00+00:00', 'runId': 'c' * 32})
+            runs = list_runs(project)['runs']
+            self.assertEqual([item['sessionId'] for item in runs], ['active-old', 'other'])
+            recent = list_runs(project, since='2026-11-19', until='2026-11-19')['runs']
+            self.assertEqual(len(recent), 1)
+            self.assertEqual(recent[0]['durationMs'], 30)
+            self.assertEqual(recent[0]['turnCount'], 2)
+            self.assertEqual(recent[0]['input'], 'first')
+            for run_id in ('a' * 32, 'b' * 32):
+                self.assertEqual(len(read_run(project, run_id)['events']), 4)
+            self.assertEqual(list_runs(project, conversation_id='other')['runs'][0]['sessionId'], 'other')
+
 
 class RuntimeLogApiTests(unittest.TestCase):
     def test_local_api_lists_details_and_rejects_external_origin_and_bad_ids(self):
@@ -114,7 +143,7 @@ class RuntimeLogSafetyTests(unittest.TestCase):
             self.assertNotIn(secret, encoded)
         self.assertIn('safe', encoded)
 
-    def test_concurrent_runs_and_cancelled_run_remain_separate(self):
+    def test_concurrent_turn_ids_remain_separate_in_merged_session(self):
         from service.utils.runtime_log import trace_run, record_event, current_run
         from service.runtime_logs import list_runs, read_run
         with tempfile.TemporaryDirectory() as folder, patch.object(log_paths, 'PROJECTS_DIR', Path(folder)):
@@ -131,12 +160,13 @@ class RuntimeLogSafetyTests(unittest.TestCase):
                 self.assertIsNone(current_run.get())
             asyncio.run(execute())
             runs = list_runs(Path.cwd(), conversation_id='concurrent')['runs']
-            self.assertEqual(len(runs), 3)
-            self.assertEqual(len({item['runId'] for item in runs}), 3)
-            for run in runs:
-                events = read_run(Path.cwd(), run['runId'])['events']
-                self.assertEqual([e['text'] for e in events if e['type'] == 'marker'], [run['input']])
-            self.assertEqual(len([run for run in runs if run['status'] == 'cancelled']), 1)
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]['turnCount'], 3)
+            events = read_run(Path.cwd(), runs[0]['runId'])['events']
+            self.assertEqual({e['text'] for e in events if e['type'] == 'marker'}, {'one', 'two', 'cancel'})
+            self.assertEqual(len({e['runId'] for e in events}), 3)
+            self.assertEqual(len([e for e in events if e.get('status') == 'cancelled']), 1)
+
 
 class ChatRuntimeLogTests(unittest.IsolatedAsyncioTestCase):
     async def test_connection_failure_is_logged_before_agent_starts(self):
@@ -160,3 +190,19 @@ class ChatRuntimeLogTests(unittest.IsolatedAsyncioTestCase):
             events = read_run(Path.cwd(), runs[0]['runId'])['events']
             self.assertEqual(events[0]['type'], 'run_start')
             self.assertIn('MCP unavailable', events[-1]['traceback'])
+
+class MergedTimelineTests(unittest.TestCase):
+    def test_model_pair_is_one_entry_and_search_checks_both_halves(self):
+        from service.runtime_logs import event_entries
+        events = [
+            {'type': 'model_request', 'timestamp': '1', 'requestId': 'a', 'messages': [{'content': 'input-only'}]},
+            {'type': 'model_response', 'timestamp': '2', 'requestId': 'a', 'content': 'output-only'},
+            {'type': 'model_request', 'timestamp': '3', 'requestId': 'b', 'messages': []},
+        ]
+        entries = list(event_entries(events))
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0][1]['type'], 'model_response')
+        self.assertEqual(entries[0][2], events[0])
+        found = list(event_entries(events, 'input-only'))
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][0]['eventId'], entries[0][0]['eventId'])

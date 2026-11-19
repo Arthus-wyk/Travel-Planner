@@ -6,12 +6,12 @@ from ollama import ResponseError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from agent.chat.context import AgentContext, DEFAULT_MAX_ROUNDS
-from agent.chat.runner import run_turn
-from agent.chat.state import AgentRequest
-from tooling.registry import ToolRegistry
-from tooling.mcp import build_registry
-from tools.catalog import tool_metadata
+from agent.chat.runtime.context import AgentContext, DEFAULT_MAX_ROUNDS
+from agent.chat.planner import run_turn
+from agent.chat.schemas.state import AgentRequest
+from agent.tools.registry import ToolRegistry
+from agent.tools.mcp import build_registry
+from agent.tools.catalog import tool_metadata
 
 MAX_TOOL_ROUNDS = DEFAULT_MAX_ROUNDS
 
@@ -139,12 +139,13 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_transport_failure_returns_to_model_as_failed_verification(self):
         await self.run_query(
             [response("", [tool_call()]), response("查询失败")],
-            tool_results=[RuntimeError("timeout")],
+            tool_results=[TimeoutError("timeout")],
         )
         tool_message = next(message for message in self.messages if message.get("tool_name") == "add_itinerary_item")
         result = json.loads(tool_message["content"])["verification"]
         self.assertEqual(result["status"], "failed")
-        self.assertTrue(result["retryable"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(json.loads(tool_message["content"])["error"]["code"], "UPSTREAM_TIMEOUT")
 
     async def test_unknown_tool_does_not_execute(self):
         await self.run_query(
@@ -152,7 +153,7 @@ class ToolFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.mcp.call_tool.assert_not_awaited()
         tool_message = next(message for message in self.messages if message.get("tool_name") == "erase_all")
-        self.assertEqual(json.loads(tool_message["content"])["error_type"], "unknown_tool")
+        self.assertEqual(json.loads(tool_message["content"])["error"]["code"], "NOT_FOUND")
 
     async def test_max_rounds_stops_even_if_model_keeps_calling_tools(self):
         answer = await self.run_query([response("", [tool_call()])] * MAX_TOOL_ROUNDS)

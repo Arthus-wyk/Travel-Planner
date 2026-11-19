@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { Activity, ArrowLeft, ChevronRight, Clock3, RefreshCw, Search } from "lucide-react";
+import { Activity, ArrowLeft, ChevronRight, Clock3, Copy, RefreshCw, Search } from "lucide-react";
 import "./runtime-logs.css";
+import { formatLogContext } from "./runtimeLogContext.js";
 
 const statuses = { completed: "已完成", failed: "失败", needs_input: "待补充信息", cancelled: "已取消", interrupted: "已中断", limit_reached: "达到轮次上限", running: "运行中 / 未收尾", legacy: "历史日志" };
 const titles = {
@@ -73,7 +74,7 @@ function LogEvent({ event, load }) {
     finally { pending.current = false; }
   }
   return <details className="log-event" onToggle={open}>
-    <summary><span><strong>{titles[event.type] || event.type}</strong>{event.stage && <code>{stages[event.stage] || event.stage}</code>}{event.tool && <code>{event.tool}</code>}{event.attempt != null && <small>尝试 {event.attempt}</small>}</span><small>{event.durationMs != null ? duration(event.durationMs) : "展开详情"}</small></summary>
+    <summary><span><strong>{event.pairedRequest ? "模型调用（输入 / 输出）" : titles[event.type] || event.type}</strong>{event.stage && <code>{stages[event.stage] || event.stage}</code>}{event.tool && <code>{event.tool}</code>}{event.attempt != null && <small>尝试 {event.attempt}</small>}</span><small>{event.durationMs != null ? duration(event.durationMs) : "展开详情"}</small></summary>
     {data ? <EventDetails event={data.event} request={data.request} /> : error ? <p role="alert">{error}，请收起后重新展开。</p> : <p>正在加载事件详情…</p>}
   </details>;
 }
@@ -98,6 +99,8 @@ export default function RuntimeLogs({ api }) {
   const [revision, setRevision] = useState(0);
   const [category, setCategory] = useState("all");
   const [search, setSearch] = useState("");
+  const [copyStatus, setCopyStatus] = useState("");
+  const [copying, setCopying] = useState(false);
   const [matches, setMatches] = useState(null);
   const [searchError, setSearchError] = useState("");
   const query = new URLSearchParams({ conversation_id: conversationId, job_id: jobId, status, since, until }).toString();
@@ -120,6 +123,7 @@ export default function RuntimeLogs({ api }) {
 
   useEffect(() => {
     const controller = new AbortController();
+    setCopyStatus("");
     setDetail(null); setDetailError(""); setCategory("all"); setSearch("");
     if (!selectedId) { setDetailLoading(false); return; }
     setDetailLoading(true);
@@ -142,6 +146,17 @@ export default function RuntimeLogs({ api }) {
     }, 250);
     return () => { clearTimeout(timer); controller.abort(); };
   }, [selectedId, detailPath, detailQuery, search, revision, api]);
+
+  async function copyContext() {
+    setCopying(true); setCopyStatus("");
+    try {
+      const data = await api(`${detailPath}?${new URLSearchParams({ conversation_id: conversationId })}`);
+      await navigator.clipboard.writeText(formatLogContext(data));
+      setCopyStatus(data.truncated ? "已复制保留范围内的上下文（较早日志已截断）" : "已复制全部日志上下文");
+    } catch (cause) {
+      setCopyStatus(`复制失败：${cause.message}`);
+    } finally { setCopying(false); }
+  }
 
   function applyFilters(event) {
     event.preventDefault();
@@ -170,7 +185,7 @@ export default function RuntimeLogs({ api }) {
 
   return <div className="logs-page">
     <header className="page-header"><h1>运行日志</h1><button className="secondary-button" onClick={() => setRevision((value) => value + 1)} disabled={loading || detailLoading}><RefreshCw size={16} aria-hidden="true" />刷新</button></header>
-    <p className="logs-intro">查看对话与行程生成的阶段进度、模型上下文、地图调用和异常堆栈。日志包含旅行及对话内容，仅供本机诊断。</p>
+    <p className="logs-intro">同一会话的所有对话合并记录。查看对话与行程生成的阶段进度、模型上下文、地图调用和异常堆栈。日志包含旅行及对话内容，仅供本机诊断。</p>
     {conversationId && <Link className="back-link" to={`/conversations/${encodeURIComponent(conversationId)}`}><ArrowLeft size={15} /> 返回对话</Link>}
     <form key={query} className="log-filters" onSubmit={applyFilters}>
       <label>会话 ID<input name="conversation_id" defaultValue={conversationId} placeholder="全部会话" /></label>
@@ -183,22 +198,23 @@ export default function RuntimeLogs({ api }) {
     {error && <p role="alert" className="log-alert">{error}</p>}
     {truncated && <p className="log-notice">日志读取范围有限：最近 100 个会话、每会话末尾 5000 条事件；生成日志每组读取最新 8 MiB（含轮转备份）。更早的事件可能不完整。</p>}
     <div className="logs-layout">
-      <section className="log-run-list" aria-label="运行列表"><div className="log-list-heading"><strong>运行记录</strong><span>{pagination.total} 次</span></div>
+      <section className="log-run-list" aria-label="运行列表"><div className="log-list-heading"><strong>运行记录</strong><span>{pagination.total} 条</span></div>
         {!error && pagination.page_count > 1 && <nav className="log-pagination" aria-label="运行记录分页">
           <button type="button" className="secondary-button" disabled={loading || pagination.page <= 1} onClick={() => changePage(pagination.page - 1)}>上一页</button>
           <span aria-live="polite">{pagination.page} / {pagination.page_count}</span>
           <button type="button" className="secondary-button" disabled={loading || pagination.page >= pagination.page_count} onClick={() => changePage(pagination.page + 1)}>下一页</button>
         </nav>}
         {loading ? <p className="empty-state">正在加载…</p> : !runs.length ? <p className="empty-state">暂无匹配的运行日志。生成行程或发送消息后刷新。</p> : runs.map((run) => <button key={run.runId} className={`log-run ${selectedId === run.runId ? "selected" : ""}`} onClick={() => selectRun(run.runId)}>
-          <span className="log-run-top"><span className={`log-status ${run.status}`}>{statuses[run.status] || run.status}</span><time>{dateTime(run.startedAt)}</time></span>
-          <strong>{String(run.input || "未记录用户输入").slice(0, 120)}</strong><span className="log-run-bottom"><span>{run.model || "未记录模型"} · {duration(run.durationMs)}</span><ChevronRight size={15} /></span><small title={run.jobId || run.sessionId}>{run.source === "generation" ? `任务：${run.jobId}` : run.sessionId}</small>
+          <span className="log-run-top"><span className={`log-status ${run.status}`}>{statuses[run.status] || run.status}</span><time>{dateTime(run.updatedAt || run.startedAt)}</time></span>
+          <strong>{String(run.input || "未记录用户输入").slice(0, 120)}</strong><span className="log-run-bottom"><span>{run.model || "未记录模型"} · {duration(run.durationMs)}{run.turnCount > 1 ? ` · ${run.turnCount} 轮对话` : ""}</span><ChevronRight size={15} /></span><small title={run.jobId || run.sessionId}>{run.source === "generation" ? `任务：${run.jobId}` : run.sessionId}</small>
         </button>)}
       </section>
       <section className="log-detail" aria-label="运行详情">
         {detailLoading ? <p className="empty-state">正在加载运行详情…</p> : detailError ? <p role="alert" className="log-alert">{detailError}</p> : !detail ? <div className="log-placeholder"><Activity size={36} /><h2>选择一次运行</h2><p>查看完整事件时间线与请求详情</p></div> : <>
-          <div className="log-detail-heading"><div><span className={`log-status ${detail.run.status}`}>{statuses[detail.run.status] || detail.run.status}</span><h2>{detail.run.model || "历史会话"}</h2></div><code title={selectedId}>{selectedId}</code></div>
+          <div className="log-detail-heading"><div><span className={`log-status ${detail.run.status}`}>{statuses[detail.run.status] || detail.run.status}</span><h2>{detail.run.model || "历史会话"}</h2></div><button type="button" className="secondary-button" disabled={copying} onClick={copyContext}><Copy size={16} aria-hidden="true" />{copying ? "正在复制…" : "一键复制上下文"}</button><code title={selectedId}>{selectedId}</code></div>
+          {copyStatus && <p role="status">{copyStatus}</p>}
           {detail.run.planId && <Link className="back-link" to={`/plans/${encodeURIComponent(detail.run.planId)}/planning`}>查看关联行程 <ChevronRight size={15} /></Link>}
-          <div className="log-metrics"><div><Clock3 size={16} /><span>总耗时</span><strong>{duration(detail.run.durationMs)}</strong></div><div><span>模型请求</span><strong>{events.filter((event) => event.type === "model_request").length} 次</strong></div><div><span>输入 / 输出 Token</span><strong>{inputTokens.toLocaleString()} / {outputTokens.toLocaleString()}</strong></div></div>
+          <div className="log-metrics"><div><Clock3 size={16} /><span>总耗时</span><strong>{duration(detail.run.durationMs)}</strong></div><div><span>模型请求</span><strong>{events.filter((event) => event.type === "model_request" || event.pairedRequest).length} 次</strong></div><div><span>输入 / 输出 Token</span><strong>{inputTokens.toLocaleString()} / {outputTokens.toLocaleString()}</strong></div></div>
           {(detail.truncated || detail.run.status === "legacy") && <p className="log-notice">{detail.run.status === "legacy" ? "历史日志按会话合并，无法还原未记录的请求上下文。" : "读取范围有限，较早的事件可能已被截断。"}</p>}
           <div className="log-event-filters"><label>事件类型<select value={category} onChange={(event) => setCategory(event.target.value)}><option value="all">全部事件</option><option value="model">模型 / API</option><option value="tool">工具执行</option><option value="error">异常</option></select></label><label>搜索详情<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="工具名、关键词、错误…" /></label><span>{visible.length} 条事件</span></div>
           {searchError && <p role="alert">{searchError}</p>}

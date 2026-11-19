@@ -3,7 +3,7 @@ from threading import Barrier, Event, Lock
 from unittest import TestCase
 from unittest.mock import patch
 
-from agent.planning.planning_graph import route_agent
+from agent.planning.implementations.routes import route_agent
 from service.travel.parallel import ordered_parallel
 from service.travel.place_matching import search_and_match
 from service.utils.request_log import context
@@ -53,8 +53,8 @@ class ParallelPlanningTests(TestCase):
 
         token = context.set({"job_id": "route-job"})
         try:
-            with patch("agent.planning.planning_graph.AMAP_API_KEY", "test"), patch(
-                "agent.planning.planning_graph.amap_compute_route", side_effect=compute
+            with patch("service.config.AMAP_API_KEY", "test"), patch(
+                "agent.planning.implementations.routes.amap_compute_route", side_effect=compute
             ):
                 routes = route_agent({"plan": plan, "action": "draft", "trace": []})["plan"]["routes"]
         finally:

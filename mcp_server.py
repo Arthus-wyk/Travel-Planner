@@ -1,17 +1,25 @@
 """Canonical MCP transport composition root."""
 
-from mcp.server.fastmcp import FastMCP
+import asyncio
+
+from mcp.server.lowlevel import Server
+from mcp.server.stdio import stdio_server
 
 from infrastructure.database import check_database_on_startup
-from tools.catalog import register_all
+from agent.tools.catalog import register_all
 
-mcp = FastMCP("custom-travel-planner")
+mcp = Server("custom-travel-planner")
 register_all(mcp)
+
+
+async def _serve():
+    async with stdio_server() as (reader, writer):
+        await mcp.run(reader, writer, mcp.create_initialization_options())
 
 
 def main() -> None:
     check_database_on_startup()
-    mcp.run(transport="stdio")
+    asyncio.run(_serve())
 
 
 if __name__ == "__main__":

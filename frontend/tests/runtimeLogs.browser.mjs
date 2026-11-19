@@ -9,7 +9,8 @@ const root = resolve(import.meta.dirname, '../dist');
 let browser;
 try {
   browser = await chromium.launch({ headless: true, channel: process.env.PLAYWRIGHT_CHANNEL || 'msedge' });
-  const page = await browser.newPage();
+  const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] });
+  const page = await context.newPage();
   await page.route('http://127.0.0.1:4179/**', async route => {
     const pathname = new URL(route.request().url()).pathname;
     const path = pathname.startsWith('/assets/') ? resolve(root, '.' + pathname) : resolve(root, 'index.html');
@@ -57,8 +58,17 @@ try {
       data = { event, request };
     } else if (url.pathname.startsWith('/api/logs/runs/')) {
       const term = url.searchParams.get('search')?.toLowerCase();
-      data = { run, truncated: false, events: events.filter(event => !term || JSON.stringify(event).toLowerCase().includes(term))
-        .map(({ timestamp, type, stage, status, usage, isError }) => ({ eventId: timestamp, timestamp, type, stage, status, usage, isError })) };
+      if (url.searchParams.get('view') !== 'timeline') {
+        data = { run, truncated: false, events };
+      } else {
+        const requestFor = event => events.find(item => item.type === 'model_request' &&
+          (event.call_id || event.requestId) && (item.call_id || item.requestId) === (event.call_id || event.requestId));
+        data = { run, truncated: false, events: events
+          .filter(event => event.type !== 'model_request' || !events.some(item => item.type === 'model_response' &&
+            (event.call_id || event.requestId) === (item.call_id || item.requestId)))
+          .filter(event => !term || JSON.stringify([event, requestFor(event)]).toLowerCase().includes(term))
+          .map(event => ({ ...event, eventId: event.timestamp, pairedRequest: event.type === 'model_response' && !!requestFor(event) })) };
+      }
     }
     return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ success: true, ...data }) });
   });
@@ -73,9 +83,9 @@ try {
   await runList.getByRole('button', { name: /行程生成/ }).click();
   await page.locator('.log-detail-heading h2').getByText('qwen2.5:7b', { exact: true }).waitFor();
   assert.equal(lastQuery.get('job_id'), job);
-  assert.equal(await page.locator('.log-timeline > li').count(), 10);
+  assert.equal(await page.locator('.log-timeline > li').count(), 8);
   assert.equal(logRequests, 4);
-  const modelResponse = page.locator('.log-event').filter({ has: page.getByText('模型响应', { exact: true }) }).first();
+  const modelResponse = page.locator('.log-event').filter({ has: page.getByText('模型调用（输入 / 输出）', { exact: true }) }).first();
   await modelResponse.locator(':scope > summary').click();
   await modelResponse.getByRole('heading', { name: 'Prompt（模型输入）', exact: true }).waitFor();
   assert.match(await modelResponse.locator('.log-event-section').filter({ hasText: 'Prompt（模型输入）' }).textContent(), /只输出地点顺序/);
@@ -94,8 +104,18 @@ try {
   const search = page.getByLabel('搜索详情');
   await search.fill('search_map_places');
   await page.waitForFunction(() => document.querySelectorAll('.log-timeline > li').length === 1);
+  await page.getByRole('button', { name: '一键复制上下文', exact: true }).click();
+  await page.getByRole('status').getByText('已复制全部日志上下文', { exact: true }).waitFor();
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  assert.match(copied, /只输出地点顺序/);
+  assert.match(copied, /对话请求/);
+  assert.match(copied, /对话输出/);
+  assert.equal(copied.split('只输出地点顺序').length - 1, 1);
+  await page.evaluate(() => { navigator.clipboard.writeText = async () => { throw new Error('denied'); }; });
+  await page.getByRole('button', { name: '一键复制上下文', exact: true }).click();
+  await page.getByRole('status').getByText('复制失败：denied', { exact: true }).waitFor();
   await search.clear();
-  await page.waitForFunction(() => document.querySelectorAll('.log-timeline > li').length === 10);
+  await page.waitForFunction(() => document.querySelectorAll('.log-timeline > li').length === 8);
   const apiResponse = page.locator('.log-event').filter({ has: page.getByText('地图 / API 响应', { exact: true }) });
   await apiResponse.locator(':scope > summary').click();
   await apiResponse.getByRole('heading', { name: '响应内容', exact: true }).waitFor();
@@ -104,7 +124,7 @@ try {
   await apiResponse.getByText('原始日志 JSON', { exact: true }).click();
   await apiResponse.locator('.log-raw pre').waitFor();
   assert.match(await apiResponse.locator('.log-raw pre').textContent(), /map-1/);
-  const chatResponse = page.locator('.log-event').filter({ has: page.getByText('模型响应', { exact: true }) }).nth(1);
+  const chatResponse = page.locator('.log-event').filter({ has: page.getByText('模型调用（输入 / 输出）', { exact: true }) }).nth(1);
   await chatResponse.locator(':scope > summary').click();
   assert.match(await chatResponse.locator('.log-event-section').filter({ hasText: 'Prompt（模型输入）' }).textContent(), /对话请求/);
   assert.match(await chatResponse.locator('.log-event-section').filter({ hasText: '模型输出' }).textContent(), /对话输出/);
@@ -113,15 +133,16 @@ try {
   await page.getByText('生成异常', { exact: true }).click();
   await page.locator('.log-event pre').getByText('ValueError: invalid proposal', { exact: false }).waitFor();
   await page.getByLabel('事件类型').selectOption('model');
-  assert.equal(await page.locator('.log-timeline > li').count(), 6);
+  assert.equal(await page.locator('.log-timeline > li').count(), 4);
   await page.getByLabel('事件类型').selectOption('all');
   assert.equal(await page.getByText('查找真实地点并匹配候选', { exact: true }).count(), 2);
   events.splice(events.findIndex(event => event.type === 'api_request'), 1);
   events.splice(events.findIndex(event => event.type === 'model_request'), 1);
   await page.getByRole('button', { name: '刷新', exact: true }).click();
   await page.locator('.log-detail-heading h2').getByText('qwen2.5:7b', { exact: true }).waitFor();
-  await modelResponse.locator(':scope > summary').click();
-  await modelResponse.getByText('对应请求未保留，无法还原 Prompt。', { exact: true }).waitFor();
+  const unpaired = page.locator('.log-event').filter({ has: page.getByText('模型响应', { exact: true }) }).first();
+  await unpaired.locator(':scope > summary').click();
+  await unpaired.getByText('对应请求未保留，无法还原 Prompt。', { exact: true }).waitFor();
   await apiResponse.locator(':scope > summary').click();
   await apiResponse.getByText('对应请求未保留，无法还原请求参数。', { exact: true }).waitFor();
   const mapError = events.find(event => event.type === 'api_response');
@@ -138,7 +159,7 @@ try {
   await page.getByRole('button', { name: '筛选', exact: true }).click();
   await page.waitForURL(url => !url.searchParams.has('run_id') && url.searchParams.get('job_id') === job);
   assert.deepEqual(errors, []);
-  console.log('PASS generation task URL, task filter, stages, API/error filters, traceback and no browser errors');
+  console.log('PASS paired model calls, full-context system clipboard copy under filtering, copy failure, task filter, traceback and no browser errors');
 } finally {
   await browser?.close();
 }
